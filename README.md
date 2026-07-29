@@ -151,6 +151,8 @@ If you let it join, it runs `realm discover`, then `realm join`, then offers:
 
 - **Short usernames** — `jdoe` instead of `jdoe@corp.example.com`, with home
   directories at `/home/jdoe`.
+- **SDDM login screen** — only offered when SDDM is the active display manager.
+  See [KDE Plasma note](#kde-plasma-note) below.
 - **Login access** — restrict to one AD group (default), allow all domain
   users, or leave the rules alone. A fresh join otherwise exposes the machine
   to every account in the directory, so the group option is the safer default.
@@ -164,10 +166,55 @@ and `/etc/sssd/sssd.conf` keeps its `0600` mode (SSSD refuses to start otherwise
 
 ## KDE Plasma note
 
-Once the machine is joined, **domain logins work normally through SDDM** — type
-the domain username at the login screen. KDE's System Settings has no Active
+Once the machine is joined, **domain logins work normally through SDDM** — pick
+"Other" and type the domain username. KDE's System Settings has no Active
 Directory module, so use Cockpit or the `realm` command for join and membership
 management.
+
+### Putting the domain user back on the login screen
+
+Out of the box the greeter shows local accounts only, so every domain login
+starts with a trip through "Other". Two things cause that:
+
+1. SDDM builds its user list with `getpwent()`, and SSSD deliberately answers
+   that with local accounts only — enumerating a directory is expensive, so it
+   is off by default.
+2. AD accounts get algorithmic UIDs in the millions, well past the greeter's
+   default `MaximumUid=60000`.
+
+The fix is *not* to enumerate the domain. SDDM 0.20 added a per-theme
+`needsFullUserModel` flag: set it to `false` and the greeter skips the
+enumeration entirely, resolving just the last user from
+`/var/lib/sddm/state.conf` with a single `getpwnam()` — which SSSD answers
+without complaint. On an issued workstation that gives the Windows behaviour,
+where the owner sees their own name and types only a password.
+
+When SDDM is the active display manager, the installer offers to write:
+
+```ini
+# /etc/sddm.conf.d/10-domain-users.conf
+[Users]
+MinimumUid=1000
+MaximumUid=2000200000        # top of the sssd.conf ldap_idmap_range
+RememberLastUser=true
+```
+
+```ini
+# /usr/share/sddm/themes/<theme>/theme.conf.user
+[General]
+needsFullUserModel=false
+```
+
+`theme.conf.user` is SDDM's own override file, so the packaged `theme.conf` is
+never touched and the setting survives a Plasma upgrade. Both files take effect
+at the next login screen — **do not** restart `sddm` from inside a running
+session. The first domain login still goes through "Other"; the account is
+remembered from then on, exactly as a fresh Windows machine behaves.
+
+On SDDM older than 0.20 the installer writes the UID drop-in, says so, and
+leaves the rest alone. The fallback there is `enumerate = true` in `sssd.conf`
+paired with an `ldap_user_search_base` scoped to a single OU, so the greeter
+gets a short list instead of the whole directory.
 
 ---
 
@@ -190,6 +237,7 @@ sudo systemctl status sssd
 | Login accepted but no desktop starts | No home directory — re-run with the `mkhomedir` extra. |
 | Domain user not found by `id` | `sssd` isn't running, or the join didn't complete. |
 | Login refused after a successful join | Access rules. `realm permit -g "Some Group"` or `realm permit --all`. |
+| Login screen lists local users only | SDDM enumerates local accounts and caps UIDs at 60000. See [the KDE note](#putting-the-domain-user-back-on-the-login-screen). |
 
 A full log of every action is written to `/var/log/domain-join-setup.log`.
 

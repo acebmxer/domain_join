@@ -1,0 +1,26 @@
+# This repo is plain shell: nothing is built, and the test suite works inside
+# `mktemp -d`, so there are no generated files to ignore. What follows guards
+# against real domain configuration being dragged in while debugging a join.
+
+# Kerberos keytabs are machine-account credentials. Never commit one.
+*.keytab
+krb5.keytab
+
+# Live configuration copied in for testing. sssd.conf is 0600 for a reason:
+# it can hold a join account and ldap_default_authtok.
+sssd.conf
+smb.conf
+krb5.conf
+resolv.conf
+
+# Backups the installer writes next to the files it edits, and its log.
+*.domain-join-setup.*.bak
+*.bak
+*.log
+
+# Editor and OS noise
+*.sw[op]
+*~
+.vscode/
+.idea/
+.DS_Store

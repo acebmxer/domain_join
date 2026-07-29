@@ -200,6 +200,87 @@ else
     printf '  %s an invalid --backend exits non-zero\n' "$(green PASS)"; ((PASS++))
 fi
 
+section "ini_set: INI editing for the SDDM drop-ins"
+INI_TMP="$(mktemp -d)"
+trap 'rm -rf "$INI_TMP"' EXIT
+DRY_RUN=0
+
+# A file that does not exist yet is created with the section in place.
+f="$INI_TMP/new.conf"
+ini_set "$f" Users MaximumUid 2000200000
+check "creates a missing file" "[Users]
+MaximumUid=2000200000" "$(cat "$f")"
+
+# A nested path is created too, the way /etc/sddm.conf.d/ may need to be.
+f="$INI_TMP/deep/dir/10-domain-users.conf"
+ini_set "$f" Users MinimumUid 1000
+check "creates missing parent directories" "1000" \
+      "$(awk -F= '/^MinimumUid=/ { print $2 }' "$f")"
+
+# An existing key is replaced in place, not appended a second time.
+f="$INI_TMP/replace.conf"
+printf '[Users]\nMaximumUid=60000\nHideShells=\n' >"$f"
+ini_set "$f" Users MaximumUid 2000200000
+check "replaces an existing key" "[Users]
+MaximumUid=2000200000
+HideShells=" "$(cat "$f")"
+check "replaces rather than duplicates" "1" "$(grep -c '^MaximumUid=' "$f")"
+
+# A new key lands inside the existing section rather than at the end of file.
+f="$INI_TMP/append-key.conf"
+printf '[Users]\nMaximumUid=60000\n\n[Theme]\nCurrent=breeze\n' >"$f"
+ini_set "$f" Users RememberLastUser true
+check "adds a key to an existing section" "[Users]
+MaximumUid=60000
+RememberLastUser=true
+
+[Theme]
+Current=breeze" "$(cat "$f")"
+
+# A missing section is appended, leaving unrelated content alone.
+f="$INI_TMP/append-section.conf"
+printf '[Theme]\nCurrent=breeze\n' >"$f"
+ini_set "$f" General needsFullUserModel false
+check "appends a missing section" "[Theme]
+Current=breeze
+[General]
+needsFullUserModel=false" "$(cat "$f")"
+
+# Same key name in two sections: only the targeted one moves.
+f="$INI_TMP/scoped.conf"
+printf '[Autologin]\nUser=kiosk\n\n[Last]\nUser=jdoe\n' >"$f"
+ini_set "$f" Last User someone
+check "only edits the targeted section" "[Autologin]
+User=kiosk
+
+[Last]
+User=someone" "$(cat "$f")"
+
+# The theme override is root-owned and must keep its mode across a rewrite.
+f="$INI_TMP/mode.conf"
+printf '[General]\nneedsFullUserModel=true\n' >"$f"
+chmod 0600 "$f"
+ini_set "$f" General needsFullUserModel false
+check "preserves the file mode" "600" "$(stat -c '%a' "$f")"
+
+# --dry-run must not touch the disk.
+f="$INI_TMP/dryrun.conf"
+DRY_RUN=1; ini_set "$f" Users MaximumUid 2000200000 >/dev/null; DRY_RUN=0
+if [[ -f "$f" ]]; then
+    printf '  %s ini_set wrote a file under --dry-run\n' "$(red FAIL)"; ((FAIL++))
+else
+    printf '  %s ini_set writes nothing under --dry-run\n' "$(green PASS)"; ((PASS++))
+fi
+
+section "SDDM version gate for needsFullUserModel"
+ver_gate() { version_has_last_user_model "$1" && echo yes || echo no; }
+check "sddm 0.21.0 supports it"   "yes" "$(ver_gate 'sddm 0.21.0')"
+check "sddm 0.20.0 supports it"   "yes" "$(ver_gate 'sddm 0.20.0')"
+check "sddm 0.19.0 does not"      "no"  "$(ver_gate 'sddm 0.19.0')"
+check "sddm 0.18.1 does not"      "no"  "$(ver_gate 'sddm 0.18.1')"
+check "sddm 1.0.0 supports it"    "yes" "$(ver_gate 'sddm 1.0.0')"
+check "unparseable version fails closed" "no" "$(ver_gate 'unknown')"
+
 section "CLI smoke tests"
 for args in "--help" "--version"; do
     if "$TARGET" $args >/dev/null 2>&1; then

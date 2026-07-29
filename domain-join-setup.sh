@@ -680,6 +680,175 @@ backup_file() {
     cp -a "$f" "$bak" && note "Backed up $f -> $bak"
 }
 
+# ini_set <file> <section> <key> <value>
+#
+# Sets key=value inside [section] of a plain INI file, creating the file or the
+# section when either is missing and replacing an existing value in place. Like
+# sssd_set_option() the contents are copied back rather than moved, so the
+# original mode and ownership survive.
+ini_set() {
+    local f="$1" section="$2" key="$3" val="$4"
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        printf '%s  [dry-run]%s set %s=%s under [%s] in %s\n' \
+            "$C_CYAN" "$C_RESET" "$key" "$val" "$section" "$f"
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$f")" || return 1
+
+    if [[ ! -f "$f" ]]; then
+        printf '[%s]\n%s=%s\n' "$section" "$key" "$val" >"$f"
+        return 0
+    fi
+
+    # Blank lines inside the target section are buffered rather than printed,
+    # so an inserted key attaches to the last setting instead of drifting below
+    # the blank line that separates one section from the next.
+    local tmp
+    tmp="$(mktemp)" || return 1
+    awk -v section="$section" -v key="$key" -v val="$val" '
+        function flush(  i) { for (i = 1; i <= npend; i++) print pend[i]; npend = 0 }
+        /^[[:space:]]*\[/ {
+            # Leaving the target section without having written the key.
+            if (in_section && !done) { print key "=" val; done = 1 }
+            flush()
+            in_section = ($0 ~ "^[[:space:]]*\\[" section "\\][[:space:]]*$")
+            if (in_section) seen = 1
+            print; next
+        }
+        in_section && $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
+            flush()
+            if (!done) { print key "=" val; done = 1 }
+            next
+        }
+        in_section && /^[[:space:]]*$/ { pend[++npend] = $0; next }
+        { flush(); print }
+        END {
+            if (!done) {
+                if (!seen) print "[" section "]"
+                print key "=" val
+            }
+            flush()
+        }
+    ' "$f" >"$tmp" || { rm -f "$tmp"; return 1; }
+
+    cat "$tmp" >"$f"
+    rm -f "$tmp"
+}
+
+# ---------------------------------------------------------------------------
+# SDDM login screen
+# ---------------------------------------------------------------------------
+# The three probes below are read-only, so they run under --dry-run too and
+# keep the preview honest.
+
+# active_display_manager - the unit behind display-manager.service ("sddm",
+# "gdm3", "lightdm", ...), or nothing when it cannot be determined.
+active_display_manager() {
+    local target
+    target="$(readlink -f /etc/systemd/system/display-manager.service 2>/dev/null)" || return 0
+    [[ -n "$target" ]] || return 0
+    target="${target##*/}"
+    printf '%s' "${target%.service}"
+}
+
+# sddm_current_theme - the theme SDDM will actually load. Later files win,
+# matching SDDM's own read order.
+sddm_current_theme() {
+    local theme="" f val
+    for f in /usr/lib/sddm/sddm.conf.d/*.conf /etc/sddm.conf /etc/sddm.conf.d/*.conf; do
+        [[ -f "$f" ]] || continue
+        val="$(awk -F= '/^[[:space:]]*Current[[:space:]]*=/ { gsub(/[[:space:]]/, "", $2); print $2 }' "$f" | tail -1)"
+        [[ -n "$val" ]] && theme="$val"
+    done
+    printf '%s' "${theme:-breeze}"
+}
+
+# version_has_last_user_model <version> - true when a version string is at
+# least 0.20, where needsFullUserModel arrived. Split out from the probe below
+# so the comparison can be tested without SDDM installed.
+version_has_last_user_model() {
+    local ver="$1" major minor
+    ver="$(printf '%s' "$ver" | grep -oE '[0-9]+\.[0-9]+' | head -1)"
+    [[ -n "$ver" ]] || return 1
+    major="${ver%%.*}"; minor="${ver##*.}"
+    (( 10#$major > 0 )) && return 0
+    (( 10#$minor >= 20 ))
+}
+
+# sddm_has_last_user_model - true when the installed SDDM understands
+# needsFullUserModel. Older builds can only show an enumerated user list.
+sddm_has_last_user_model() {
+    have sddm || return 1
+    version_has_last_user_model "$(sddm --version 2>/dev/null)"
+}
+
+# configure_sddm_greeter - put the domain user back on the login screen.
+#
+# SDDM builds its user list with getpwent(), which SSSD deliberately answers
+# with local accounts only, and then filters it by UID range. A domain user
+# therefore fails twice over and the greeter offers nothing but "Other". Rather
+# than enumerate the directory, this switches the theme to SDDM's last-user
+# model: one getpwnam() against the name in /var/lib/sddm/state.conf, which
+# SSSD resolves happily. The result is the Windows behaviour - the machine's
+# owner sees their own tile and types only a password.
+configure_sddm_greeter() {
+    [[ "$(active_display_manager)" == "sddm" ]] || return 0
+
+    printf '\n'
+    note "SDDM lists local accounts only, so a domain user has to click 'Other' every time."
+    if ! confirm "Show the last domain user on the SDDM login screen instead?" "y"; then
+        note "Login screen left unchanged."
+        return 0
+    fi
+
+    # AD accounts get algorithmic UIDs far above the greeter's 60000 default,
+    # so lift the ceiling to the top of SSSD's ID mapping range.
+    local uid_max
+    uid_max="$(awk -F= '/^[[:space:]]*ldap_idmap_range_max[[:space:]]*=/ { gsub(/[[:space:]]/, "", $2); print $2 }' \
+        /etc/sssd/sssd.conf 2>/dev/null | tail -1)"
+    [[ "$uid_max" =~ ^[0-9]+$ ]] || uid_max=2000200000
+
+    local dropin="/etc/sddm.conf.d/10-domain-users.conf"
+    backup_file "$dropin"
+    ini_set "$dropin" Users MinimumUid 1000       || { warn "Could not write $dropin."; return 0; }
+    ini_set "$dropin" Users MaximumUid "$uid_max" || { warn "Could not write $dropin."; return 0; }
+    ini_set "$dropin" Users RememberLastUser true || { warn "Could not write $dropin."; return 0; }
+    [[ $DRY_RUN -eq 0 ]] && ok "$dropin: UID ceiling raised to $uid_max"
+
+    if ! sddm_has_last_user_model; then
+        warn "This SDDM predates needsFullUserModel (0.20); the greeter will keep listing local users only."
+        note "Either upgrade SDDM, or set 'enumerate = true' in sssd.conf together with an"
+        note "ldap_user_search_base scoped to one OU, so the whole directory is not pulled."
+        return 0
+    fi
+
+    local theme theme_dir
+    theme="$(sddm_current_theme)"
+    for theme_dir in "/usr/share/sddm/themes/$theme" "/usr/local/share/sddm/themes/$theme"; do
+        [[ -d "$theme_dir" ]] && break
+        theme_dir=""
+    done
+    if [[ -z "$theme_dir" ]]; then
+        warn "SDDM theme '$theme' was not found; skipping the theme override."
+        return 0
+    fi
+
+    # theme.conf.user is SDDM's own override file, so the packaged theme.conf
+    # stays untouched and the change survives a Plasma upgrade.
+    local override="$theme_dir/theme.conf.user"
+    backup_file "$override"
+    if ! ini_set "$override" General needsFullUserModel false; then
+        warn "Could not write $override."
+        return 0
+    fi
+    [[ $DRY_RUN -eq 0 ]] && ok "$override: greeter shows the last logged-in user"
+
+    note "Applies at the next login screen -- do not restart sddm from inside a session."
+    note "The first domain login still goes through 'Other'; the account is remembered after that."
+}
+
 open_firewall_for_cockpit() {
     local answer=$OPEN_FIREWALL
     if (( answer == -1 )); then
@@ -831,6 +1000,8 @@ post_join_tuning() {
             ok "sssd.conf: short names enabled, home directories under /home/<user>"
         fi
     fi
+
+    configure_sddm_greeter
 
     local access_choice
     menu_single access_choice "Who may log in to this machine?" "group" \
@@ -1003,8 +1174,10 @@ print_next_steps() {
         printf '\n  %sKDE Plasma note:%s System Settings has no Active Directory module.\n' \
             "$C_YELLOW$C_BOLD" "$C_RESET"
         printf '  Domain logins still work normally through SDDM once the machine is\n'
-        printf '  joined -- type the domain username at the login screen. Use Cockpit or\n'
-        printf '  the realm command for join and membership management.\n'
+        printf '  joined -- pick "Other" and type the domain username. With the login\n'
+        printf '  screen tweak applied, that account is shown by name from then on, the\n'
+        printf '  way Windows remembers the last user. Use Cockpit or the realm command\n'
+        printf '  for join and membership management.\n'
     fi
 
     printf '\n  Full log: %s\n' "$LOG_FILE"
