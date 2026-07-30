@@ -193,6 +193,134 @@ section "Argument parsing"
 # parse_args in a subshell cannot report its counters back, so re-count here.
 PASS=$((PASS + 4))
 
+section "The menu is the default, and the action flags switch it off"
+# menu_wanted also insists on a terminal, which the test harness is not, so
+# CLI_DIRECTED is what is being read back here.
+directed_after() {
+    ( CLI_DIRECTED=0; MENU_FORCED=-1; OPT_DOMAIN=""; OPT_BACKEND=""
+      parse_args "$@" >/dev/null 2>&1; printf '%s' "$CLI_DIRECTED" )
+}
+check "no flags leaves the menu in place"     "0" "$(directed_after)"
+check "--dry-run alone leaves the menu"       "0" "$(directed_after --dry-run)"
+check "--detected-de alone leaves the menu"   "0" "$(directed_after --detected-de kde)"
+check "--backend skips the menu"              "1" "$(directed_after -b sssd)"
+check "--domain skips the menu"               "1" "$(directed_after -d corp.example.com)"
+check "--yes skips the menu"                  "1" "$(directed_after -y)"
+check "--list skips the menu"                 "1" "$(directed_after -l)"
+check "--join skips the menu"                 "1" "$(directed_after --join)"
+forced_after() {
+    ( MENU_FORCED=-1; parse_args "$@" >/dev/null 2>&1; printf '%s' "$MENU_FORCED" )
+}
+check "--menu forces the menu on"    "1" "$(forced_after --menu)"
+check "--no-menu forces the menu off" "0" "$(forced_after --no-menu)"
+
+section "Menu tables line up"
+check "one hint per entry"  "${#MENU_NAMES[@]}" "${#MENU_HINTS[@]}"
+check "MENU_TOTAL matches the names" "${#MENU_NAMES[@]}" "$MENU_TOTAL"
+check "the columns account for every entry" "$MENU_TOTAL" \
+      "$(( MENU_LEFT_COUNT + MENU_RIGHT_COUNT + (MENU_TOTAL - MENU_LEFT_COUNT - MENU_RIGHT_COUNT) ))"
+check "the run order covers every entry once" "$MENU_TOTAL" "${#MENU_RUN_ORDER[@]}"
+check "the run order is a permutation of the indices" \
+      "$(seq 0 $((MENU_TOTAL - 1)) | sort -n | tr '\n' ' ')" \
+      "$(printf '%s\n' "${MENU_RUN_ORDER[@]}" | sort -n | tr '\n' ' ')"
+# Every index must map to an action, and nothing beyond the table may.
+missing=""
+for ((i=0; i<MENU_TOTAL; i++)); do
+    grep -qE "^ *$i\) action_" "$TARGET" || missing="$missing $i"
+done
+check "every entry dispatches to an action" "" "$missing"
+if ( menu_run_action "$MENU_TOTAL" ) >/dev/null 2>&1; then
+    printf '  %s an out-of-range menu index was accepted\n' "$(red FAIL)"; ((FAIL++))
+else
+    printf '  %s an out-of-range menu index returns non-zero\n' "$(green PASS)"; ((PASS++))
+fi
+
+section "Menu layout adapts to the terminal"
+# stty cannot report a size here, so menu_term_size falls back to LINES/COLUMNS.
+layout_at() {
+    COLUMNS="$1" LINES="$2" menu_compute_layout
+}
+DISTRO_NAME="Test Linux 1"; PKG_MGR="dnf"; PKG_FAMILY="rhel"; DE_NAME="KDE Plasma"; MENU_DOMAIN=""
+layout_at 120 45
+check "120x45 uses two columns"      "1" "$ML_TWO_COL"
+check "120x45 keeps the banner box"  "1" "$ML_BANNER"
+check "120x45 keeps the hint line"   "1" "$ML_HINTS"
+check "120x45 is not too small"      "0" "$ML_TOO_SMALL"
+layout_at 80 24
+check "80x24 still uses two columns" "1" "$ML_TWO_COL"
+check "80x24 is not too small"       "0" "$ML_TOO_SMALL"
+layout_at 60 30
+check "60x30 stacks into one column" "0" "$ML_TWO_COL"
+check "60x30 is not too small"       "0" "$ML_TOO_SMALL"
+layout_at 30 12
+check "30x12 reports too small"      "1" "$ML_TOO_SMALL"
+# The floor the README quotes. Adding a menu entry moves it, so it is pinned.
+layout_at 40 20
+check "40x20 is the smallest usable size" "0" "$ML_TOO_SMALL"
+layout_at 39 20
+check "39 columns is too narrow"          "1" "$ML_TOO_SMALL"
+layout_at 40 19
+check "19 rows is too short"              "1" "$ML_TOO_SMALL"
+
+# No drawn line may be wider than the terminal, or the redraw leaves debris.
+overlong=0
+for size in "120 45" "100 40" "80 24" "70 30" "60 30" "45 24"; do
+    set -- $size
+    MENU_CURSOR=0
+    widest="$(COLUMNS="$1" LINES="$2" draw_menu \
+        | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g' \
+        | awk '{ if (length($0) > m) m = length($0) } END { print m + 0 }')"
+    (( widest > $1 )) && { overlong=1; printf '        %sx%s produced a %s-column line\n' "$1" "$2" "$widest"; }
+done
+check "every drawn line fits the terminal" "0" "$overlong"
+
+section "Menu navigation"
+nav() {
+    # Places the cursor, applies a key, and reports where it landed.
+    MENU_CURSOR="$1"
+    menu_get_pos "$MENU_CURSOR"
+    case "$2" in
+        up)    if (( MCOL == 2 )); then menu_set_cursor 0 $(( MENU_LEFT_COUNT - 1 ))
+               elif (( MROW == 0 )); then menu_set_cursor 2 0
+               else menu_set_cursor "$MCOL" $(( MROW - 1 )); fi ;;
+        down)  if (( MCOL == 2 )); then menu_set_cursor 0 0
+               else
+                   col_size=$MENU_LEFT_COUNT
+                   (( MCOL == 1 )) && col_size=$MENU_RIGHT_COUNT
+                   if (( MROW >= col_size - 1 )); then menu_set_cursor 2 0
+                   else menu_set_cursor "$MCOL" $(( MROW + 1 )); fi
+               fi ;;
+    esac
+    printf '%s' "$MENU_CURSOR"
+}
+ML_TWO_COL=1
+centre_idx=$(( MENU_LEFT_COUNT + MENU_RIGHT_COUNT ))
+right_foot=$(( MENU_LEFT_COUNT + MENU_RIGHT_COUNT - 1 ))
+left_foot=$(( MENU_LEFT_COUNT - 1 ))
+check "index 0 is the top of the left column"  "0 0" "$(menu_get_pos 0; printf '%s %s' "$MCOL" "$MROW")"
+check "the first right-column index is its top" "1 0" \
+      "$(menu_get_pos "$MENU_LEFT_COUNT"; printf '%s %s' "$MCOL" "$MROW")"
+check "the last index is the centred row"      "2 0" \
+      "$(menu_get_pos "$centre_idx"; printf '%s %s' "$MCOL" "$MROW")"
+check "the right column's foot is in column 1" "1 $(( MENU_RIGHT_COUNT - 1 ))" \
+      "$(menu_get_pos "$right_foot"; printf '%s %s' "$MCOL" "$MROW")"
+check "up from the top wraps to the centre"    "$centre_idx" "$(nav 0 up)"
+check "down off the left column reaches it too" "$centre_idx" "$(nav "$left_foot" down)"
+check "down off the right column reaches it too" "$centre_idx" "$(nav "$right_foot" down)"
+check "down from the centre returns to the top" "0" "$(nav "$centre_idx" down)"
+check "up from the centre enters the left column" "$left_foot" "$(nav "$centre_idx" up)"
+MENU_CURSOR=0
+
+# The columns need not be the same length, and the draw loop used to walk only
+# as many rows as the left column has - which silently hid the last entry of a
+# longer right column.
+missing_names=""
+drawn="$(COLUMNS=120 LINES=45 draw_menu | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
+for name in "${MENU_NAMES[@]}"; do
+    [[ "$drawn" == *"$name"* ]] || missing_names="$missing_names|$name"
+done
+check "every entry is drawn, whichever column is longer" "" "$missing_names"
+
 section "Invalid backend is rejected"
 if ( OPT_BACKEND=""; parse_args -b nonsense ) >/dev/null 2>&1; then
     printf '  %s an invalid --backend was accepted\n' "$(red FAIL)"; ((FAIL++))
@@ -280,6 +408,286 @@ check "sddm 0.19.0 does not"      "no"  "$(ver_gate 'sddm 0.19.0')"
 check "sddm 0.18.1 does not"      "no"  "$(ver_gate 'sddm 0.18.1')"
 check "sddm 1.0.0 supports it"    "yes" "$(ver_gate 'sddm 1.0.0')"
 check "unparseable version fails closed" "no" "$(ver_gate 'unknown')"
+
+section "Duo: package map"
+for fam in debian rhel suse arch; do
+    PKG_FAMILY="$fam"
+    duo="$(pkgs_for extra_duo)"
+    deps="$(pkgs_for duo_build_deps)"
+    [[ -n "$duo" ]]  && { printf '  %s %s: extra_duo is populated\n' "$(green PASS)" "$fam"; ((PASS++)); } \
+                     || { printf '  %s %s: extra_duo is empty\n' "$(red FAIL)" "$fam"; ((FAIL++)); }
+    [[ -n "$deps" ]] && { printf '  %s %s: duo_build_deps is populated\n' "$(green PASS)" "$fam"; ((PASS++)); } \
+                     || { printf '  %s %s: duo_build_deps is empty\n' "$(red FAIL)" "$fam"; ((FAIL++)); }
+done
+PKG_FAMILY="debian"
+check_contains "debian duo build deps use libpam0g-dev" "libpam0g-dev" "$(pkgs_for duo_build_deps)"
+PKG_FAMILY="rhel"
+check_contains "rhel duo build deps use pam-devel" "pam-devel" "$(pkgs_for duo_build_deps)"
+check_lacks    "rhel avoids libpam0g-dev"         "libpam0g-dev" "$(pkgs_for duo_build_deps)"
+
+section "Duo: credential formats"
+gate() { "$1" "$2" && echo yes || echo no; }
+check "a 20-character ikey is accepted"   "yes" "$(gate valid_duo_ikey DIABCDEFGHIJKLMNOPQR)"
+check "a short ikey is rejected"          "no"  "$(gate valid_duo_ikey DIABC)"
+check "a lower-case ikey is rejected"     "no"  "$(gate valid_duo_ikey diabcdefghijklmnopqr)"
+check "an empty ikey is rejected"         "no"  "$(gate valid_duo_ikey '')"
+check "a 40-character skey is accepted"   "yes" "$(gate valid_duo_skey 0123456789abcdef0123456789abcdef01234567)"
+check "a 39-character skey is rejected"   "no"  "$(gate valid_duo_skey 0123456789abcdef0123456789abcdef0123456)"
+check "an api host is accepted"           "yes" "$(gate valid_duo_host api-1234abcd.duosecurity.com)"
+check "a duofederal host is accepted"     "yes" "$(gate valid_duo_host api-1234abcd.duofederal.com)"
+check "a bare domain is rejected"         "no"  "$(gate valid_duo_host duosecurity.com)"
+check "the mangled '://duosecurity.com' is rejected" "no" "$(gate valid_duo_host '://duosecurity.com')"
+check "an admin host is rejected"         "no"  "$(gate valid_duo_host admin-1234abcd.duosecurity.com)"
+
+section "Duo: which repository fits which distro"
+repo_kind_for() {
+    ( PKG_FAMILY="$1"; DISTRO_ID="$2"; DISTRO_VERSION="$3"; DISTRO_CODENAME="$4"
+      printf '%s' "$(duo_repo_kind)" )
+}
+check "Kubuntu gets the apt repo"       "apt" "$(repo_kind_for debian ubuntu 24.04 noble)"
+check "Debian gets the apt repo"        "apt" "$(repo_kind_for debian debian 12 bookworm)"
+check "no codename means no apt repo"   ""    "$(repo_kind_for debian debian 12 '')"
+check "RHEL 9 gets the yum repo"        "yum" "$(repo_kind_for rhel rhel 9.4 '')"
+check "Rocky gets the yum repo"         "yum" "$(repo_kind_for rhel rocky 9.4 '')"
+check "Fedora has no Duo repo"          ""    "$(repo_kind_for rhel fedora 44 '')"
+check "openSUSE has no Duo repo"        ""    "$(repo_kind_for suse opensuse-leap 15.6 '')"
+check "Arch has no Duo repo"            ""    "$(repo_kind_for arch arch '' '')"
+check "an Ubuntu lineage uses the Ubuntu suite" "Ubuntu" \
+      "$( DISTRO_UBUNTU_BASED=1; duo_apt_suite )"
+check "everything else uses the Debian suite"   "Debian" \
+      "$( DISTRO_UBUNTU_BASED=0; duo_apt_suite )"
+
+section "Duo: reading back /etc/duo/pam_duo.conf"
+DUO_TMP="$(mktemp -d)"
+f="$DUO_TMP/pam_duo.conf"
+printf '[duo]\nikey=DIABCDEFGHIJKLMNOPQR\nskey=0123456789abcdef0123456789abcdef01234567\nhost=api-1234abcd.duosecurity.com\n' >"$f"
+check "a complete config reads back as configured" "yes" "$(duo_conf_is_configured "$f" && echo yes || echo no)"
+check "the API host is read back"  "api-1234abcd.duosecurity.com" "$(duo_conf_host "$f")"
+check "spaces around the '=' are tolerated" "api-1234abcd.duosecurity.com" \
+      "$(printf '[duo]\nhost = api-1234abcd.duosecurity.com\n' >"$f.spaced"; duo_conf_host "$f.spaced")"
+printf '[duo]\nikey=DIABCDEFGHIJKLMNOPQR\nskey=tooshort\nhost=api-1234abcd.duosecurity.com\n' >"$f.bad"
+check "a bad secret key is not 'configured'" "no" "$(duo_conf_is_configured "$f.bad" && echo yes || echo no)"
+check "a missing file is not 'configured'"   "no" "$(duo_conf_is_configured "$DUO_TMP/absent" && echo yes || echo no)"
+
+section "Duo: naming the PAM module"
+# A module referenced by bare name must actually be on PAM's search path. Get
+# this wrong and PAM reports the module as missing, which on some control flags
+# lets the login through with no second factor at all.
+MOD_TMP="$(mktemp -d)"
+mkdir -p "$MOD_TMP/system/security" "$MOD_TMP/elsewhere/security"
+touch "$MOD_TMP/system/security/pam_unix.so"
+DUO_PAM_SEARCH_DIRS=("$MOD_TMP/system/security" "$MOD_TMP/elsewhere/security")
+check "the module directory is the one holding pam_unix.so" \
+      "$MOD_TMP/system/security" "$(pam_module_dir)"
+check "no pam_duo.so means no module" "" "$(duo_pam_module || true)"
+
+touch "$MOD_TMP/system/security/pam_duo.so"
+check "a module on the search path is named plainly" "pam_duo.so" "$(duo_pam_module_arg)"
+
+rm -f "$MOD_TMP/system/security/pam_duo.so"
+touch "$MOD_TMP/elsewhere/security/pam_duo.so"
+check "a module off the search path needs its full path" \
+      "$MOD_TMP/elsewhere/security/pam_duo.so" "$(duo_pam_module_arg)"
+
+# /lib64 is a symlink to /usr/lib64 on a merged-usr system, so the same
+# directory reached by two names must not be mistaken for two directories.
+ln -s "$MOD_TMP/system" "$MOD_TMP/system-link"
+DUO_PAM_SEARCH_DIRS=("$MOD_TMP/system/security" "$MOD_TMP/system-link/security")
+touch "$MOD_TMP/system/security/pam_duo.so"
+check "a symlinked module directory is still the same one" "pam_duo.so" \
+      "$( DUO_PAM_SEARCH_DIRS=("$MOD_TMP/system-link/security" "$MOD_TMP/system/security"); duo_pam_module_arg )"
+rm -rf "$MOD_TMP"
+DUO_PAM_SEARCH_DIRS=(/lib/security /lib64/security /usr/lib/security /usr/lib64/security /usr/lib/*/security /usr/local/lib/security /usr/local/lib64/security)
+
+section "Duo: writing /etc/duo/pam_duo.conf"
+# pam_duo reads a shared secret out of this file on every authentication, so the
+# mode matters as much as the contents. DUO_CONF is redirected at a temporary
+# file rather than mocked, so the real function is what gets exercised.
+DUO_CONF_REAL="$DUO_CONF"
+DUO_CONF="$DUO_TMP/written/pam_duo.conf"
+DRY_RUN=0
+(
+    OPT_DUO_IKEY="DIABCDEFGHIJKLMNOPQR"
+    OPT_DUO_SKEY="0123456789abcdef0123456789abcdef01234567"
+    OPT_DUO_HOST="api-1234abcd.duosecurity.com"
+    OPT_DUO_SKEY_FILE=""
+    duo_write_conf safe yes duo-exempt >/dev/null 2>&1
+)
+check "the config file is created"        "yes" "$([[ -f "$DUO_CONF" ]] && echo yes || echo no)"
+check "and is readable only by its owner" "600" "$(stat -c '%a' "$DUO_CONF" 2>/dev/null)"
+check "the parent directory is created"   "yes" "$([[ -d "$(dirname "$DUO_CONF")" ]] && echo yes || echo no)"
+check "it reads back as fully configured" "yes" "$(duo_conf_is_configured && echo yes || echo no)"
+check "failmode is recorded"              "safe" "$(duo_conf_get failmode)"
+check "autopush is recorded"              "yes"  "$(duo_conf_get autopush)"
+check "prompts is capped at one"          "1"    "$(duo_conf_get prompts)"
+check "the bypass group becomes an exclusion" '*,!duo-exempt' "$(duo_conf_get groups)"
+check "everything lands under [duo]"      "1" "$(grep -c '^\[duo\]' "$DUO_CONF")"
+
+# The secret key must not leak into the transcript, which the operator may paste
+# into a ticket, or into the log file.
+transcript="$(
+    DRY_RUN=1
+    DUO_CONF="$DUO_TMP/dryrun.conf"
+    OPT_DUO_IKEY="DIABCDEFGHIJKLMNOPQR"
+    OPT_DUO_SKEY="0123456789abcdef0123456789abcdef01234567"
+    OPT_DUO_HOST="api-1234abcd.duosecurity.com"
+    OPT_DUO_SKEY_FILE=""
+    duo_write_conf safe yes "" 2>&1
+)"
+if [[ "$transcript" == *"0123456789abcdef0123456789abcdef01234567"* ]]; then
+    printf '  %s the secret key appeared in the --dry-run transcript\n' "$(red FAIL)"; ((FAIL++))
+else
+    printf '  %s the secret key stays out of the --dry-run transcript\n' "$(green PASS)"; ((PASS++))
+fi
+check "--dry-run writes no config file" "no" \
+      "$([[ -f "$DUO_TMP/dryrun.conf" ]] && echo yes || echo no)"
+
+# A secret key read from a file, which is how it should be supplied.
+printf '0123456789abcdef0123456789abcdef01234567\n' >"$DUO_TMP/skey"
+DUO_CONF="$DUO_TMP/from-file.conf"
+(
+    OPT_DUO_IKEY="DIABCDEFGHIJKLMNOPQR"
+    OPT_DUO_SKEY=""
+    OPT_DUO_SKEY_FILE="$DUO_TMP/skey"
+    OPT_DUO_HOST="api-1234abcd.duosecurity.com"
+    duo_write_conf secure no "" >/dev/null 2>&1
+)
+check "--duo-skey-file supplies the secret" "yes" "$(duo_conf_is_configured && echo yes || echo no)"
+check "failmode=secure is honoured"         "secure" "$(duo_conf_get failmode)"
+check "no bypass group means no groups key" "" "$(duo_conf_get groups)"
+DUO_CONF="$DUO_CONF_REAL"
+
+section "Duo: reading a PAM auth stack"
+# Written the way the real files are, since where the Duo rule may go depends on
+# whether anything ahead of it can return success for the whole stack.
+pam_dir="$DUO_TMP/pam.d"
+mkdir -p "$pam_dir"
+printf 'auth required pam_env.so\nauth sufficient pam_unix.so\nauth required pam_deny.so\n' >"$pam_dir/short-circuit"
+printf 'auth substack password-auth\nauth include postlogin\n' >"$pam_dir/substack"
+printf 'auth [success=1 default=ignore] pam_unix.so nullok\nauth requisite pam_deny.so\nauth required pam_permit.so\n' >"$pam_dir/debian-style"
+printf 'auth [success=done default=ignore] pam_sss.so\nauth required pam_deny.so\n' >"$pam_dir/jump"
+printf '# no auth rules here\naccount required pam_unix.so\n' >"$pam_dir/no-auth"
+sc() { pam_auth_can_short_circuit "$1" && echo yes || echo no; }
+check "a bare 'sufficient' short-circuits"     "yes" "$(sc "$pam_dir/short-circuit")"
+check "'substack' does not short-circuit"      "no"  "$(sc "$pam_dir/substack")"
+check "Debian's success=1 does not"            "no"  "$(sc "$pam_dir/debian-style")"
+check "a success=done jump does"                "yes" "$(sc "$pam_dir/jump")"
+check "a file with no auth rules does not"     "no"  "$(sc "$pam_dir/no-auth")"
+check "the anchor is the last auth rule"       "3" "$(pam_auth_anchor "$pam_dir/short-circuit")"
+check "the first auth rule is found too"       "1" "$(pam_auth_first "$pam_dir/short-circuit")"
+check "no auth rules means no anchor"          ""  "$(pam_auth_anchor "$pam_dir/no-auth")"
+
+# A Debian-style service file whose primary block lives in an @include.
+printf 'auth requisite pam_nologin.so\n@include common-auth\n-auth optional pam_kwallet5.so\n' >"$pam_dir/sddm"
+printf 'auth [success=1 default=ignore] pam_unix.so nullok\nauth requisite pam_deny.so\nauth required pam_permit.so\n' >"$pam_dir/common-auth"
+check "@include is recognised as part of the stack" "2" \
+      "$(( $(pam_auth_anchor "$pam_dir/sddm") - 1 ))"
+check "an @include of a safe stack stays safe"      "no"  "$(sc "$pam_dir/sddm")"
+printf 'auth sufficient pam_unix.so\n' >"$pam_dir/common-auth"
+check "an @include of a short-circuiting stack is caught" "yes" "$(sc "$pam_dir/sddm")"
+
+section "Duo: inserting the rule into a PAM file"
+DRY_RUN=0
+rule="auth       required     pam_duo.so"
+
+# The safe case: the rule goes after the password check, which is the ordering
+# that makes it a second factor rather than a first one.
+f="$pam_dir/place-after"
+printf 'auth substack password-auth\nauth include postlogin\naccount required pam_unix.so\n' >"$f"
+pam_add_auth "$f" "$rule" pam_duo.so >/dev/null; rc=$?
+check "a non-short-circuiting stack returns 0" "0" "$rc"
+check "the rule lands after the last auth rule" "3" "$(grep -n 'pam_duo.so' "$f" | cut -d: -f1)"
+check "the account section is left below it" "4" "$(grep -n 'account' "$f" | cut -d: -f1)"
+
+# A second run must not add a second copy.
+pam_add_auth "$f" "$rule" pam_duo.so >/dev/null
+check "a second run adds nothing" "1" "$(grep -c 'pam_duo.so' "$f")"
+
+# The short-circuiting case: after the password check the rule would never run,
+# so it has to go first, and the caller is told with rc 3.
+f="$pam_dir/place-before"
+printf 'auth required pam_env.so\nauth sufficient pam_unix.so\nauth required pam_deny.so\n' >"$f"
+pam_add_auth "$f" "$rule" pam_duo.so >/dev/null; rc=$?
+check "a short-circuiting stack returns 3" "3" "$rc"
+check "the rule goes in ahead of the stack" "1" "$(grep -n 'pam_duo.so' "$f" | cut -d: -f1)"
+
+# PAM files are root-owned with a fixed mode; a rewrite must not relax either.
+f="$pam_dir/mode"
+printf 'auth substack password-auth\n' >"$f"
+chmod 0644 "$f"
+pam_add_auth "$f" "$rule" pam_duo.so >/dev/null
+check "the file mode survives the edit" "644" "$(stat -c '%a' "$f")"
+
+# A file with no auth stack is left alone rather than guessed at.
+f="$pam_dir/no-auth-target"
+printf 'account required pam_unix.so\n' >"$f"
+pam_add_auth "$f" "$rule" pam_duo.so >/dev/null 2>&1; rc=$?
+check "a file with no auth stack is refused" "1" "$rc"
+check "and is left untouched" "0" "$(grep -c 'pam_duo.so' "$f")"
+
+# Nothing may reach the disk under --dry-run.
+f="$pam_dir/dryrun"
+printf 'auth substack password-auth\n' >"$f"
+before="$(cat "$f")"
+DRY_RUN=1; pam_add_auth "$f" "$rule" pam_duo.so >/dev/null; DRY_RUN=0
+check "--dry-run changes nothing on disk" "$before" "$(cat "$f")"
+
+section "Duo: taking the rule back out"
+f="$pam_dir/remove"
+printf 'auth substack password-auth\nauth required pam_duo.so\naccount required pam_unix.so\n' >"$f"
+pam_remove_auth "$f" pam_duo.so >/dev/null
+check "the rule is removed" "0" "$(grep -c 'pam_duo.so' "$f")"
+check "the rest of the file survives" "2" "$(wc -l <"$f")"
+pam_remove_auth "$f" pam_duo.so >/dev/null; rc=$?
+check "removing what is not there succeeds" "0" "$rc"
+
+# A file consisting only of the rule would be emptied, which is worse than
+# leaving it: an empty PAM file denies everything.
+f="$pam_dir/only-duo"
+printf 'auth required pam_duo.so\n' >"$f"
+pam_remove_auth "$f" pam_duo.so >/dev/null 2>&1; rc=$?
+check "refuses to empty a PAM file" "1" "$rc"
+check "and leaves the file intact" "1" "$(grep -c 'pam_duo.so' "$f")"
+
+rm -rf "$DUO_TMP"
+
+section "Duo: argument parsing"
+duo_opt() {
+    local want="$1"; shift
+    ( OPT_DUO=-1; OPT_DUO_IKEY=""; OPT_DUO_HOST=""; OPT_DUO_PROTECT=""
+      OPT_DUO_FAILMODE=""; OPT_DUO_AUTOPUSH=""; OPT_DUO_SKEY=""; DUO_ADD_REPO=-1
+      parse_args "$@" >/dev/null 2>&1; printf '%s' "${!want}" )
+}
+check "--duo turns Duo on"                  "1" "$(duo_opt OPT_DUO --duo)"
+check "--no-duo turns Duo off"              "0" "$(duo_opt OPT_DUO --no-duo)"
+check "--duo-ikey implies --duo"            "1" "$(duo_opt OPT_DUO --duo-ikey DIABCDEFGHIJKLMNOPQR)"
+check "--duo-ikey is stored"                "DIABCDEFGHIJKLMNOPQR" \
+      "$(duo_opt OPT_DUO_IKEY --duo-ikey DIABCDEFGHIJKLMNOPQR)"
+check "--duo-host is stored"                "api-1234abcd.duosecurity.com" \
+      "$(duo_opt OPT_DUO_HOST --duo-host api-1234abcd.duosecurity.com)"
+check "--duo-protect is stored"             "login,sshd" "$(duo_opt OPT_DUO_PROTECT --duo-protect login,sshd)"
+check "--duo-failmode is stored"            "secure" "$(duo_opt OPT_DUO_FAILMODE --duo-failmode secure)"
+check "--duo-autopush normalises 'y'"       "yes" "$(duo_opt OPT_DUO_AUTOPUSH --duo-autopush y)"
+check "--duo-autopush normalises 'FALSE'"   "no"  "$(duo_opt OPT_DUO_AUTOPUSH --duo-autopush FALSE)"
+check "--duo-repo opens the repo gate"      "1" "$(duo_opt DUO_ADD_REPO --duo-repo)"
+check "--duo skips the menu"                "1" "$(directed_after --duo)"
+check "--duo-repo alone leaves the menu"    "0" "$(directed_after --duo-repo)"
+
+for bad in "--duo-failmode maybe" "--duo-autopush sometimes" "--duo-protect everything"; do
+    # shellcheck disable=SC2086
+    if ( OPT_DUO_FAILMODE=""; OPT_DUO_AUTOPUSH=""; OPT_DUO_PROTECT=""; parse_args $bad ) >/dev/null 2>&1; then
+        printf '  %s "%s" was accepted\n' "$(red FAIL)" "$bad"; ((FAIL++))
+    else
+        printf '  %s "%s" exits non-zero\n' "$(green PASS)" "$bad"; ((PASS++))
+    fi
+done
+
+section "Duo: extras keyword drives the configuration step, not a package"
+( BACKEND="sssd"; PKG_FAMILY="debian"; GUI_CHOICES=""; EXTRA_CHOICES="duo"
+  build_package_list
+  check "-e duo sets WANT_DUO" "1" "$WANT_DUO"
+  check_lacks "-e duo adds no package to the preview" "duo-unix" "${WANTED_PACKAGES[*]}" )
+PASS=$((PASS + 2))
 
 section "CLI smoke tests"
 for args in "--help" "--version"; do

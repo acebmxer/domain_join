@@ -14,6 +14,60 @@ cd domain_join
 sudo ./domain-join-setup.sh
 ```
 
+Run with no options and you get a menu of everything the script can do. Every
+step is still available as a flag for unattended runs.
+
+---
+
+## The menu
+
+```
+ ╔════════════════════════════════════════════════════════════════════════════╗
+ ║           Active Directory Domain Join - Setup and Configuration           ║
+ ╚════════════════════════════════════════════════════════════════════════════╝
+          Distribution    : Fedora Linux 44 (KDE Plasma Desktop Edition)
+          Package manager : dnf5 (rhel family)
+          Desktop         : KDE Plasma
+          Domain          : not joined
+          Mode            : changes will be applied
+ ──────────────────────────────────────────────────────────────────────────────
+ ▸ [✓] Guided setup                         [ ] Home directories on first login
+   [ ] Install packages only                [✓] Network time synchronisation
+   [ ] Graphical management tools           [ ] SDDM login screen
+   [ ] Join an Active Directory domain      [ ] Post-join login settings
+                                            [ ] Duo two-factor authentication
+                      [ ] Preflight checks and domain status
+      Install, configure, then offer to join - the whole setup in one pass
+ ──────────────────────────────────────────────────────────────────────────────
+ Selected: 2
+ ↑↓←→ Navigate   SPACE Select/Deselect   ENTER Confirm   D Dry-run   Q Quit
+ Legend: [✓] selected  [ ] not selected
+```
+
+Arrow keys move, **SPACE** ticks an entry, **ENTER** runs everything ticked,
+**D** toggles dry-run without leaving the menu, **Q** or **Esc** quits without
+changing anything. Tick several entries and they run in a sensible order —
+packages before configuration, configuration before the join, and the settings
+that only apply to a domain member last. The header shows what was detected and
+whether the machine is already joined.
+
+| Entry | What it runs |
+| --- | --- |
+| **Guided setup** | The whole thing: pick a backend, GUI tools and extras, install, configure, then offer to join. This is what the flags drive when you skip the menu. |
+| **Install packages only** | The same choices and the same install, but nothing is configured and no service is enabled. |
+| **Graphical management tools** | Installs and enables just the GUI front ends — Cockpit, GNOME Enterprise Login, YaST or ADSys, whichever apply here. |
+| **Join an Active Directory domain** | `realm discover`, `realm join`, then the post-join login settings. |
+| **Home directories on first login** | Wires up `pam_mkhomedir` the way this distro expects. |
+| **Network time synchronisation** | Enables `chronyd` or `systemd-timesyncd` and turns on NTP. |
+| **SDDM login screen** | The last-domain-user tweak described in the [KDE note](#putting-the-domain-user-back-on-the-login-screen). |
+| **Post-join login settings** | Short usernames, who may log in, and optional sudo for a domain group. |
+| **Duo two-factor authentication** | Installs Duo Unix, writes `/etc/duo/pam_duo.conf`, and adds `pam_duo.so` to the services you pick — or takes it back out again. See [Duo](#duo-security-two-factor-authentication). |
+| **Preflight checks and domain status** | Read-only: hostname, clock, DNS SRV records, membership and service state. |
+
+The terminal only has to be 40x20; below that the menu says so rather than
+drawing something broken. It reflows live as the window is resized, dropping
+detail — the hint line, then the banner box — before it gives up two columns.
+
 ---
 
 ## Why this exists
@@ -87,6 +141,7 @@ Only the entries valid for your system are shown.
 | **Diagnostic tools** | on | `dig`, `ldapsearch`, `kinit` for checking SRV records, querying the directory and testing tickets. |
 | **Access to Windows file shares** | off | `cifs-utils` + `smbclient`, including Kerberos-authenticated mounts. |
 | **SSSD sudo rules from the directory** | off | Lets `sudo` read sudoers rules published in AD. |
+| **Duo two-factor authentication** | off | A second factor in front of logins, for local *and* domain accounts. Asks separately which services to protect. See [Duo](#duo-security-two-factor-authentication). |
 
 ---
 
@@ -95,11 +150,13 @@ Only the entries valid for your system are shown.
 ```
 sudo ./domain-join-setup.sh [options]
 
+      --menu              Force the interactive menu
+      --no-menu           Skip the menu and run the guided setup
   -d, --domain DOMAIN     Active Directory domain (e.g. corp.example.com)
   -u, --user USER         Domain account used to perform the join
   -b, --backend NAME      sssd | winbind | both
   -g, --gui LIST          cockpit,gnome,yast,adsys,none
-  -e, --extras LIST       mkhomedir,timesync,troubleshoot,shares,sudo
+  -e, --extras LIST       mkhomedir,timesync,troubleshoot,shares,sudo,duo
       --join              Join the domain after installing
       --no-join           Install only; never attempt a join
       --open-firewall     Allow Cockpit (9090/tcp) through the firewall
@@ -109,16 +166,41 @@ sudo ./domain-join-setup.sh [options]
   -l, --list              Show the packages for this system and exit
   -h, --help              Show help
       --version           Print the version
+
+Duo two-factor authentication:
+      --duo               Set up Duo Security 2FA (same as -e duo)
+      --no-duo            Never set up Duo, whatever the extras say
+      --duo-ikey KEY      Duo integration key
+      --duo-skey KEY      Duo secret key. Visible in 'ps'; prefer the two below
+      --duo-skey-file F   Read the secret key from the first line of F
+      --duo-host HOST     Duo API hostname, e.g. api-1234abcd.duosecurity.com
+      --duo-protect LIST  login,sshd,sudo,none
+      --duo-failmode MODE safe (allow logins if Duo is unreachable) or secure
+      --duo-autopush Y/N  yes = push to the enrolled device instead of prompting
+      --duo-exempt GROUP  Break-glass group whose members skip Duo
+      --duo-repo          Allow adding Duo's own package repository
+      --duo-build         Allow building Duo Unix from source where unpackaged
 ```
+
+The secret key is also read from the `DUO_SKEY` environment variable, which
+keeps it out of the process list and the shell history.
+
+Any option that says *what to do* skips the menu and runs the guided setup
+directly. `--dry-run` and the internal `--detected-de` only change *how* it is
+done, so they leave the menu in place — `sudo ./domain-join-setup.sh --dry-run`
+opens the menu with dry-run already on.
 
 ### Examples
 
 ```bash
-# Interactive — detect the system and ask what to install
+# The menu
 sudo ./domain-join-setup.sh
 
-# See exactly what would happen, change nothing
+# The menu, with nothing allowed to change on disk
 sudo ./domain-join-setup.sh --dry-run
+
+# Straight to the guided setup, no menu
+sudo ./domain-join-setup.sh --no-menu
 
 # Just show the package list for this machine
 ./domain-join-setup.sh --list
@@ -126,6 +208,13 @@ sudo ./domain-join-setup.sh --dry-run
 # Unattended install and join (Kubuntu / Fedora KDE)
 sudo ./domain-join-setup.sh -y -b sssd -g cockpit \
      -e mkhomedir,timesync,shares -d corp.example.com -u svc-join --join
+
+# The same, with Duo protecting the login screen
+DUO_SKEY=... sudo -E ./domain-join-setup.sh -y -b sssd -g cockpit \
+     -d corp.example.com -u svc-join --join \
+     --duo --duo-repo --duo-ikey DIXXXXXXXXXXXXXXXXXX \
+     --duo-host api-1234abcd.duosecurity.com \
+     --duo-protect login --duo-exempt duo-exempt
 ```
 
 `--dry-run` and `--list` work without root.
@@ -144,6 +233,9 @@ sudo ./domain-join-setup.sh -y -b sssd -g cockpit \
    still leaves Cockpit usable at `https://localhost:9090`.
 5. **Preflight checks** — FQDN hostname, clock sync, and DNS SRV records for
    the domain.
+6. **Duo 2FA**, if selected — runs *last*, after the join and after the login
+   settings, because it is the only step that can leave a machine unable to
+   authenticate. See [Duo](#duo-security-two-factor-authentication).
 
 ### Optional join
 
@@ -218,6 +310,184 @@ gets a short list instead of the whole directory.
 
 ---
 
+## Duo Security two-factor authentication
+
+Duo Unix adds a second factor in front of this machine's logins. `pam_duo.so`
+runs *after* the password module and doesn't care which module checked the
+password — so the same configuration covers **local accounts and Active
+Directory accounts together**, with nothing account-type-specific about it.
+
+Pick **Duo two-factor authentication** from the menu, or `-e duo`, or `--duo`.
+
+### What you need first
+
+From the Duo Admin Panel: **Applications → Protect an Application → Unix
+Application**. That yields an integration key, a secret key and an API hostname.
+Each account that will log in also has to be **enrolled in Duo under the same
+username PAM sees** — `jdoe` for a local account, and `jdoe` rather than
+`jdoe@corp.example.com` once short names are on (see below).
+
+### Duo Unix has no graphical interface
+
+This is the constraint everything else follows from. Duo talks over the PAM
+conversation in plain text, so a greeter can render it as a line of text at
+best, and often not at all. There is no Duo dialog on Linux.
+
+The configuration that works on a desktop is therefore **autopush**, which the
+installer turns on by default whenever the login screen is among the protected
+services:
+
+```ini
+autopush = yes    # push to the enrolled device instead of asking for a passcode
+prompts  = 1      # one attempt; a rejected push fails the login rather than
+                  # hanging on a second question the greeter cannot show
+```
+
+The greeter takes the password as normal, Duo pushes to the phone, and the login
+completes when it's approved. No typing, no dialog needed.
+
+### Where the rule goes, and why not `common-auth`
+
+The installer edits the PAM file of each **individual service** —
+`/etc/pam.d/sddm`, `/etc/pam.d/login`, `/etc/pam.d/sshd` — and never
+`common-auth`, `system-auth` or `password-auth`. Two reasons:
+
+1. **Those files are generated.** `pam-auth-update` on Debian and `authselect`
+   on RHEL rewrite them, and would drop a hand-added line at the next run.
+2. **Every service includes them.** A second factor there lands on `sudo`, `su`,
+   `cron` and polkit as well as the login screen — and Plasma's graphical polkit
+   prompt cannot show Duo's text conversation at all.
+
+Placement inside a service file is *measured*, not assumed. A rule appended to
+an auth stack only runs if nothing ahead of it can return success for the whole
+stack, and two constructs can:
+
+| Construct | Returns from the stack on success? |
+| --- | --- |
+| `auth sufficient …` | **yes** |
+| `auth include <file>` | yes, if that file has a `sufficient` |
+| `auth [… success=done]` | **yes** |
+| `auth substack <file>` | no — a `sufficient` inside ends only the substack |
+| `auth [success=1 default=ignore]` (Debian) | no |
+
+So on Kubuntu, where `/etc/pam.d/sddm` pulls the primary block in with
+`@include common-auth` and that block uses `[success=1 default=ignore]`, the
+rule is appended and Duo runs **after** the password:
+
+```
+auth       requisite    pam_nologin.so
+@include common-auth
+-auth      optional     pam_kwallet5.so
+auth       required     pam_duo.so     <- added here
+```
+
+Where a stack *does* short-circuit — Fedora's `/etc/pam.d/sudo` is just
+`auth include system-auth`, and `system-auth` ends `auth sufficient pam_unix.so`
+— appending would produce a rule that never runs: 2FA that looks configured and
+silently does nothing. The installer detects that, puts the rule **first**
+instead, and tells you which files were affected and that Duo will ask before
+the password there.
+
+### Failing open or failing closed
+
+```ini
+failmode = safe      # Duo unreachable -> password alone is accepted, and logged
+failmode = secure    # Duo unreachable -> nobody logs in
+```
+
+`safe` is the default. `secure` is the stronger stance and also the one that
+locks a workstation out of its own front door during a Duo outage, a DNS
+problem, or a laptop that's off the network at the wrong moment.
+
+### The break-glass group
+
+Strongly recommended, and offered by default. Duo's `groups` directive is
+evaluated by `pam_duo` itself, before it ever contacts Duo, so the exemption
+holds even when the Duo service is completely unreachable:
+
+```ini
+groups = *,!duo-exempt
+```
+
+Everyone needs Duo except members of `duo-exempt`. The installer creates the
+group and offers to add the account that invoked `sudo`, so one local
+administrator can always get in and undo things. `pam_duo` logs each bypass to
+syslog, so it is auditable rather than invisible.
+
+> Space separates independent patterns in `groups`; commas separate the
+> alternatives within one pattern, and `!` negates. `*,!duo-exempt` is a single
+> pattern meaning "any group, except that one" — a negated match wins outright.
+
+### Domain usernames
+
+Duo receives the PAM username verbatim. Enable **short usernames** in the
+post-join settings (`use_fully_qualified_names = False` in `sssd.conf`) and the
+name PAM sees is `jdoe`, which matches a Duo directory entry directly. Otherwise
+enrol users as `jdoe@corp.example.com`, or create username aliases in the Duo
+Admin Panel.
+
+There is **no** `username_format` option in `pam_duo.conf` — the recognised keys
+are `ikey`, `skey`, `host`, `cafile`, `http_proxy`, `groups`/`group`, `failmode`,
+`pushinfo`, `autopush`, `verified_push`, `prompts`, `accept_env_factor`,
+`fallback_local_ip`, `https_timeout`, `noverify`, `send_gecos`, `gecos_parsed`,
+`gecos_delim` and `gecos_username_pos`. Rewriting the username is what
+`send_gecos` and the `gecos_*` options are for.
+
+### Getting hold of `pam_duo.so`
+
+The installer tries the cheapest source first and checks for the **module**, not
+the package — because a package can install without one:
+
+| System | Where the module comes from |
+| --- | --- |
+| Ubuntu / Kubuntu / Debian | `duo-unix` from Duo's apt repository (`--duo-repo`) |
+| RHEL, Rocky, AlmaLinux, Oracle | `duo_unix` from Duo's yum repository (`--duo-repo`) |
+| **Fedora** | Fedora's own `duo_unix` ships `login_duo` **only, with no PAM module**, so this falls through to a source build (`--duo-build`) |
+| openSUSE, Arch | no Duo package; source build (`--duo-build`) |
+
+Adding Duo's repository shows you the signing key's fingerprint and asks before
+trusting it. The source build downloads Duo's release, verifies its detached
+signature where one is published (and shows the SHA256 and asks when it isn't),
+then runs `./configure --with-pam=<this system's PAM module directory>
+--prefix=/usr/local`. The PAM directory is passed explicitly because Duo's own
+default hard-codes `/lib64/security`, which is right on the RPM distributions
+and wrong on Debian's multiarch layout. `sysconfdir` is deliberately *not*
+passed, so Duo's own default of `/etc/duo` applies — override it and `pam_duo`
+would read a different file from the one the installer writes.
+
+### Testing it without locking yourself out
+
+The installer says all of this before it touches anything, and then:
+
+1. Keep a root shell open on a text console (**Ctrl+Alt+F3**) while you test.
+2. Test in a **second** session. Don't log out of the current one first.
+3. Every file is backed up as `<file>.domain-join-setup.<timestamp>.bak`.
+
+To undo it, run the Duo entry again and choose **Remove Duo from every service**
+— that strips the rule from every file under `/etc/pam.d/` that carries it and
+leaves the package and credentials in place, so it can be switched back on. By
+hand:
+
+```bash
+sudo grep -rl pam_duo.so /etc/pam.d/                 # what is wired up
+sudo sed -i '/pam_duo.so/d' /etc/pam.d/sddm          # take it back out
+```
+
+`/etc/duo/pam_duo.conf` is written root-owned and mode `0600`; the secret key is
+never echoed while you type it and never appears in the `--dry-run` transcript
+or the log.
+
+### SSH
+
+`pam_duo` can only reach an SSH client through keyboard-interactive
+authentication, so with `sshd` among the protected services the installer checks
+for `UsePAM yes` and `KbdInteractiveAuthentication yes` and offers to write them
+to `/etc/ssh/sshd_config.d/99-duo.conf` — validated with `sshd -t` and removed
+again if `sshd` rejects it. Note that public-key authentication bypasses the PAM
+auth stack entirely, so a key-only login gets no second factor.
+
+---
+
 ## Verifying
 
 ```bash
@@ -226,6 +496,7 @@ id someuser@corp.example.com        # does the directory resolve?
 kinit someuser@CORP.EXAMPLE.COM     # get a Kerberos ticket
 klist                               # inspect it
 sudo systemctl status sssd
+grep -rl pam_duo.so /etc/pam.d/     # which services require Duo
 ```
 
 ## Troubleshooting
@@ -238,6 +509,10 @@ sudo systemctl status sssd
 | Domain user not found by `id` | `sssd` isn't running, or the join didn't complete. |
 | Login refused after a successful join | Access rules. `realm permit -g "Some Group"` or `realm permit --all`. |
 | Login screen lists local users only | SDDM enumerates local accounts and caps UIDs at 60000. See [the KDE note](#putting-the-domain-user-back-on-the-login-screen). |
+| Duo is configured but never asks | Either the rule sits after a `sufficient` that already returned success, or `pam_duo.so` isn't on PAM's search path. `grep -rl pam_duo.so /etc/pam.d/` and check the journal for "module is unknown". |
+| Duo denies every login | Wrong `ikey`/`skey`/`host`, or the account isn't enrolled under the username PAM sends. `journalctl -t pam_duo` shows which. |
+| Locked out after enabling Duo | Log in on a text console as a member of the bypass group, or from the greeter if `failmode = safe` and Duo is unreachable. Then `sudo sed -i '/pam_duo.so/d' /etc/pam.d/*`. |
+| Every `sudo` waits on a phone | `sudo` was among the protected services. Remove it: `sudo sed -i '/pam_duo.so/d' /etc/pam.d/sudo /etc/pam.d/sudo-i`. |
 
 A full log of every action is written to `/var/log/domain-join-setup.log`.
 
@@ -253,7 +528,23 @@ The installer is *sourced* rather than executed by the suite, so the
 per-distribution and per-desktop logic can be verified on a single machine.
 Coverage: syntax, the package map for all four families, cross-contamination of
 distro-specific package names, GUI menu composition per distro/desktop, desktop
-detection, argument parsing and CLI exit codes.
+detection, argument parsing and CLI exit codes, plus the interactive menu — that
+every entry dispatches to an action, that the run order is a permutation of the
+entries, that every entry is actually drawn whichever column is longer, that the
+layout degrades correctly from 120x45 down to 30x12 without drawing a line wider
+than the terminal, and that cursor movement wraps the way the two columns imply.
+
+For Duo, where a mistake is a lockout or a silent 2FA bypass, the risky parts are
+tested directly rather than by inspection: the credential formats; which
+repository fits which distro; that a module on PAM's search path is named plainly
+while one off it gets an absolute path, including when the directory is reached
+through a symlink; that `sufficient`, `include`, `substack`, `@include` and
+`success=done` are each classified correctly, so the rule is placed where it will
+actually run; that the rule lands after the last auth rule when that is safe and
+before the stack when it is not; that a second run adds no second copy; that a
+PAM file's mode survives the rewrite and `--dry-run` never touches the disk; that
+removal refuses to empty a PAM file; and that the secret key stays out of the
+`--dry-run` transcript while the config file is created mode `0600`.
 
 ## License
 
