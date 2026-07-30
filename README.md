@@ -254,6 +254,42 @@ If you let it join, it runs `realm discover`, then `realm join`, then offers:
 Every file it edits is backed up first as `<file>.domain-join-setup.<timestamp>.bak`,
 and `/etc/sssd/sssd.conf` keeps its `0600` mode (SSSD refuses to start otherwise).
 
+### Short usernames need the cache cleared, not just the setting
+
+`use_fully_qualified_names = False` in `sssd.conf` is only half of it. Every
+record already in `cache_<domain>.ldb` was written under the *qualified* name,
+and a lookup for the short form misses it — so `jdoe` keeps getting rejected
+while `sssd.conf` plainly says short names are on. `sss_cache -E` is not enough
+either: it marks records stale, but the keys themselves are still in the old
+format. The cache has to go:
+
+```bash
+sudo systemctl stop sssd
+sudo rm -f /var/lib/sss/db/*.ldb
+sudo systemctl start sssd
+```
+
+The installer does this for you whenever you turn short names on. The one cost
+is cached credentials — the next domain login has to reach a domain controller,
+after which offline logins work again. `jdoe@corp.example.com` keeps working
+throughout; the short form is simply what gets displayed and accepted as well.
+
+Two things that also make a domain login *look* like a name-format problem when
+it isn't:
+
+- **No home directory.** Short names move homes from `/home/jdoe@corp.example.com`
+  to `/home/jdoe`. If nothing on the machine creates them, the login succeeds
+  and the desktop session then dies instantly on a missing `$HOME` — straight
+  back to the greeter, with the session often still listed as active. Enable
+  **Home directories on first login** (`-e mkhomedir`); the installer warns if
+  you turn short names on without it.
+- **SSSD restarted under your own session.** If you run the installer *as a
+  domain user* in a graphical session, restarting SSSD pulls NSS and PAM out
+  from under it: the screen locker engages, a greeter appears, and the session
+  keeps running behind it. It reads as being thrown out even though nothing is
+  lost. The installer detects this and leaves SSSD alone, telling you to reboot
+  or re-run from a local account instead.
+
 ---
 
 ## KDE Plasma note
@@ -266,29 +302,51 @@ management.
 ### Putting the domain user back on the login screen
 
 Out of the box the greeter shows local accounts only, so every domain login
-starts with a trip through "Other". Two things cause that:
+starts with a trip through "Other". SDDM builds its user list with `getpwent()`,
+and SSSD deliberately answers that with local accounts only — enumerating a
+directory is expensive, so it is off by default.
 
-1. SDDM builds its user list with `getpwent()`, and SSSD deliberately answers
-   that with local accounts only — enumerating a directory is expensive, so it
-   is off by default.
-2. AD accounts get algorithmic UIDs in the millions, well past the greeter's
-   default `MaximumUid=60000`.
-
-The fix is *not* to enumerate the domain. SDDM 0.20 added a per-theme
-`needsFullUserModel` flag: set it to `false` and the greeter skips the
-enumeration entirely, resolving just the last user from
-`/var/lib/sddm/state.conf` with a single `getpwnam()` — which SSSD answers
+The fix is *not* to enumerate the domain. SDDM 0.19 added a per-theme
+`needsFullUserModel` flag; with it `false`, the greeter resolves the last user
+from `/var/lib/sddm/state.conf` with a single `getpwnam()` — which SSSD answers
 without complaint. On an issued workstation that gives the Windows behaviour,
 where the owner sees their own name and types only a password.
+
+**That flag is not sufficient on its own**, which is easy to miss. In
+`UserModel.cpp` the `getpwnam()` fallback is not a separate code path — it sits
+inside the early-exit branch of the enumeration loop:
+
+```cpp
+if (!needAllUsers && d->users.count() > Theme.DisableAvatarsThreshold) {
+    if (!lastUserFound && (lastUserData = getpwnam(lastUser())))
+        d->users << ...
+    break;
+}
+```
+
+`needsFullUserModel=false` only clears the `needAllUsers` half of that
+condition. The enumerated count still has to *exceed*
+`DisableAvatarsThreshold`, whose default is 7 — more accounts than a normal
+workstation has. The loop therefore never breaks early, the fallback never
+runs, and the domain user never appears. Setting the theme flag alone changes
+nothing visible.
+
+So the installer sets the threshold to one below the number of local accounts.
+The branch then fires on the last local account: every local user is already in
+the model, the domain user is appended by name, and nothing is lost.
 
 When SDDM is the active display manager, the installer offers to write:
 
 ```ini
-# /etc/sddm.conf.d/10-domain-users.conf
+# /etc/sddm.conf.d/zz-domain-users.conf
 [Users]
 MinimumUid=1000
-MaximumUid=2000200000        # top of the sssd.conf ldap_idmap_range
 RememberLastUser=true
+
+[Theme]
+DisableAvatarsThreshold=1    # (local accounts in 1000-60000) - 1
+EnableAvatars=true           # explicit: the model auto-disables avatars past
+                             # the threshold, but only while still default
 ```
 
 ```ini
@@ -297,16 +355,49 @@ RememberLastUser=true
 needsFullUserModel=false
 ```
 
+Three details in that drop-in are deliberate:
+
+- **The `zz-` prefix.** Drop-ins are read in alphabetical order and the last
+  value wins. Kubuntu ships `20-kubuntu.conf` and `numlock.conf`, and KDE's
+  "Login Screen" module writes `kde_settings.conf` — a `10-` prefix loses to all
+  of them. (The installer removes an older `10-domain-users.conf` if it finds
+  one.)
+- **`MaximumUid` is left alone.** AD UIDs land in the millions, far past the
+  `60000` default, but the UID window is only applied while walking
+  `getpwent()` — `getpwnam()` ignores it. Raising the ceiling is unnecessary
+  here and would put `nobody` (65534) on the login screen.
+- **No backup is left in that directory.** `ConfigBase::load()` walks it with
+  `entryInfoList(QDir::Files | QDir::NoDotAndDotDot)` — **no name filter**. A
+  `.bak` there is not an inert backup, it is live configuration, and
+  `foo.conf.<stamp>.bak` sorts *after* `foo.conf`, so it overrides the file it
+  was copied from. Backups of this drop-in go to
+  `/var/backups/domain-join-setup/` instead, and the installer moves any strays
+  it finds out of the way. Note also that `/etc/sddm.conf` is read *after* the
+  whole drop-in directory, so a key set there beats every drop-in; the installer
+  warns if it sees one.
+
 `theme.conf.user` is SDDM's own override file, so the packaged `theme.conf` is
 never touched and the setting survives a Plasma upgrade. Both files take effect
-at the next login screen — **do not** restart `sddm` from inside a running
-session. The first domain login still goes through "Other"; the account is
-remembered from then on, exactly as a fresh Windows machine behaves.
+at the next login screen. The first domain login still goes through "Other";
+the account is remembered from then on, exactly as a fresh Windows machine
+behaves.
 
-On SDDM older than 0.20 the installer writes the UID drop-in, says so, and
-leaves the rest alone. The fallback there is `enumerate = true` in `sssd.conf`
-paired with an `ldap_user_search_base` scoped to a single OU, so the greeter
-gets a short list instead of the whole directory.
+> **Never run `sddm --version`,** and don't `systemctl restart sddm` from inside
+> a running session either. On Kubuntu's build the daemon does not recognise
+> `--version` and simply *starts*: it takes VT 1, brings up a display server and
+> throws a greeter over whatever session you were in. Your session keeps running
+> on its own VT, so nothing is lost — but it is indistinguishable from being
+> locked out of your own machine, and you have to `Ctrl-C` a stray daemon.
+>
+> This is why the installer probes the version through the package database
+> (`dpkg-query`, `rpm`, `pacman`) and falls back to grepping the greeter binary
+> for the option name. Nothing in it executes `sddm`, and a test asserts that.
+
+If there is no local account in the 1000–60000 range there is nothing for the
+loop to enumerate, so the lookup can never fire; the installer says so and
+stops. On SDDM older than 0.19 it does the same. The fallback in both cases is
+`enumerate = true` in `sssd.conf` paired with an `ldap_user_search_base` scoped
+to a single OU, so the greeter gets a short list instead of the whole directory.
 
 ---
 

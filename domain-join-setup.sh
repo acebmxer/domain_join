@@ -757,11 +757,28 @@ configure_timesync() {
     have timedatectl && run_quiet timedatectl set-ntp true
 }
 
+# Where backups go when they must not sit beside the original. See
+# OUT_OF_TREE_BACKUP_DIR usage in configure_sddm_greeter: SDDM parses every file
+# in /etc/sddm.conf.d/ regardless of name, so a .bak left there becomes live
+# configuration.
+readonly OUT_OF_TREE_BACKUP_DIR="/var/backups/${PROGRAM_NAME}"
+
+# backup_file <file> [dest_dir]
+#
+# Without dest_dir the copy lands beside the original, which is what almost
+# every caller wants. Pass dest_dir for files inside a directory that some
+# daemon reads wholesale.
 backup_file() {
-    local f="$1"
+    local f="$1" destdir="${2:-}"
     [[ -f "$f" ]] || return 0
     [[ $DRY_RUN -eq 1 ]] && { printf '%s  [dry-run]%s back up %s\n' "$C_CYAN" "$C_RESET" "$f"; return 0; }
-    local bak="${f}.${PROGRAM_NAME}.$(date +%Y%m%d%H%M%S).bak"
+    local bak
+    if [[ -n "$destdir" ]]; then
+        mkdir -p "$destdir" || { warn "Could not create $destdir; $f not backed up."; return 1; }
+        bak="$destdir/${f##*/}.$(date +%Y%m%d%H%M%S).bak"
+    else
+        bak="${f}.${PROGRAM_NAME}.$(date +%Y%m%d%H%M%S).bak"
+    fi
     cp -a "$f" "$bak" && note "Backed up $f -> $bak"
 }
 
@@ -1014,33 +1031,124 @@ sddm_current_theme() {
 }
 
 # version_has_last_user_model <version> - true when a version string is at
-# least 0.20, where needsFullUserModel arrived. Split out from the probe below
-# so the comparison can be tested without SDDM installed.
+# least 0.19. "Don't fill UserModel if theme does not require it" - the commit
+# that added needsFullUserModel - shipped in 0.19.0 (2020-11-02), not 0.20, and
+# 0.19 is what Ubuntu 22.04 LTS carries. Split out from the probe below so the
+# comparison can be tested without SDDM installed.
 version_has_last_user_model() {
     local ver="$1" major minor
     ver="$(printf '%s' "$ver" | grep -oE '[0-9]+\.[0-9]+' | head -1)"
     [[ -n "$ver" ]] || return 1
     major="${ver%%.*}"; minor="${ver##*.}"
     (( 10#$major > 0 )) && return 0
-    (( 10#$minor >= 20 ))
+    (( 10#$minor >= 19 ))
+}
+
+# sddm_package_version - the installed SDDM version according to the package
+# database.
+#
+# Deliberately NOT `sddm --version`. On at least some builds - Kubuntu's among
+# them - the daemon does not recognise the flag and simply *starts*: it grabs a
+# VT, brings up a display server and throws a greeter over whatever session was
+# in front of you. Nothing is lost, the old session keeps running on its own VT,
+# but it is indistinguishable from being locked out of your own machine. A probe
+# has no business being able to do that, so nothing here executes sddm.
+sddm_package_version() {
+    local v=""
+    if have dpkg-query; then
+        v="$(dpkg-query -W -f='${Version}' sddm 2>/dev/null)"
+    fi
+    if [[ -z "$v" ]] && have rpm; then
+        v="$(rpm -q --qf '%{VERSION}' sddm 2>/dev/null)"
+    fi
+    if [[ -z "$v" ]] && have pacman; then
+        v="$(pacman -Q sddm 2>/dev/null | awk '{print $2}')"
+    fi
+    printf '%s' "$v"
+}
+
+# sddm_binary_knows_last_user_model - look for the option name inside the
+# greeter binary. The greeter reads it through ThemeConfig, so the literal
+# string is linked in, which makes this a direct capability check rather than a
+# version comparison. Used when no package database can answer.
+sddm_binary_knows_last_user_model() {
+    local b
+    for b in /usr/bin/sddm-greeter-qt6 /usr/bin/sddm-greeter \
+             /usr/libexec/sddm-greeter /usr/lib/sddm/sddm-greeter \
+             /usr/lib/*/libexec/sddm-greeter /usr/bin/sddm; do
+        [[ -f "$b" ]] || continue
+        grep -qa 'needsFullUserModel' "$b" 2>/dev/null && return 0
+    done
+    return 1
 }
 
 # sddm_has_last_user_model - true when the installed SDDM understands
 # needsFullUserModel. Older builds can only show an enumerated user list.
 sddm_has_last_user_model() {
     have sddm || return 1
-    version_has_last_user_model "$(sddm --version 2>/dev/null)"
+
+    local v
+    v="$(sddm_package_version)"
+    if [[ -n "$v" ]]; then
+        version_has_last_user_model "$v"
+        return $?
+    fi
+
+    sddm_binary_knows_last_user_model
+}
+
+# sddm_local_user_count [passwd_file] - how many accounts the greeter would list
+# from files(5). Only local accounts are counted, because SSSD does not answer
+# getpwent() and so contributes nothing to the enumeration. The UID window is
+# the greeter's own default: 1000 to 60000, which is what keeps 'nobody' (65534)
+# off the login screen.
+sddm_local_user_count() {
+    awk -F: '$3 >= 1000 && $3 <= 60000' "${1:-/etc/passwd}" 2>/dev/null | wc -l
+}
+
+# sddm_avatar_threshold <local_user_count> - the DisableAvatarsThreshold that
+# makes SDDM look the last user up by name, or nothing when it cannot work.
+#
+# This is the whole trick, and it is not obvious from the option name. In
+# UserModel.cpp the getpwnam() fallback for the last user is not a separate
+# code path - it lives *inside* the early-exit branch of the getpwent() loop:
+#
+#     if (!needAllUsers && d->users.count() > Theme.DisableAvatarsThreshold) {
+#         if (!lastUserFound && (lastUserData = getpwnam(lastUser())))
+#             d->users << ...
+#         break;
+#     }
+#
+# So needsFullUserModel=false only disarms the `needAllUsers` half of that
+# condition. The count still has to exceed the threshold for the branch to run
+# at all, and the default threshold is 7 - more than the number of accounts on
+# any normal workstation. The loop therefore never breaks, the fallback never
+# fires, and the domain user never appears. That is why setting
+# needsFullUserModel on its own changes nothing.
+#
+# Setting the threshold to one below the local user count makes the branch fire
+# on the last local account: every local user is already in the model, the
+# domain user is appended by name, and nothing is lost.
+sddm_avatar_threshold() {
+    local n="$1"
+    [[ "$n" =~ ^[0-9]+$ ]] || return 1
+    (( n >= 1 )) || return 1
+    printf '%s' "$(( n - 1 ))"
 }
 
 # configure_sddm_greeter - put the domain user back on the login screen.
 #
 # SDDM builds its user list with getpwent(), which SSSD deliberately answers
-# with local accounts only, and then filters it by UID range. A domain user
-# therefore fails twice over and the greeter offers nothing but "Other". Rather
-# than enumerate the directory, this switches the theme to SDDM's last-user
-# model: one getpwnam() against the name in /var/lib/sddm/state.conf, which
-# SSSD resolves happily. The result is the Windows behaviour - the machine's
-# owner sees their own tile and types only a password.
+# with local accounts only. A domain user is therefore absent and the greeter
+# offers nothing but "Other". Rather than enumerate the directory, this switches
+# the theme to SDDM's last-user model: one getpwnam() against the name in
+# /var/lib/sddm/state.conf, which SSSD resolves happily. The result is the
+# Windows behaviour - the machine's owner sees their own tile and types only a
+# password.
+#
+# Two settings are needed, not one. needsFullUserModel=false on the theme, and a
+# DisableAvatarsThreshold low enough for the lookup to actually run - see
+# sddm_avatar_threshold for why the second one is what makes the difference.
 #
 # The menu can reach this twice in one run - directly, and again through
 # post_join_tuning after a join - so the second call is a no-op.
@@ -1058,26 +1166,76 @@ configure_sddm_greeter() {
         return 0
     fi
 
-    # AD accounts get algorithmic UIDs far above the greeter's 60000 default,
-    # so lift the ceiling to the top of SSSD's ID mapping range.
-    local uid_max
-    uid_max="$(awk -F= '/^[[:space:]]*ldap_idmap_range_max[[:space:]]*=/ { gsub(/[[:space:]]/, "", $2); print $2 }' \
-        /etc/sssd/sssd.conf 2>/dev/null | tail -1)"
-    [[ "$uid_max" =~ ^[0-9]+$ ]] || uid_max=2000200000
-
-    local dropin="/etc/sddm.conf.d/10-domain-users.conf"
-    backup_file "$dropin"
-    ini_set "$dropin" Users MinimumUid 1000       || { warn "Could not write $dropin."; return 0; }
-    ini_set "$dropin" Users MaximumUid "$uid_max" || { warn "Could not write $dropin."; return 0; }
-    ini_set "$dropin" Users RememberLastUser true || { warn "Could not write $dropin."; return 0; }
-    [[ $DRY_RUN -eq 0 ]] && ok "$dropin: UID ceiling raised to $uid_max"
-
     if ! sddm_has_last_user_model; then
-        warn "This SDDM predates needsFullUserModel (0.20); the greeter will keep listing local users only."
+        warn "This SDDM predates needsFullUserModel (0.19); the greeter will keep listing local users only."
         note "Either upgrade SDDM, or set 'enumerate = true' in sssd.conf together with an"
         note "ldap_user_search_base scoped to one OU, so the whole directory is not pulled."
         return 0
     fi
+
+    # The greeter resolves the remembered account with getpwnam(), which ignores
+    # MinimumUid/MaximumUid - those are only applied while walking getpwent().
+    # So the AD UID, high as it is, needs no window widening here, and leaving
+    # the 60000 default in place is what keeps 'nobody' off the login screen.
+    local users threshold
+    users="$(sddm_local_user_count)"
+    if ! threshold="$(sddm_avatar_threshold "$users")"; then
+        warn "No local account in the 1000-60000 range, so the greeter has nothing to enumerate."
+        note "SDDM only looks the remembered user up while walking the local accounts, so it"
+        note "needs at least one. Create a local account, or enumerate the directory instead."
+        return 0
+    fi
+
+    # Sorts after 20-kubuntu.conf, kde_settings.conf and anything else a distro
+    # or the Plasma "Login Screen" module drops in here. Drop-ins are read in
+    # alphabetical order and the last value wins, so a 10- prefix loses to all
+    # of them.
+    local dropin="/etc/sddm.conf.d/zz-domain-users.conf"
+    local legacy="/etc/sddm.conf.d/10-domain-users.conf"
+    if [[ -f "$legacy" ]]; then
+        backup_file "$legacy" "$OUT_OF_TREE_BACKUP_DIR"
+        run rm -f "$legacy" && note "Removed $legacy (it sorted before the distro's own drop-ins)."
+    fi
+
+    # ConfigBase::load() walks this directory with
+    # entryInfoList(QDir::Files | QDir::NoDotAndDotDot) - no name filter at all.
+    # So a .bak sitting here is not an inert backup, it is live configuration,
+    # and because "<name>.conf.<stamp>.bak" sorts after "<name>.conf" it wins
+    # over the very file it was copied from. Earlier runs of this script left
+    # exactly that behind. Clear them out and keep backups elsewhere from now on.
+    [[ $DRY_RUN -eq 1 ]] || mkdir -p "$OUT_OF_TREE_BACKUP_DIR" 2>/dev/null || true
+    local stray moved=0
+    for stray in /etc/sddm.conf.d/*.bak /etc/sddm.conf.d/*~ /etc/sddm.conf.d/*.orig; do
+        [[ -f "$stray" ]] || continue
+        # Moved, never deleted -- it is still the user's backup, it just cannot
+        # live in a directory that gets parsed.
+        if run mv -f "$stray" "$OUT_OF_TREE_BACKUP_DIR/"; then
+            moved=1
+        else
+            warn "Could not move $stray out of /etc/sddm.conf.d/; SDDM will keep reading it."
+        fi
+    done
+    if (( moved )); then
+        note "Stale backups moved to $OUT_OF_TREE_BACKUP_DIR -- SDDM was parsing them as config."
+    fi
+
+    # /etc/sddm.conf is appended *after* the drop-in directory, so it overrides
+    # every drop-in. Worth saying out loud rather than silently losing to it.
+    if [[ -f /etc/sddm.conf ]] \
+       && grep -qE '^[[:space:]]*(MaximumUid|MinimumUid|DisableAvatarsThreshold|EnableAvatars|RememberLastUser)[[:space:]]*=' \
+            /etc/sddm.conf 2>/dev/null; then
+        warn "/etc/sddm.conf sets one of these keys itself, and it is read after the drop-ins."
+        note "Remove the conflicting line from /etc/sddm.conf or this drop-in will not win."
+    fi
+
+    backup_file "$dropin" "$OUT_OF_TREE_BACKUP_DIR"
+    ini_set "$dropin" Users MinimumUid 1000                       || { warn "Could not write $dropin."; return 0; }
+    ini_set "$dropin" Users RememberLastUser true                 || { warn "Could not write $dropin."; return 0; }
+    ini_set "$dropin" Theme DisableAvatarsThreshold "$threshold"  || { warn "Could not write $dropin."; return 0; }
+    # Explicit, because the model disables avatars by itself once the count is
+    # over the threshold - but only while the setting is still at its default.
+    ini_set "$dropin" Theme EnableAvatars true                    || { warn "Could not write $dropin."; return 0; }
+    [[ $DRY_RUN -eq 0 ]] && ok "$dropin: last-user lookup armed ($users local accounts, threshold $threshold)"
 
     local theme theme_dir
     theme="$(sddm_current_theme)"
@@ -1100,7 +1258,10 @@ configure_sddm_greeter() {
     fi
     [[ $DRY_RUN -eq 0 ]] && ok "$override: greeter shows the last logged-in user"
 
-    note "Applies at the next login screen -- do not restart sddm from inside a session."
+    note "Applies at the next login screen. Log out normally when you are ready."
+    warn "Do not 'systemctl restart sddm' from inside a session: that starts a fresh greeter"
+    note "on a new VT and looks exactly like being locked out, while the old session keeps"
+    note "running behind it. Logging back in shows the session still there."
     note "The first domain login still goes through 'Other'; the account is remembered after that."
 }
 
@@ -2196,6 +2357,77 @@ sssd_set_option() {
     rm -f "$tmp"
 }
 
+# invoking_user_is_domain_user - true when the account that started this script
+# is served by the directory rather than by /etc/passwd. Checking files(5)
+# first and only then the full NSS stack keeps a local account whose name also
+# exists in AD on the local side of the answer.
+invoking_user_is_domain_user() {
+    local u=""
+    # pkexec hands over a UID rather than a name; logname reads the owner of the
+    # controlling terminal. Either way what is wanted is the pre-sudo account.
+    if [[ -n "${PKEXEC_UID:-}" ]]; then
+        u="$(getent passwd "$PKEXEC_UID" 2>/dev/null | cut -d: -f1)"
+    elif [[ -n "${SUDO_USER:-}" ]]; then
+        u="$SUDO_USER"
+    else
+        u="$(logname 2>/dev/null)" || u=""
+    fi
+
+    [[ -n "$u" && "$u" != "root" ]] || return 1
+    cut -d: -f1 /etc/passwd 2>/dev/null | grep -qxF "$u" && return 1
+    getent passwd "$u" >/dev/null 2>&1
+}
+
+# restart_sssd [flush] - make sssd.conf changes take effect.
+#
+# "flush" also drops the on-disk cache, which is required whenever the name
+# format changed. Every record in cache_<domain>.ldb was written under the old
+# form, and a lookup for the new one misses until the cache is rebuilt, so
+# 'jdoe' keeps failing while sssd.conf plainly says use_fully_qualified_names =
+# False. The setting is right; the daemon is just still answering from stale
+# records. This is the single most common reason the short-name option looks
+# like it did nothing.
+restart_sssd() {
+    local flush="${1:-}"
+
+    # Restarting SSSD underneath a live graphical session owned by a domain user
+    # pulls NSS and PAM out from under it. The screen locker engages, a greeter
+    # comes back, and the session keeps running behind it -- indistinguishable
+    # from being thrown out, even though nothing was lost. Not worth doing to
+    # someone mid-session when the next boot picks it up for free.
+    if invoking_user_is_domain_user; then
+        printf '\n'
+        warn "This session belongs to a domain user, so SSSD is being left running."
+        note "Restarting it here would lock the session and drop you at the login screen,"
+        note "with the session still alive behind it. Reboot, or run this from a local"
+        note "account, and the changes apply on the way back up:"
+        if [[ "$flush" == "flush" ]]; then
+            printf '    %ssudo systemctl stop sssd && sudo rm -f /var/lib/sss/db/*.ldb && sudo systemctl start sssd%s\n' \
+                "$C_CYAN" "$C_RESET"
+        else
+            printf '    %ssudo systemctl restart sssd%s\n' "$C_CYAN" "$C_RESET"
+        fi
+        return 0
+    fi
+
+    if [[ "$flush" == "flush" ]]; then
+        info "Clearing the SSSD cache so the new name format is picked up"
+        run_quiet systemctl stop sssd
+        # Cached credentials go with the cache, so the first login after this
+        # has to reach a domain controller. Everything else is refetched on
+        # demand. sss_cache -E only marks records stale, which is not enough
+        # when the keys themselves are in the old format.
+        if run_quiet sh -c 'rm -f /var/lib/sss/db/*.ldb'; then
+            ok "SSSD cache cleared (the next domain login must be online)"
+        else
+            warn "Could not clear /var/lib/sss/db; short names may not resolve until it is."
+        fi
+    fi
+
+    info "Restarting SSSD to apply the changes"
+    run_quiet systemctl restart sssd && ok "sssd restarted" || warn "Could not restart sssd."
+}
+
 perform_join() {
     heading "Join the Active Directory domain"
 
@@ -2248,12 +2480,23 @@ post_join_tuning() {
 
     heading "Post-join login settings"
 
+    # Tracked because turning this on is what makes the cache wipe necessary
+    # below: the cached records are keyed by the old, qualified name.
+    local names_changed=0
     if confirm "Allow short usernames (jdoe) instead of requiring jdoe@${OPT_DOMAIN}?" "y"; then
         backup_file /etc/sssd/sssd.conf
+        names_changed=1
         if [[ $DRY_RUN -eq 0 ]]; then
             sssd_set_option "use_fully_qualified_names" "False"
             sssd_set_option "fallback_homedir" "/home/%u"
             ok "sssd.conf: short names enabled, home directories under /home/<user>"
+            note "jdoe@${OPT_DOMAIN} keeps working too -- the short form is what gets displayed."
+            if (( ! WANT_MKHOMEDIR )) && ! grep -rq 'pam_mkhomedir\|pam_oddjob_mkhomedir' /etc/pam.d/ 2>/dev/null; then
+                warn "Home directories move to /home/<user>, but nothing on this machine creates them."
+                note "Without pam_mkhomedir a domain login lands in a missing \$HOME and the desktop"
+                note "session dies on the spot, straight back to the greeter. Run this script's"
+                note "'Create home directories on first login' step, or enable it by hand."
+            fi
         fi
     fi
 
@@ -2307,8 +2550,11 @@ post_join_tuning() {
         fi
     fi
 
-    info "Restarting SSSD to apply the changes"
-    run_quiet systemctl restart sssd && ok "sssd restarted" || warn "Could not restart sssd."
+    if (( names_changed )); then
+        restart_sssd flush
+    else
+        restart_sssd
+    fi
 }
 
 # ---------------------------------------------------------------------------

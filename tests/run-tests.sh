@@ -401,13 +401,72 @@ else
 fi
 
 section "SDDM version gate for needsFullUserModel"
+# 0.19.0 is the floor: "Don't fill UserModel if theme does not require it"
+# shipped there, and it is the version Ubuntu 22.04 LTS carries.
 ver_gate() { version_has_last_user_model "$1" && echo yes || echo no; }
 check "sddm 0.21.0 supports it"   "yes" "$(ver_gate 'sddm 0.21.0')"
 check "sddm 0.20.0 supports it"   "yes" "$(ver_gate 'sddm 0.20.0')"
-check "sddm 0.19.0 does not"      "no"  "$(ver_gate 'sddm 0.19.0')"
+check "sddm 0.19.0 supports it"   "yes" "$(ver_gate 'sddm 0.19.0')"
 check "sddm 0.18.1 does not"      "no"  "$(ver_gate 'sddm 0.18.1')"
+check "sddm 0.13.0 does not"      "no"  "$(ver_gate 'sddm 0.13.0')"
 check "sddm 1.0.0 supports it"    "yes" "$(ver_gate 'sddm 1.0.0')"
 check "unparseable version fails closed" "no" "$(ver_gate 'unknown')"
+
+section "SDDM version probe never executes sddm"
+# Regression: sddm_has_last_user_model used to run `sddm --version`. On Kubuntu
+# the daemon does not recognise the flag and starts instead -- it takes a VT and
+# throws a greeter over the running session, which looks exactly like being
+# locked out. Nothing in the probe may execute sddm.
+# Comments discuss the old call on purpose, so compare against code only.
+sddm_code_only() { grep -v '^[[:space:]]*#' "$TARGET"; }
+check "no code runs 'sddm --version'" "0" \
+    "$(sddm_code_only | grep -c 'sddm --version')"
+check "no code runs sddm with a flag" "0" \
+    "$(sddm_code_only | grep -cE '(^|[^-[:alnum:]_/])sddm[[:space:]]+-')"
+
+# The probe reads the package database instead. Stub each backend in turn.
+probe_with() {
+    (
+        have() { [[ "$1" == "$1" ]]; }
+        dpkg-query() { :; }
+        eval "$1"
+        sddm_package_version
+    )
+}
+check "dpkg-query answer is used" "0.19.0-1ubuntu4" \
+    "$(probe_with 'dpkg-query() { printf "0.19.0-1ubuntu4"; }')"
+check "a Kubuntu 0.19 package version passes the gate" "yes" \
+    "$(version_has_last_user_model '0.19.0-1ubuntu4' && echo yes || echo no)"
+check "a Kubuntu 0.21 package version passes the gate" "yes" \
+    "$(version_has_last_user_model '0.21.0-1ubuntu2' && echo yes || echo no)"
+check "an 0.18 package version fails the gate" "no" \
+    "$(version_has_last_user_model '0.18.1-2build1' && echo yes || echo no)"
+
+section "SDDM last-user lookup: local account count and threshold"
+# The greeter only runs getpwnam() on the remembered user once the enumerated
+# count exceeds DisableAvatarsThreshold, so the threshold has to sit one below
+# the number of local accounts -- see sddm_avatar_threshold.
+# Reuses $INI_TMP rather than taking a second temp dir, so the EXIT trap set up
+# for it stays the only one -- a second trap would replace it and leak the first.
+pw="$INI_TMP/passwd"
+printf 'root:x:0:0::/root:/bin/bash\ndaemon:x:1:1::/usr/sbin:/usr/sbin/nologin\n' >"$pw"
+check "system accounts are not counted" "0" "$(sddm_local_user_count "$pw")"
+
+printf 'nick:x:1000:1000::/home/nick:/bin/bash\n' >>"$pw"
+check "one local account counted" "1" "$(sddm_local_user_count "$pw")"
+
+printf 'guest:x:1001:1001::/home/guest:/bin/bash\n' >>"$pw"
+check "two local accounts counted" "2" "$(sddm_local_user_count "$pw")"
+
+printf 'nobody:x:65534:65534::/nonexistent:/usr/sbin/nologin\n' >>"$pw"
+check "nobody is outside the UID window" "2" "$(sddm_local_user_count "$pw")"
+
+thr() { sddm_avatar_threshold "$1" 2>/dev/null || echo unusable; }
+check "one local account -> threshold 0"  "0" "$(thr 1)"
+check "two local accounts -> threshold 1" "1" "$(thr 2)"
+check "five local accounts -> threshold 4" "4" "$(thr 5)"
+check "no local account is unusable" "unusable" "$(thr 0)"
+check "garbage is unusable"          "unusable" "$(thr '')"
 
 section "Duo: package map"
 for fam in debian rhel suse arch; do
