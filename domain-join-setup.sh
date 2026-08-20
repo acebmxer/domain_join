@@ -27,7 +27,7 @@
 set -uo pipefail
 
 readonly PROGRAM_NAME="domain-join-setup"
-readonly SCRIPT_VERSION="1.2.0"
+readonly SCRIPT_VERSION="1.3.0"
 
 # ---------------------------------------------------------------------------
 # Runtime options (overridable by flags)
@@ -40,6 +40,8 @@ OPT_GUI=""
 OPT_EXTRAS=""
 OPT_DOMAIN=""
 OPT_JOIN_USER=""
+OPT_SUDO_USER=""  # comma separated accounts to grant sudo (empty = ask)
+OPT_SUDO_GROUP="" # comma separated groups to grant sudo (empty = ask)
 DO_JOIN=-1        # -1 = ask, 0 = no, 1 = yes
 OPEN_FIREWALL=-1  # -1 = ask, 0 = no, 1 = yes
 MENU_FORCED=-1    # -1 = decide from the flags, 0 = never, 1 = always
@@ -2530,31 +2532,344 @@ post_join_tuning() {
             ;;
     esac
 
-    if confirm "Grant a domain group passwordless-prompt sudo rights on this machine?" "n"; then
-        local sudo_grp
-        ask_value sudo_grp "AD group to grant sudo (e.g. 'Linux Admins')" ""
-        if [[ -n "$sudo_grp" ]]; then
-            local sudoers_file="/etc/sudoers.d/domain-admins"
-            if [[ $DRY_RUN -eq 1 ]]; then
-                printf '%s  [dry-run]%s write %s for group %s\n' "$C_CYAN" "$C_RESET" "$sudoers_file" "$sudo_grp"
-            else
-                printf '%%%s ALL=(ALL) ALL\n' "${sudo_grp// /\\ }" >"$sudoers_file"
-                chmod 0440 "$sudoers_file"
-                if visudo -cf "$sudoers_file" >/dev/null 2>&1; then
-                    ok "sudo granted to '$sudo_grp' via $sudoers_file"
-                else
-                    rm -f "$sudoers_file"
-                    err "Generated sudoers entry was invalid and has been removed."
-                fi
-            fi
-        fi
-    fi
-
     if (( names_changed )); then
         restart_sssd flush
     else
         restart_sssd
     fi
+
+    # After the restart, not before: configure_sudo_access checks each name
+    # through getent, and a daemon still holding the pre-change configuration
+    # (or a stale cache) would answer for the wrong form of the name.
+    configure_sudo_access
+}
+
+# ---------------------------------------------------------------------------
+# sudo rights for an account or a group
+#
+# Every grant is its own drop-in under /etc/sudoers.d, never a line appended to
+# /etc/sudoers: a drop-in is undone by deleting one file, and a botched edit to
+# the main file takes every sudo on the machine with it.
+#
+# A domain principal is not a well behaved filename. 'Linux Admins@corp.example.com'
+# carries a space and two dots, and sudo skips any file in sudoers.d whose name
+# contains a dot or ends in '~' - so the name is slugified for the filename and
+# only the rule inside the file spells it out verbatim.
+# ---------------------------------------------------------------------------
+# Not readonly: the test suite points it at a temporary directory so the real
+# write path is what gets exercised.
+SUDOERS_DIR="/etc/sudoers.d"
+
+# Fold a principal into something sudo will actually read as a filename.
+sudoers_slug() {
+    local s="${1,,}"
+    s="${s//[^a-z0-9]/-}"
+    while [[ "$s" == *--* ]]; do s="${s//--/-}"; done
+    s="${s#-}"; s="${s%-}"
+    s="${s:0:56}"
+    s="${s%-}"
+    printf '%s' "$s"
+}
+
+# sudoers reads ',', '=', ':', '(', ')', '!' and '#' as syntax, and a backslash
+# as the escape this script adds itself. A name holding any of them cannot be
+# written as a plain rule, so it is rejected here rather than turned into a file
+# that visudo refuses - or, worse, one it accepts as something other than the
+# name that was typed. A space is legal, and common in AD group names.
+valid_sudo_principal() {
+    # 'ALL' is the sudoers wildcard, not a name: as a typo it reads as a valid
+    # rule handing every account on the machine full root.
+    [[ "$1" == "ALL" ]] && return 1
+    # Single quoted so the '$-' inside the bracket expression is not expanded as
+    # the shell's own option-flags parameter before the match runs.
+    local re='^[A-Za-z0-9._@$-]+( +[A-Za-z0-9._@$-]+)*$'
+    [[ "$1" =~ $re ]]
+}
+
+# The realm this machine belongs to, for the qualified retry below. OPT_DOMAIN
+# is whatever a join in this run used; realm knows it for an existing member.
+sudo_domain_suffix() {
+    local d="${OPT_DOMAIN:-}"
+    if [[ -z "$d" ]] && have realm; then
+        d="$(realm list --name-only 2>/dev/null | head -1)"
+    fi
+    printf '%s' "${d,,}"
+}
+
+# NSS lookup, retried with the domain appended. With use_fully_qualified_names
+# left at its default a joined machine answers only to 'name@domain' - which is
+# the form that then has to go into the rule, since sudo resolves the name the
+# same way. Sets SUDO_RESOLVED to the form that answered. Returns 2, not 1, when
+# there is no getent to ask: unknown is not the same as absent.
+SUDO_RESOLVED=""
+sudo_resolve_principal() {
+    local kind="$1" name="$2" db="passwd" domain
+    [[ "$kind" == "group" ]] && db="group"
+    SUDO_RESOLVED=""
+
+    have getent || return 2
+
+    if getent "$db" "$name" >/dev/null 2>&1; then
+        SUDO_RESOLVED="$name"
+        return 0
+    fi
+
+    domain="$(sudo_domain_suffix)"
+    if [[ -n "$domain" && "$name" != *@* ]] \
+        && getent "$db" "${name}@${domain}" >/dev/null 2>&1; then
+        SUDO_RESOLVED="${name}@${domain}"
+        return 0
+    fi
+    return 1
+}
+
+# The member list is the quickest confirmation that the group found is the group
+# meant - a local group of the same name resolves just as happily as the AD one.
+sudo_show_group_members() {
+    local members
+    have getent || return 0
+    members="$(getent group "$1" 2>/dev/null | awk -F: '{print $4}')"
+    if [[ -n "$members" ]]; then
+        note "Members: ${members//,/, }"
+    else
+        note "getent lists no members for '$1'. Accounts holding it as their"
+        note "primary group are not listed there, so this alone is not a fault."
+    fi
+    return 0
+}
+
+# sudoers_write_rule <user|group> <name>
+sudoers_write_rule() {
+    local kind="$1" name="$2"
+    local slug file rule tmp
+
+    slug="$(sudoers_slug "$name")"
+    if [[ -z "$slug" ]]; then
+        err "'$name' has nothing in it that can be used as a filename."
+        return 1
+    fi
+    file="$SUDOERS_DIR/domain-join-${kind}-${slug}"
+
+    # A space is the one character common in AD names that sudoers reads as a
+    # separator, so it is escaped in the rule itself.
+    if [[ "$kind" == "group" ]]; then
+        rule="%${name// /\\ } ALL=(ALL:ALL) ALL"
+    else
+        rule="${name// /\\ } ALL=(ALL:ALL) ALL"
+    fi
+
+    # A second run over the same name is a no-op rather than another identical
+    # file and another backup of it.
+    if [[ -f "$file" && "$(grep -v '^#' "$file" 2>/dev/null)" == "$rule" ]]; then
+        ok "$file already grants this"
+        note "  $rule"
+        return 0
+    fi
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        printf '%s  [dry-run]%s write %s containing:\n' "$C_CYAN" "$C_RESET" "$file"
+        printf '%s  [dry-run]%s   %s\n' "$C_CYAN" "$C_RESET" "$rule"
+        return 0
+    fi
+
+    if [[ ! -d "$SUDOERS_DIR" ]]; then
+        mkdir -p "$SUDOERS_DIR" || { err "Could not create $SUDOERS_DIR."; return 1; }
+        chmod 0750 "$SUDOERS_DIR"
+    fi
+
+    # Checked before it is installed, never after. A syntax error anywhere in
+    # /etc/sudoers.d makes sudo refuse to run at all, so a file that fails the
+    # check must never have existed at that path, not even for a moment.
+    tmp="$(mktemp "${TMPDIR:-/tmp}/${PROGRAM_NAME}.sudoers.XXXXXX")" || {
+        err "Could not create a temporary file to validate the rule."
+        return 1
+    }
+    printf '# Written by %s on %s\n%s\n' \
+        "$PROGRAM_NAME" "$(date '+%Y-%m-%d %H:%M:%S')" "$rule" >"$tmp"
+    chmod 0440 "$tmp"
+
+    if have visudo; then
+        if ! visudo -cf "$tmp" >/dev/null 2>&1; then
+            rm -f "$tmp"
+            err "The rule generated for '$name' is not valid sudoers syntax; nothing was written."
+            return 1
+        fi
+    else
+        warn "visudo is not installed, so the rule could not be syntax checked."
+    fi
+
+    [[ -f "$file" ]] && backup_file "$file" "$OUT_OF_TREE_BACKUP_DIR"
+
+    # sudo ignores any file in sudoers.d that is not owned by root or is group
+    # writable, so the ownership is stated rather than inherited. Skipped when
+    # not root, which is only ever the test suite: install would just fail.
+    local -a inst=(install -m 0440)
+    (( EUID == 0 )) && inst+=(-o root -g root)
+
+    if "${inst[@]}" "$tmp" "$file"; then
+        rm -f "$tmp"
+        ok "$file"
+        note "  $rule"
+        log_to_file "SUDO  $kind '$name' -> $file"
+        return 0
+    fi
+
+    rm -f "$tmp"
+    err "Could not install $file."
+    return 1
+}
+
+# sudo_grant_one <user|group> <name> [forced]
+#
+# forced=1 means the name came from a flag rather than a prompt, so an
+# unresolvable name is reported and written anyway instead of asking.
+sudo_grant_one() {
+    local kind="$1" name="$2" forced="${3:-0}" rc=0
+
+    if ! valid_sudo_principal "$name"; then
+        err "'$name' holds a character that sudoers cannot carry in a name."
+        note "Letters, digits, spaces and . _ - @ \$ only: ',', '=', ':', '!' and '#'"
+        note "are sudoers syntax, so a name containing them cannot be written as a rule."
+        return 1
+    fi
+
+    sudo_resolve_principal "$kind" "$name" || rc=$?
+    case $rc in
+        0)
+            if [[ "$SUDO_RESOLVED" != "$name" ]]; then
+                note "'$name' only resolves as '$SUDO_RESOLVED'; using the qualified form."
+                name="$SUDO_RESOLVED"
+            fi
+            ok "The $kind '$name' resolves on this machine"
+            [[ "$kind" == "group" ]] && sudo_show_group_members "$name"
+            ;;
+        2)
+            warn "getent is not available, so '$name' could not be checked."
+            ;;
+        *)
+            warn "Nothing on this machine resolves the $kind '$name'."
+            local db="passwd"
+            [[ "$kind" == "group" ]] && db="group"
+            note "Check it with: getent $db '$name'"
+            local suffix
+            suffix="$(sudo_domain_suffix)"
+            if [[ -n "$suffix" && "$name" != *@* ]]; then
+                note "A joined machine often answers only to '${name}@${suffix}'."
+            elif [[ "$kind" == "group" ]]; then
+                note "Directory groups only answer once SSSD is running and the machine"
+                note "has joined, so this is expected before the join."
+            fi
+            note "A rule naming something that does not exist grants nothing, and stays"
+            note "wrong quietly until somebody reads the file."
+            if (( forced )); then
+                warn "Writing it anyway, since it was named on the command line."
+            elif ! confirm "Write the rule anyway?" "n"; then
+                note "Left '$name' alone."
+                return 0
+            fi
+            ;;
+    esac
+
+    sudoers_write_rule "$kind" "$name" || return 1
+
+    if [[ "$kind" == "group" ]]; then
+        note "Group membership is read at login, so a member already signed in has to"
+        note "log out and back in before sudo will see it."
+    fi
+    return 0
+}
+
+# Ask for one name and grant it.
+sudo_grant_interactive() {
+    local kind="$1" name prompt domain
+    domain="$(sudo_domain_suffix)"
+    domain="${domain:-corp.example.com}"
+
+    if [[ "$kind" == "group" ]]; then
+        prompt="Group to grant sudo (e.g. 'Linux Admins' or 'Linux Admins@${domain}')"
+    else
+        prompt="Account to grant sudo (e.g. jdoe or jdoe@${domain})"
+    fi
+
+    printf '\n'
+    ask_value name "$prompt" ""
+    name="${name#"${name%%[![:space:]]*}"}"
+    name="${name%"${name##*[![:space:]]}"}"
+
+    if [[ -z "$name" ]]; then
+        note "No $kind given; nothing granted."
+        return 0
+    fi
+    sudo_grant_one "$kind" "$name"
+}
+
+# --sudo-user / --sudo-group, comma separated. Only the comma splits: a name may
+# legitimately contain spaces.
+sudo_grant_list() {
+    local kind="$1" list="$2" rc=0 name
+    local -a names=()
+    [[ -z "$list" ]] && return 0
+
+    IFS=',' read -r -a names <<<"$list"
+    for name in "${names[@]}"; do
+        name="${name#"${name%%[![:space:]]*}"}"
+        name="${name%"${name##*[![:space:]]}"}"
+        [[ -z "$name" ]] && continue
+        sudo_grant_one "$kind" "$name" 1 || rc=1
+    done
+    return $rc
+}
+
+# Reachable twice in one run - straight from the menu, and again through
+# post_join_tuning after a join - so the second call is a no-op, the same way
+# configure_sddm_greeter is guarded.
+SUDO_ACCESS_DONE=0
+configure_sudo_access() {
+    (( SUDO_ACCESS_DONE )) && return 0
+    SUDO_ACCESS_DONE=1
+
+    heading "sudo rights"
+
+    # Flags win outright and skip the prompts: -y with neither of them set is a
+    # deliberate "leave sudo alone", not an invitation to guess.
+    if [[ -n "$OPT_SUDO_USER" || -n "$OPT_SUDO_GROUP" ]]; then
+        local frc=0
+        sudo_grant_list user  "$OPT_SUDO_USER"  || frc=1
+        sudo_grant_list group "$OPT_SUDO_GROUP" || frc=1
+        return $frc
+    fi
+
+    note "Each grant becomes its own file in $SUDOERS_DIR, so it can be taken back"
+    note "by deleting that one file. Local and domain accounts both work here."
+
+    # A group is the usual answer and so the one Enter accepts - but under -y
+    # the default is what runs unasked, and granting root to a guessed name is
+    # not something a non-interactive run should do on its own.
+    local choice rc=0 default_choice="group"
+    (( ASSUME_YES )) && default_choice="skip"
+
+    menu_single choice "Who should be allowed to use sudo on this machine?" "$default_choice" \
+        "user|An account|Grants sudo to one account, local or domain. Use this for a named administrator rather than for everybody who happens to be in a directory group." \
+        "group|A group|Grants sudo to every member of one group, which is how an AD 'Linux Admins' group is normally put to work: membership is then managed in the directory instead of on this machine." \
+        "both|An account and a group|Asks for one of each, writing a separate file for each so either can be revoked on its own." \
+        "skip|Neither|Leaves sudo exactly as it is. Nothing under $SUDOERS_DIR is written or removed."
+
+    case "$choice" in
+        user)
+            sudo_grant_interactive user || rc=1
+            ;;
+        group)
+            sudo_grant_interactive group || rc=1
+            ;;
+        both)
+            sudo_grant_interactive user  || rc=1
+            sudo_grant_interactive group || rc=1
+            ;;
+        skip)
+            note "sudo left unchanged."
+            ;;
+    esac
+    return $rc
 }
 
 # ---------------------------------------------------------------------------
@@ -2891,6 +3206,13 @@ action_guided_setup() {
     fi
     (( join_now == 1 )) && perform_join
 
+    # Named on the command line rather than reached through the join, so it has
+    # to run whether or not this pass joined anything. A join already ran it,
+    # and the guard inside makes this second call a no-op.
+    if [[ -n "$OPT_SUDO_USER" || -n "$OPT_SUDO_GROUP" ]]; then
+        configure_sudo_access
+    fi
+
     # Duo goes last, deliberately. It is the only step that can leave the machine
     # unable to authenticate, so everything else is already done and verifiable
     # before the authentication stack is touched.
@@ -2957,6 +3279,10 @@ action_mkhomedir() {
 
 action_timesync() {
     configure_timesync
+}
+
+action_sudo_access() {
+    configure_sudo_access
 }
 
 action_duo() {
@@ -3050,7 +3376,7 @@ fi
 
 MENU_TITLE="Active Directory Domain Join - Setup and Configuration"
 
-# Left column is indices 0-3, right column 4-8, and index 9 is a full-width
+# Left column is indices 0-4, right column 5-9, and index 10 is a full-width
 # row centred underneath both. The columns need not be the same length.
 MENU_NAMES=(
     "Guided setup"
@@ -3061,6 +3387,7 @@ MENU_NAMES=(
     "Network time synchronisation"
     "SDDM login screen"
     "Post-join login settings"
+    "Grant sudo to a user or group"
     "Duo two-factor authentication"
     "Preflight checks and domain status"
 )
@@ -3075,21 +3402,22 @@ MENU_HINTS=(
     "Create a home directory the first time a domain user logs in"
     "Keep the clock in step - Kerberos rejects a skew over five minutes"
     "Show the last domain user on the SDDM greeter instead of only 'Other'"
-    "Short usernames, who is allowed to log in, sudo for a domain group"
+    "Short usernames, who is allowed to log in, and then the sudo rights"
+    "Give an account or a group sudo through its own /etc/sudoers.d file"
     "Second factor for local and domain logins via Duo Unix, or remove it"
     "Read-only: hostname, clock, DNS, membership and service state"
 )
 
-MENU_LEFT_COUNT=4
+MENU_LEFT_COUNT=5
 MENU_RIGHT_COUNT=5
-MENU_TOTAL=10
+MENU_TOTAL=11
 MENU_CURSOR=0
-MENU_SELECTED=(0 0 0 0 0 0 0 0 0 0)
+MENU_SELECTED=(0 0 0 0 0 0 0 0 0 0 0)
 
 # The order selections run in: install first, then configure, then join, then
 # the settings that only make sense once the machine is a domain member - and
 # Duo last of all, since it is the only entry that can stop a login working.
-MENU_RUN_ORDER=(0 1 2 4 5 9 3 7 6 8)
+MENU_RUN_ORDER=(0 1 2 4 5 10 3 7 6 8 9)
 
 MCOL=0
 MROW=0
@@ -3623,7 +3951,7 @@ menu_cleanup() {
 # Draw the menu and collect the selections. Returns 1 when the user quit.
 run_menu() {
     MENU_CURSOR=0
-    MENU_SELECTED=(0 0 0 0 0 0 0 0 0 0)
+    MENU_SELECTED=(0 0 0 0 0 0 0 0 0 0 0)
     menu_gather_info
 
     MENU_SAVED_STTY="$(stty -g 2>/dev/null)" || MENU_SAVED_STTY=""
@@ -3750,8 +4078,9 @@ menu_run_action() {
         5) action_timesync ;;
         6) action_sddm_greeter ;;
         7) action_post_join ;;
-        8) action_duo ;;
-        9) action_status ;;
+        8) action_sudo_access ;;
+        9) action_duo ;;
+        10) action_status ;;
         *) return 1 ;;
     esac
 }
@@ -3823,6 +4152,10 @@ ${C_BOLD}OPTIONS${C_RESET}
   -b, --backend NAME      sssd | winbind | both
   -g, --gui LIST          Comma separated: cockpit,gnome,yast,adsys,none
   -e, --extras LIST       Comma separated: mkhomedir,timesync,troubleshoot,shares,sudo,duo
+      --sudo-user LIST    Grant sudo to these accounts, comma separated. Local
+                          or domain; a name may contain spaces.
+      --sudo-group LIST   Grant sudo to these groups, comma separated. Each one
+                          gets its own file under /etc/sudoers.d.
       --join              Join the domain after installing.
       --no-join           Install only; never attempt a join.
       --open-firewall     Allow Cockpit (9090/tcp) through the firewall.
@@ -3861,6 +4194,10 @@ ${C_BOLD}EXAMPLES${C_RESET}
   sudo ./domain-join-setup.sh -y -b sssd -g cockpit \\
        -e mkhomedir,timesync,shares -d corp.example.com -u svc-join --join
 
+  # Grant sudo to a domain group and one account, no prompts
+  sudo ./domain-join-setup.sh -y --sudo-group 'Linux Admins@corp.example.com' \\
+       --sudo-user jdoe
+
   # The same, with Duo protecting the login screen
   DUO_SKEY=... sudo -E ./domain-join-setup.sh -y -b sssd -g cockpit \\
        -d corp.example.com -u svc-join --join \\
@@ -3882,6 +4219,8 @@ parse_args() {
             -b|--backend)  OPT_BACKEND="${2:-}"; CLI_DIRECTED=1; shift 2 ;;
             -g|--gui)      OPT_GUI="${2:-}"; CLI_DIRECTED=1; shift 2 ;;
             -e|--extras)   OPT_EXTRAS="${2:-}"; CLI_DIRECTED=1; shift 2 ;;
+            --sudo-user)   OPT_SUDO_USER="${2:-}"; CLI_DIRECTED=1; shift 2 ;;
+            --sudo-group)  OPT_SUDO_GROUP="${2:-}"; CLI_DIRECTED=1; shift 2 ;;
             --join)        DO_JOIN=1; CLI_DIRECTED=1; shift ;;
             --no-join)     DO_JOIN=0; CLI_DIRECTED=1; shift ;;
             --open-firewall)    OPEN_FIREWALL=1; CLI_DIRECTED=1; shift ;;

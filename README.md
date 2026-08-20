@@ -31,11 +31,11 @@ step is still available as a flag for unattended runs.
           Domain          : not joined
           Mode            : changes will be applied
  ──────────────────────────────────────────────────────────────────────────────
- ▸ [✓] Guided setup                         [ ] Home directories on first login
-   [ ] Install packages only                [✓] Network time synchronisation
-   [ ] Graphical management tools           [ ] SDDM login screen
-   [ ] Join an Active Directory domain      [ ] Post-join login settings
-                                            [ ] Duo two-factor authentication
+ ▸ [✓] Guided setup                         [✓] Network time synchronisation
+   [ ] Install packages only                [ ] SDDM login screen
+   [ ] Graphical management tools           [ ] Post-join login settings
+   [ ] Join an Active Directory domain      [ ] Grant sudo to a user or group
+   [ ] Home directories on first login      [ ] Duo two-factor authentication
                       [ ] Preflight checks and domain status
       Install, configure, then offer to join - the whole setup in one pass
  ──────────────────────────────────────────────────────────────────────────────
@@ -60,11 +60,12 @@ whether the machine is already joined.
 | **Home directories on first login** | Wires up `pam_mkhomedir` the way this distro expects. |
 | **Network time synchronisation** | Enables `chronyd` or `systemd-timesyncd` and turns on NTP. |
 | **SDDM login screen** | The last-domain-user tweak described in the [KDE note](#putting-the-domain-user-back-on-the-login-screen). |
-| **Post-join login settings** | Short usernames, who may log in, and optional sudo for a domain group. |
+| **Post-join login settings** | Short usernames, who may log in, then the sudo rights below. |
+| **Grant sudo to a user or group** | Asks for an account, a group, or one of each, and writes a `/etc/sudoers.d` drop-in for each. See [sudo rights](#sudo-rights). |
 | **Duo two-factor authentication** | Installs Duo Unix, writes `/etc/duo/pam_duo.conf`, and adds `pam_duo.so` to the services you pick — or takes it back out again. See [Duo](#duo-security-two-factor-authentication). |
 | **Preflight checks and domain status** | Read-only: hostname, clock, DNS SRV records, membership and service state. |
 
-The terminal only has to be 40x20; below that the menu says so rather than
+The terminal only has to be 40x21; below that the menu says so rather than
 drawing something broken. It reflows live as the window is resized, dropping
 detail — the hint line, then the banner box — before it gives up two columns.
 
@@ -140,7 +141,7 @@ Only the entries valid for your system are shown.
 | **Enforce network time sync** | on | Kerberos rejects tickets with more than ~5 minutes of clock skew — the single most common cause of a failed join. |
 | **Diagnostic tools** | on | `dig`, `ldapsearch`, `kinit` for checking SRV records, querying the directory and testing tickets. |
 | **Access to Windows file shares** | off | `cifs-utils` + `smbclient`, including Kerberos-authenticated mounts. |
-| **SSSD sudo rules from the directory** | off | Lets `sudo` read sudoers rules published in AD. |
+| **SSSD sudo rules from the directory** | off | Lets `sudo` read sudoers rules *published in AD*, so admin rights are managed centrally. This is not the same thing as [granting sudo here](#sudo-rights), which writes a rule on this machine. |
 | **Duo two-factor authentication** | off | A second factor in front of logins, for local *and* domain accounts. Asks separately which services to protect. See [Duo](#duo-security-two-factor-authentication). |
 
 ---
@@ -157,6 +158,8 @@ sudo ./domain-join-setup.sh [options]
   -b, --backend NAME      sssd | winbind | both
   -g, --gui LIST          cockpit,gnome,yast,adsys,none
   -e, --extras LIST       mkhomedir,timesync,troubleshoot,shares,sudo,duo
+      --sudo-user LIST    Grant sudo to these accounts, comma separated
+      --sudo-group LIST   Grant sudo to these groups, comma separated
       --join              Join the domain after installing
       --no-join           Install only; never attempt a join
       --open-firewall     Allow Cockpit (9090/tcp) through the firewall
@@ -209,6 +212,10 @@ sudo ./domain-join-setup.sh --no-menu
 sudo ./domain-join-setup.sh -y -b sssd -g cockpit \
      -e mkhomedir,timesync,shares -d corp.example.com -u svc-join --join
 
+# Grant sudo to a domain group and one account, no prompts
+sudo ./domain-join-setup.sh -y --sudo-group 'Linux Admins@corp.example.com' \
+     --sudo-user jdoe
+
 # The same, with Duo protecting the login screen
 DUO_SKEY=... sudo -E ./domain-join-setup.sh -y -b sssd -g cockpit \
      -d corp.example.com -u svc-join --join \
@@ -248,8 +255,9 @@ If you let it join, it runs `realm discover`, then `realm join`, then offers:
 - **Login access** — restrict to one AD group (default), allow all domain
   users, or leave the rules alone. A fresh join otherwise exposes the machine
   to every account in the directory, so the group option is the safer default.
-- **sudo rights** — grant an AD group sudo via `/etc/sudoers.d/domain-admins`,
-  validated with `visudo -c` and removed again if it doesn't parse.
+- **sudo rights** — an account, a group, or one of each. See
+  [sudo rights](#sudo-rights) below; the same step is on the menu on its own,
+  for a machine that is already a member.
 
 Every file it edits is backed up first as `<file>.domain-join-setup.<timestamp>.bak`,
 and `/etc/sssd/sssd.conf` keeps its `0600` mode (SSSD refuses to start otherwise).
@@ -289,6 +297,85 @@ it isn't:
   keeps running behind it. It reads as being thrown out even though nothing is
   lost. The installer detects this and leaves SSSD alone, telling you to reboot
   or re-run from a local account instead.
+
+---
+
+## sudo rights
+
+**Grant sudo to a user or group** on the menu (and the last question of the
+post-join settings) asks who should be able to run `sudo` here:
+
+```
+Who should be allowed to use sudo on this machine?
+
+   1) An account          - one account, local or domain
+ * 2) A group             - every member of one group
+   3) An account and a group
+   4) Neither             - leave sudo exactly as it is
+```
+
+Whichever you pick, it asks for the name and writes **one file per grant** under
+`/etc/sudoers.d`, named after a slugified form of the principal:
+
+```
+/etc/sudoers.d/domain-join-group-linux-admins-corp-example-com
+    %Linux\ Admins@corp.example.com ALL=(ALL:ALL) ALL
+
+/etc/sudoers.d/domain-join-user-jdoe
+    jdoe ALL=(ALL:ALL) ALL
+```
+
+One grant per file means any of them can be revoked by deleting that one file,
+and nothing has to be edited out of `/etc/sudoers`.
+
+**Every grant requires a password.** There is no `NOPASSWD` here and no option to
+add one: `ALL=(ALL:ALL) ALL` means the account types *its own* password the first
+time it runs `sudo` in a session — for a domain account, the domain password,
+checked through PAM against SSSD. If `sudo` is among the services Duo protects,
+that password is followed by the second factor.
+
+A few details that are easy to get wrong by hand:
+
+- **Spaces in the name.** AD group names routinely have them, and sudoers reads
+  a space as a separator — so `Linux Admins` has to be written `Linux\ Admins`.
+  The installer escapes it for you.
+- **The filename cannot be the name.** `sudo` ignores any file in
+  `sudoers.d` whose name contains a dot or ends in `~`, which rules out
+  `Linux Admins@corp.example.com` verbatim. The name is folded to
+  `linux-admins-corp-example-com` for the filename; the rule inside spells it
+  out in full.
+- **The qualified form.** A joined machine with the default
+  `use_fully_qualified_names` only answers to `name@domain`. If a bare name
+  doesn't resolve, the installer retries `name@your.domain` and uses whichever
+  one NSS actually answers for — the same thing you would find with:
+
+  ```bash
+  getent group "Linux Admins@corp.example.com"
+  getent passwd jdoe@corp.example.com
+  ```
+
+  A group that resolves has its member list printed back, which is the quickest
+  way to confirm you have the group you meant rather than a local one of the
+  same name.
+- **Nothing invalid is ever installed.** The rule is written to a temporary
+  file, checked with `visudo -c`, and only then moved into `/etc/sudoers.d`
+  with mode `0440`, owned by root. A syntax error anywhere in that directory
+  makes `sudo` refuse to run *at all*, so a file that fails the check must never
+  exist at that path even briefly.
+- **Names sudoers cannot hold** — anything containing `,` `=` `:` `!` `#` `(`
+  `)` or a backslash, and the literal `ALL` — are refused up front rather than
+  turned into a rule that means something other than what you typed.
+
+If a name resolves to nothing, it says so and asks whether to write the rule
+anyway; a name given with `--sudo-user`/`--sudo-group` is taken as deliberate
+and written with a warning. Group membership is read at login, so a member who
+is already signed in has to log out and back in before `sudo` sees it.
+
+To take a grant back:
+
+```bash
+sudo rm /etc/sudoers.d/domain-join-group-linux-admins-corp-example-com
+```
 
 ---
 
@@ -587,6 +674,8 @@ id someuser@corp.example.com        # does the directory resolve?
 kinit someuser@CORP.EXAMPLE.COM     # get a Kerberos ticket
 klist                               # inspect it
 sudo systemctl status sssd
+sudo -l -U someuser@corp.example.com  # what sudo grants that account
+getent group "Linux Admins@corp.example.com"   # the group and its members
 grep -rl pam_duo.so /etc/pam.d/     # which services require Duo
 ```
 
@@ -600,6 +689,9 @@ grep -rl pam_duo.so /etc/pam.d/     # which services require Duo
 | Domain user not found by `id` | `sssd` isn't running, or the join didn't complete. |
 | Login refused after a successful join | Access rules. `realm permit -g "Some Group"` or `realm permit --all`. |
 | Login screen lists local users only | SDDM enumerates local accounts and caps UIDs at 60000. See [the KDE note](#putting-the-domain-user-back-on-the-login-screen). |
+| A sudo grant seems to do nothing | The rule names something NSS doesn't resolve. `getent group "Linux Admins"` and `getent group "Linux Admins@<domain>"` — use whichever answers, and check with `sudo -l -U <user>`. |
+| A group member still can't use sudo | Group membership is read at login. Log out and back in, then `id` to confirm the group is in the list. |
+| `sudo` refuses to run at all | A syntax error in `/etc/sudoers.d`. Recover with `pkexec visudo` or a root console, and `visudo -c` to find the offending file. |
 | Duo is configured but never asks | Either the rule sits after a `sufficient` that already returned success, or `pam_duo.so` isn't on PAM's search path. `grep -rl pam_duo.so /etc/pam.d/` and check the journal for "module is unknown". |
 | Duo denies every login | Wrong `ikey`/`skey`/`host`, or the account isn't enrolled under the username PAM sends. `journalctl -t pam_duo` shows which. |
 | Locked out after enabling Duo | Log in on a text console as a member of the bypass group, or from the greeter if `failmode = safe` and Duo is unreachable. Then `sudo sed -i '/pam_duo.so/d' /etc/pam.d/*`. |
@@ -624,6 +716,15 @@ every entry dispatches to an action, that the run order is a permutation of the
 entries, that every entry is actually drawn whichever column is longer, that the
 layout degrades correctly from 120x45 down to 30x12 without drawing a line wider
 than the terminal, and that cursor movement wraps the way the two columns imply.
+
+The sudo grants are covered the same way, since a bad file in `/etc/sudoers.d`
+stops `sudo` working entirely: that a principal with spaces, `@` and dots folds
+into a filename `sudo` will read; that the rule escapes the space and carries
+`%` only for a group; that names holding sudoers syntax — and the literal `ALL`
+— are refused; that a rule `visudo` rejects never reaches the directory and the
+write reports failure; that the file lands mode `0440`; that a comma separated
+list writes one file per name; that `--dry-run` and `-y` with no flags write
+nothing at all.
 
 For Duo, where a mistake is a lockout or a silent 2FA bypass, the risky parts are
 tested directly rather than by inspection: the credential formats; which

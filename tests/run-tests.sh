@@ -255,12 +255,12 @@ check "60x30 is not too small"       "0" "$ML_TOO_SMALL"
 layout_at 30 12
 check "30x12 reports too small"      "1" "$ML_TOO_SMALL"
 # The floor the README quotes. Adding a menu entry moves it, so it is pinned.
-layout_at 40 20
-check "40x20 is the smallest usable size" "0" "$ML_TOO_SMALL"
-layout_at 39 20
+layout_at 40 21
+check "40x21 is the smallest usable size" "0" "$ML_TOO_SMALL"
+layout_at 39 21
 check "39 columns is too narrow"          "1" "$ML_TOO_SMALL"
-layout_at 40 19
-check "19 rows is too short"              "1" "$ML_TOO_SMALL"
+layout_at 40 20
+check "20 rows is too short"              "1" "$ML_TOO_SMALL"
 
 # No drawn line may be wider than the terminal, or the redraw leaves debris.
 overlong=0
@@ -747,6 +747,111 @@ section "Duo: extras keyword drives the configuration step, not a package"
   check "-e duo sets WANT_DUO" "1" "$WANT_DUO"
   check_lacks "-e duo adds no package to the preview" "duo-unix" "${WANTED_PACKAGES[*]}" )
 PASS=$((PASS + 2))
+
+section "sudo rights: turning a principal into a filename"
+# sudo skips any file in sudoers.d whose name holds a dot or ends in '~', so a
+# domain principal cannot simply be pasted in as the filename.
+check "a plain account is unchanged"     "jdoe" "$(sudoers_slug jdoe)"
+check "spaces, '@' and dots all fold"    "linux-admins-corp-example-com" \
+      "$(sudoers_slug 'Linux Admins@corp.example.com')"
+check "runs of separators collapse"      "a-b-c" "$(sudoers_slug 'A--B..C')"
+check "leading and trailing dashes go"   "jdoe"  "$(sudoers_slug '  jdoe  ')"
+check "a name with nothing usable slugs to nothing" "" "$(sudoers_slug '@@@')"
+check "no slug means no file is written" "1" \
+      "$(SUDOERS_DIR="$(mktemp -d)" DRY_RUN=0; sudoers_write_rule user '@@@' >/dev/null 2>&1; echo $?)"
+
+section "sudo rights: names sudoers cannot carry"
+for good in "jdoe" "Linux Admins" "Linux Admins@corp.example.com" "svc.account_1" "host\$"; do
+    check "'$good' is accepted" "0" "$(valid_sudo_principal "$good"; echo $?)"
+done
+# Each of these is sudoers syntax, not part of a name. Writing one out produces
+# a rule that means something other than what was typed.
+for bad in "a,b" "a=b" "a:b" "a!b" "a#b" "a(b" 'back\slash' " leading" "trailing " ""; do
+    check "'$bad' is rejected" "1" "$(valid_sudo_principal "$bad"; echo $?)"
+done
+check "'ALL' is rejected as a name" "1" "$(valid_sudo_principal ALL; echo $?)"
+
+section "sudo rights: writing the drop-in"
+SUDO_TMP="$(mktemp -d)"
+SUDOERS_DIR="$SUDO_TMP"
+DRY_RUN=0
+sudoers_write_rule group "Linux Admins@corp.example.com" >/dev/null 2>&1
+grp_file="$SUDO_TMP/domain-join-group-linux-admins-corp-example-com"
+check "the group file is created" "yes" "$([[ -f "$grp_file" ]] && echo yes || echo no)"
+check "and is read-only, no write bit anywhere" "440" "$(stat -c '%a' "$grp_file" 2>/dev/null)"
+# The space is the one character common in AD group names that sudoers reads as
+# a separator, and '%' is what makes the rule match a group rather than a user.
+check "the group rule escapes the space" \
+      '%Linux\ Admins@corp.example.com ALL=(ALL:ALL) ALL' \
+      "$(grep -v '^#' "$grp_file")"
+
+sudoers_write_rule user "jdoe@corp.example.com" >/dev/null 2>&1
+usr_file="$SUDO_TMP/domain-join-user-jdoe-corp-example-com"
+check "the user file is created" "yes" "$([[ -f "$usr_file" ]] && echo yes || echo no)"
+check "a user rule carries no '%'" "jdoe@corp.example.com ALL=(ALL:ALL) ALL" \
+      "$(grep -v '^#' "$usr_file")"
+check "user and group files are separate" "2" "$(ls -1 "$SUDO_TMP" | wc -l)"
+
+# A second run must not stack up identical files and backups of them.
+before="$(stat -c '%Y %s' "$grp_file")"
+sudoers_write_rule group "Linux Admins@corp.example.com" >/dev/null 2>&1
+check "writing the same grant twice leaves the file alone" "$before" \
+      "$(stat -c '%Y %s' "$grp_file")"
+check "and adds no second file" "2" "$(ls -1 "$SUDO_TMP" | wc -l)"
+
+# A syntax error anywhere in sudoers.d makes sudo refuse to run at all, so the
+# check has to happen before the file is in place, never after.
+if have visudo; then
+    sudoers_write_rule user "a=b" >/dev/null 2>&1
+    check "a rule visudo rejects is never installed" "" \
+          "$(ls -1 "$SUDO_TMP" | grep 'a-b' || true)"
+    check "and the write reports failure" "1" \
+          "$(sudoers_write_rule user 'a=b' >/dev/null 2>&1; echo $?)"
+else
+    printf '  %s visudo is not installed; skipped the syntax-check tests\n' "$(green PASS)"
+    ((PASS++))
+fi
+
+DRY_RUN=1
+rm -rf "${SUDO_TMP:?}"/*
+sudoers_write_rule group "Linux Admins" >/dev/null 2>&1
+check "--dry-run writes nothing" "0" "$(ls -1 "$SUDO_TMP" | wc -l)"
+DRY_RUN=0
+rm -rf "$SUDO_TMP"
+
+section "sudo rights: the flags"
+( CLI_DIRECTED=0; OPT_SUDO_USER=""; OPT_SUDO_GROUP=""
+  parse_args --sudo-user jdoe --sudo-group 'Linux Admins' >/dev/null 2>&1
+  check "--sudo-user is stored"  "jdoe"          "$OPT_SUDO_USER"
+  check "--sudo-group is stored" "Linux Admins"  "$OPT_SUDO_GROUP"
+  check "--sudo-group skips the menu" "1" "$CLI_DIRECTED" )
+PASS=$((PASS + 3))
+
+# A name may contain spaces, so only the comma separates one from the next.
+SUDO_TMP="$(mktemp -d)"
+( SUDOERS_DIR="$SUDO_TMP"; DRY_RUN=0; ASSUME_YES=1
+  OPT_SUDO_USER=""; OPT_SUDO_GROUP="Linux Admins, Server Admins"
+  SUDO_ACCESS_DONE=0
+  configure_sudo_access >/dev/null 2>&1 )
+check "a comma separated list writes one file per group" "2" "$(ls -1 "$SUDO_TMP" | wc -l)"
+check "the first group keeps its space" "yes" \
+      "$([[ -f "$SUDO_TMP/domain-join-group-linux-admins" ]] && echo yes || echo no)"
+check "the second group is trimmed, not mangled" "yes" \
+      "$([[ -f "$SUDO_TMP/domain-join-group-server-admins" ]] && echo yes || echo no)"
+
+# -y with neither flag is a deliberate "leave sudo alone", not a licence to guess.
+( SUDOERS_DIR="$SUDO_TMP"; DRY_RUN=0; ASSUME_YES=1
+  OPT_SUDO_USER=""; OPT_SUDO_GROUP=""
+  SUDO_ACCESS_DONE=0
+  configure_sudo_access >/dev/null 2>&1 )
+check "-y with no flags grants nothing" "2" "$(ls -1 "$SUDO_TMP" | wc -l)"
+rm -rf "$SUDO_TMP"
+SUDOERS_DIR="/etc/sudoers.d"
+
+section "sudo rights: the guard against asking twice"
+( SUDO_ACCESS_DONE=1
+  check "a second call is a no-op" "" "$(configure_sudo_access 2>&1)" )
+PASS=$((PASS + 1))
 
 section "CLI smoke tests"
 for args in "--help" "--version"; do
