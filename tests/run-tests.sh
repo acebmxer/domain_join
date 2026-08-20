@@ -468,6 +468,68 @@ check "five local accounts -> threshold 4" "4" "$(thr 5)"
 check "no local account is unusable" "unusable" "$(thr 0)"
 check "garbage is unusable"          "unusable" "$(thr '')"
 
+section "SDDM forked theme: the showUserList patch"
+# Arming the getpwnam() fallback is not enough on its own: Breeze refuses to
+# draw a user list once containsAllUsers is false, and false is exactly what
+# UserModel sets in the branch that appends the domain user. Both bails have to
+# go, or the greeter falls back to a pre-filled username field.
+qml="$INI_TMP/Main.qml"
+write_breeze_showuserlist() {
+    cat >"$qml" <<'QML'
+                showUserList: {
+                    if (!userListModel.hasOwnProperty("count")
+                        || !userListModel.hasOwnProperty("disableAvatarsThreshold")) {
+                        return false
+                    }
+
+                    if (userListModel.count === 0 ) {
+                        return false
+                    }
+
+                    if (userListModel.hasOwnProperty("containsAllUsers") && !userListModel.containsAllUsers) {
+                        return false
+                    }
+
+                    return userListModel.count <= userListModel.disableAvatarsThreshold
+                }
+QML
+}
+
+write_breeze_showuserlist
+check "the patch applies to Breeze's block" "yes" \
+    "$(sddm_patch_main_qml "$qml" >/dev/null 2>&1 && echo yes || echo no)"
+check "the containsAllUsers bail is neutralised" "0" \
+    "$(grep -c '&& !userListModel\.containsAllUsers' "$qml")"
+check "the threshold comparison is gone" "0" \
+    "$(grep -c 'count <= userListModel\.disableAvatarsThreshold' "$qml")"
+check "the list is drawn whenever the model has anyone" "1" \
+    "$(grep -c 'return userListModel\.count > 0' "$qml")"
+check "the empty-model guard is left alone" "1" \
+    "$(grep -c 'userListModel\.count === 0' "$qml")"
+
+# A silently unpatched copy is worse than no fork at all: it looks like a
+# working theme and behaves like the broken one. If Plasma rewrites the block,
+# the patch has to report failure so the caller leaves the login screen alone.
+printf 'showUserList: { return somethingCompletelyDifferent }\n' >"$qml"
+check "a rewritten block is reported, not ignored" "no" \
+    "$(sddm_patch_main_qml "$qml" >/dev/null 2>&1 && echo yes || echo no)"
+
+section "SDDM forked theme: finding what to fork from"
+# Re-running must refresh the fork from the packaged theme. Forking the fork
+# would patch an already-patched Main.qml and, once upstream changes, quietly
+# accumulate a copy of a copy.
+themes="$INI_TMP/themes"
+mkdir -p "$themes/breeze" "$themes/breeze-domain"
+check "a packaged theme is its own source" "breeze" \
+    "$(sddm_fork_source breeze "$themes")"
+printf 'source=breeze\nbuilt=2026-08-20\n' >"$themes/breeze-domain/.domain-join-setup.source"
+check "a fork names the theme it came from" "breeze" \
+    "$(sddm_fork_source breeze-domain "$themes")"
+check "an unknown theme is passed through" "elarun" \
+    "$(sddm_fork_source elarun "$themes")"
+check "a theme root without the theme finds nothing" "no" \
+    "$(sddm_theme_dir nosuchtheme "$themes" >/dev/null 2>&1 && echo yes || echo no)"
+
 section "Duo: package map"
 for fam in debian rhel suse arch; do
     PKG_FAMILY="$fam"

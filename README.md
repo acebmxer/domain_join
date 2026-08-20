@@ -422,6 +422,43 @@ So the installer sets the threshold to one below the number of local accounts.
 The branch then fires on the last local account: every local user is already in
 the model, the domain user is appended by name, and nothing is lost.
 
+#### …and that still does not draw a user list
+
+Getting the account into the model is only half of it. Breeze decides whether to
+draw tiles at all in `Main.qml`:
+
+```qml
+showUserList: {
+    ...
+    if (userListModel.hasOwnProperty("containsAllUsers")
+        && !userListModel.containsAllUsers) {
+        return false                                                      // (1)
+    }
+    return userListModel.count <= userListModel.disableAvatarsThreshold   // (2)
+}
+```
+
+Both of those fire. **(1)** because `UserModel` sets `containsAllUsers = false`
+in the very branch that appends the domain user — on every released SDDM the
+only code path that adds the account is the one that marks the model partial.
+**(2)** because the threshold has to sit *below* the user count for that branch
+to run at all, which is the exact opposite of what this test wants.
+
+The greeter therefore falls back to a username field with the remembered name
+typed into it. That is better than clicking "Other" and typing it yourself, but
+it is not a user list, and no combination of settings makes it one.
+
+So the installer forks the theme and patches those two lines. Everything except
+`Main.qml` is **symlinked** at the packaged theme, so a Plasma upgrade keeps the
+fork's assets, translations and sub-components current and only the one patched
+file can go stale — and the fork is rebuilt from source on every run, so that
+staleness is corrected the next time the installer is used. The packaged theme
+is never modified; `diff -r` against it comes back clean.
+
+If Plasma ever rewrites `showUserList` past recognition, the patch reports
+failure and the login screen is left alone rather than replaced by a fork that
+looks configured and behaves exactly like the unpatched greeter.
+
 When SDDM is the active display manager, the installer offers to write:
 
 ```ini
@@ -431,16 +468,26 @@ MinimumUid=1000
 RememberLastUser=true
 
 [Theme]
+Current=breeze-domain        # the fork, built from whatever theme was selected
 DisableAvatarsThreshold=1    # (local accounts in 1000-60000) - 1
 EnableAvatars=true           # explicit: the model auto-disables avatars past
                              # the threshold, but only while still default
 ```
 
-```ini
-# /usr/share/sddm/themes/<theme>/theme.conf.user
-[General]
-needsFullUserModel=false
 ```
+/usr/share/sddm/themes/breeze-domain/
+├── Main.qml                      # copy, two lines patched
+├── metadata.desktop              # copy, renamed for Plasma's Login Screen module
+├── theme.conf.user               # needsFullUserModel=false
+├── .domain-join-setup.source     # origin + sha256 of the Main.qml it came from
+├── theme.conf   -> ../breeze/theme.conf
+├── Login.qml    -> ../breeze/Login.qml
+└── …                             # every other file, symlinked
+```
+
+The stamp file is what stops a second run forking the fork: `sddm_fork_source`
+reads the recorded origin and re-derives from the real Breeze rather than
+patching an already-patched `Main.qml`.
 
 Three details in that drop-in are deliberate:
 
@@ -463,11 +510,20 @@ Three details in that drop-in are deliberate:
   whole drop-in directory, so a key set there beats every drop-in; the installer
   warns if it sees one.
 
-`theme.conf.user` is SDDM's own override file, so the packaged `theme.conf` is
-never touched and the setting survives a Plasma upgrade. Both files take effect
-at the next login screen. The first domain login still goes through "Other";
-the account is remembered from then on, exactly as a fresh Windows machine
-behaves.
+`theme.conf.user` is SDDM's own override file and it lives *inside the fork*, so
+the distribution's `theme.conf` is not even opened for writing. Everything takes
+effect at the next login screen: local accounts and the last domain user appear
+as tiles, and Breeze's own "Other…" button covers a first login or anyone else.
+The first domain login still goes through "Other"; the account is remembered
+from then on, exactly as a fresh Windows machine behaves.
+
+> Upstream has already fixed this. On SDDM's `develop` branch the `getpwnam()`
+> fallback was hoisted out of the loop, so it runs unconditionally,
+> `containsAllUsers` stays `true`, and stock Breeze draws the tiles with nothing
+> but `RememberLastUser`. That is unreleased — v0.21.0 is still the newest tag —
+> and the installer does not try to detect it, because a branch for a version
+> that does not exist yet cannot be tested against one. When 0.22 ships, the
+> fork can be dropped.
 
 > **Never run `sddm --version`,** and don't `systemctl restart sddm` from inside
 > a running session either. On Kubuntu's build the daemon does not recognise

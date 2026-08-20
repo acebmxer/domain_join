@@ -1138,6 +1138,167 @@ sddm_avatar_threshold() {
     printf '%s' "$(( n - 1 ))"
 }
 
+# --- The forked theme ------------------------------------------------------
+#
+# Arming the getpwnam() fallback puts the domain user in the model but does not
+# put them on screen, because Breeze refuses to draw a user list at all once the
+# model is incomplete. Main.qml:
+#
+#     showUserList: {
+#         ...
+#         if (userListModel.hasOwnProperty("containsAllUsers")
+#             && !userListModel.containsAllUsers) {
+#             return false                                     // (1)
+#         }
+#         return userListModel.count <= userListModel.disableAvatarsThreshold  // (2)
+#     }
+#
+# Both bails fire. (1) because UserModel sets containsAllUsers = false in the
+# very branch that appends the domain user - on every released SDDM the only
+# code path that adds the account is the one that marks the model partial. (2)
+# because the threshold has to sit *below* the user count for that branch to run
+# at all, which is the exact opposite of what this test wants. The greeter falls
+# back to a username field with the remembered name typed in, which is not a
+# user list.
+#
+# Neither is reachable from configuration, so the theme is forked and those two
+# lines are patched. Everything except Main.qml is symlinked at the packaged
+# theme, so a Plasma upgrade keeps the fork's assets and sub-components current
+# and only the one patched file can go stale; the fork is rebuilt from source on
+# every run, so that staleness is corrected the next time this is used.
+#
+# SDDM's develop branch has already hoisted the fallback out of the loop, so
+# containsAllUsers stays true and stock Breeze needs no patch. That is
+# unreleased - v0.21.0 is still the newest tag - and nothing here tries to
+# detect it, because a branch for a version that does not exist yet cannot be
+# tested against one. When 0.22 ships, the fork can be dropped and the drop-in
+# reduced to RememberLastUser on its own.
+# Not readonly: the test suite redirects it at a temporary tree so a fork can be
+# built and inspected end to end without writing under /usr or needing root.
+SDDM_THEME_ROOT="${SDDM_THEME_ROOT:-/usr/share/sddm/themes}"
+readonly SDDM_FORK_SUFFIX="-domain"
+readonly SDDM_FORK_STAMP=".domain-join-setup.source"
+
+# sddm_theme_dir <name> [root] - where a theme actually lives, or nothing. The
+# optional root is what the test suite points at a temporary tree, so the
+# lookup can be exercised without writing under /usr.
+sddm_theme_dir() {
+    local d
+    if [[ -n "${2:-}" ]]; then
+        [[ -d "$2/$1" ]] && { printf '%s' "$2/$1"; return 0; }
+        return 1
+    fi
+    for d in "$SDDM_THEME_ROOT/$1" "/usr/local/share/sddm/themes/$1"; do
+        [[ -d "$d" ]] && { printf '%s' "$d"; return 0; }
+    done
+    return 1
+}
+
+# sddm_fork_source <theme> [root] - the theme a fork should be derived from. A
+# fork records its origin, so a second run refreshes from the real Breeze
+# instead of forking the fork and patching an already-patched file.
+sddm_fork_source() {
+    local theme="$1" dir src
+    dir="$(sddm_theme_dir "$theme" "${2:-}")" || { printf '%s' "$theme"; return 0; }
+    if [[ -f "$dir/$SDDM_FORK_STAMP" ]]; then
+        src="$(awk -F= '/^source=/ { print $2 }' "$dir/$SDDM_FORK_STAMP" | tail -1)"
+        [[ -n "$src" ]] && { printf '%s' "$src"; return 0; }
+    fi
+    printf '%s' "$theme"
+}
+
+# sddm_patch_main_qml <file> - neutralise the two bails. Both anchors appear
+# exactly once in Breeze, and a mismatch is reported rather than ignored: a
+# silently unpatched copy would look like a working theme and behave like the
+# broken one.
+sddm_patch_main_qml() {
+    local f="$1"
+    sed -i \
+        -e 's|&& !userListModel\.containsAllUsers|\&\& false /* domain-join-setup: the partial model is deliberate */|' \
+        -e 's|return userListModel\.count <= userListModel\.disableAvatarsThreshold|return userListModel.count > 0 /* domain-join-setup: the threshold is tuned for the getpwnam fallback, not for hiding the list */|' \
+        "$f" || return 1
+    grep -q '&& !userListModel\.containsAllUsers' "$f" && return 1
+    grep -q 'return userListModel\.count <= userListModel\.disableAvatarsThreshold' "$f" && return 1
+    grep -q 'domain-join-setup' "$f" || return 1
+    return 0
+}
+
+# sddm_build_forked_theme <source_theme> - build <source>-domain, print its name.
+#
+# Built in a staging directory and swapped in only once the patch has verified,
+# because the live theme is what the login screen loads: a half-built one is a
+# machine nobody can log into.
+sddm_build_forked_theme() {
+    local src="$1" srcdir forkname forkdir staging entry base
+    srcdir="$(sddm_theme_dir "$src")" || { warn "SDDM theme '$src' was not found."; return 1; }
+    forkname="${src}${SDDM_FORK_SUFFIX}"
+    forkdir="$SDDM_THEME_ROOT/$forkname"
+    staging="${forkdir}.new"
+
+    if [[ ! -f "$srcdir/Main.qml" ]]; then
+        warn "$srcdir has no Main.qml, so there is nothing to fork."
+        return 1
+    fi
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        printf '%s  [dry-run]%s fork %s -> %s (Main.qml patched, everything else symlinked)\n' \
+            "$C_CYAN" "$C_RESET" "$srcdir" "$forkdir"
+        printf '%s' "$forkname"
+        return 0
+    fi
+
+    # Only ever replace a directory this script built. Anything else under that
+    # name is somebody's own theme and is left strictly alone.
+    if [[ -e "$forkdir" && ! -f "$forkdir/$SDDM_FORK_STAMP" ]]; then
+        warn "$forkdir exists but was not created by this installer; leaving it alone."
+        return 1
+    fi
+
+    rm -rf -- "$staging" || return 1
+    mkdir -p "$staging" || return 1
+
+    for entry in "$srcdir"/*; do
+        [[ -e "$entry" ]] || continue
+        base="${entry##*/}"
+        [[ "$base" == "Main.qml" || "$base" == "metadata.desktop" ]] && continue
+        ln -sfn "$entry" "$staging/$base" || { rm -rf -- "$staging"; return 1; }
+    done
+
+    cp -a "$srcdir/Main.qml" "$staging/Main.qml" || { rm -rf -- "$staging"; return 1; }
+    if ! sddm_patch_main_qml "$staging/Main.qml"; then
+        warn "Breeze's showUserList no longer matches what this patch expects."
+        note "Plasma has rewritten Main.qml, so the fork would be built and do nothing."
+        note "The login screen is left exactly as it is rather than changed into a lie."
+        rm -rf -- "$staging"
+        return 1
+    fi
+
+    # Its own copy, so the fork is distinguishable in Plasma's Login Screen module
+    # instead of showing up as a second entry with the same name as the original.
+    if [[ -f "$srcdir/metadata.desktop" ]]; then
+        cp -a "$srcdir/metadata.desktop" "$staging/metadata.desktop" \
+            && sed -i "s|^Name=.*|Name=${src} (domain users)|" "$staging/metadata.desktop"
+    fi
+
+    # needsFullUserModel lives in the fork, so the packaged theme is never
+    # touched at all - theme.conf above is a symlink to the distribution's own.
+    ini_set "$staging/theme.conf.user" General needsFullUserModel false \
+        || { rm -rf -- "$staging"; return 1; }
+
+    {
+        printf 'source=%s\n' "$src"
+        printf 'source_dir=%s\n' "$srcdir"
+        printf 'source_main_qml_sha256=%s\n' "$(sha256sum "$srcdir/Main.qml" | awk '{print $1}')"
+        printf 'built=%s\n' "$(date -Is)"
+        printf 'by=%s\n' "$PROGRAM_NAME"
+    } > "$staging/$SDDM_FORK_STAMP" || { rm -rf -- "$staging"; return 1; }
+
+    rm -rf -- "$forkdir" || { rm -rf -- "$staging"; return 1; }
+    mv -T "$staging" "$forkdir" || return 1
+
+    printf '%s' "$forkname"
+}
+
 # configure_sddm_greeter - put the domain user back on the login screen.
 #
 # SDDM builds its user list with getpwent(), which SSSD deliberately answers
@@ -1239,26 +1400,25 @@ configure_sddm_greeter() {
     ini_set "$dropin" Theme EnableAvatars true                    || { warn "Could not write $dropin."; return 0; }
     [[ $DRY_RUN -eq 0 ]] && ok "$dropin: last-user lookup armed ($users local accounts, threshold $threshold)"
 
-    local theme theme_dir
+    local theme source forkname
     theme="$(sddm_current_theme)"
-    for theme_dir in "/usr/share/sddm/themes/$theme" "/usr/local/share/sddm/themes/$theme"; do
-        [[ -d "$theme_dir" ]] && break
-        theme_dir=""
-    done
-    if [[ -z "$theme_dir" ]]; then
-        warn "SDDM theme '$theme' was not found; skipping the theme override."
+    source="$(sddm_fork_source "$theme")"
+    if ! sddm_theme_dir "$source" >/dev/null; then
+        warn "SDDM theme '$source' was not found; leaving the login screen alone."
         return 0
     fi
 
-    # theme.conf.user is SDDM's own override file, so the packaged theme.conf
-    # stays untouched and the change survives a Plasma upgrade.
-    local override="$theme_dir/theme.conf.user"
-    backup_file "$override"
-    if ! ini_set "$override" General needsFullUserModel false; then
-        warn "Could not write $override."
+    if ! forkname="$(sddm_build_forked_theme "$source")"; then
+        note "The drop-in above still stands, so the remembered user is offered as a"
+        note "pre-filled username. That is SDDM's own behaviour without the patched theme."
         return 0
     fi
-    [[ $DRY_RUN -eq 0 ]] && ok "$override: greeter shows the last logged-in user"
+
+    if ! ini_set "$dropin" Theme Current "$forkname"; then
+        warn "Could not point SDDM at $forkname; the packaged theme stays selected."
+        return 0
+    fi
+    [[ $DRY_RUN -eq 0 ]] && ok "$dropin: theme set to $forkname (local users and the last domain user as tiles)"
 
     note "Applies at the next login screen. Log out normally when you are ready."
     warn "Do not 'systemctl restart sddm' from inside a session: that starts a fresh greeter"
