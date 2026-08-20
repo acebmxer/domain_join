@@ -1384,10 +1384,16 @@ configure_sddm_greeter() {
 
     # /etc/sddm.conf is appended *after* the drop-in directory, so it overrides
     # every drop-in. Worth saying out loud rather than silently losing to it.
+    # Current belongs in this list above all: it is the key that selects the
+    # forked theme, so a Current= in /etc/sddm.conf does not merely weaken the
+    # result, it discards the whole thing while every other setting still looks
+    # correctly applied.
     if [[ -f /etc/sddm.conf ]] \
-       && grep -qE '^[[:space:]]*(MaximumUid|MinimumUid|DisableAvatarsThreshold|EnableAvatars|RememberLastUser)[[:space:]]*=' \
+       && grep -qE '^[[:space:]]*(Current|MaximumUid|MinimumUid|DisableAvatarsThreshold|EnableAvatars|RememberLastUser)[[:space:]]*=' \
             /etc/sddm.conf 2>/dev/null; then
         warn "/etc/sddm.conf sets one of these keys itself, and it is read after the drop-ins."
+        grep -nE '^[[:space:]]*(Current|MaximumUid|MinimumUid|DisableAvatarsThreshold|EnableAvatars|RememberLastUser)[[:space:]]*=' \
+            /etc/sddm.conf 2>/dev/null | while read -r line; do note "  /etc/sddm.conf:$line"; done
         note "Remove the conflicting line from /etc/sddm.conf or this drop-in will not win."
     fi
 
