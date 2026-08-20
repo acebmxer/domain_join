@@ -27,7 +27,7 @@
 set -uo pipefail
 
 readonly PROGRAM_NAME="domain-join-setup"
-readonly SCRIPT_VERSION="1.3.0"
+readonly SCRIPT_VERSION="1.4.0"
 
 # ---------------------------------------------------------------------------
 # Runtime options (overridable by flags)
@@ -4332,6 +4332,144 @@ process_menu_selections() {
 }
 
 # ---------------------------------------------------------------------------
+# Staying current
+# ---------------------------------------------------------------------------
+# There is no packaging here and no version handshake: whatever file is sitting
+# on the machine is what runs. A checkout three commits behind looks exactly
+# like a current one, produces log lines that look exactly like a current one's,
+# and only diverges at the point where it does the wrong thing - by which time
+# the obvious conclusion is that the new code does not work, rather than that it
+# was never running. So the launch checks, says what is missing, and offers to
+# fix it before anything else happens.
+UPDATE_CHECK=1          # --no-update-check turns the launch check off
+UPDATE_ONLY=0           # --update checks, updates, and exits
+declare -a ORIGINAL_ARGV=()
+
+# script_path - the running file, absolute.
+script_path() {
+    local p="${BASH_SOURCE[0]}"
+    [[ "$p" == /* ]] || p="$PWD/$p"
+    printf '%s' "$p"
+}
+
+# script_repo - the git checkout the running script lives in, or nothing. The
+# .git directory is tested directly rather than asking git, so a script sitting
+# outside a checkout costs nothing and prints nothing.
+script_repo() {
+    local dir
+    have git || return 1
+    dir="$(cd -- "$(dirname -- "$(script_path)")" 2>/dev/null && pwd)" || return 1
+    [[ -d "$dir/.git" ]] || return 1
+    printf '%s' "$dir"
+}
+
+# git_in_repo <dir> <args...> - git against the checkout, as its owner.
+#
+# This script is normally run under sudo while the checkout belongs to whoever
+# cloned it. Running git as root there trips the dubious-ownership refusal, and
+# when it does not, it leaves root-owned objects behind that break the owner's
+# next pull. Dropping back to the owner avoids both. Every call is bounded, so
+# an unreachable remote delays the launch rather than hanging it.
+git_in_repo() {
+    local dir="$1"; shift
+    local owner
+    owner="$(stat -c '%U' "$dir" 2>/dev/null)" || return 1
+    if [[ $EUID -eq 0 && "$owner" != "root" ]] && have sudo; then
+        timeout 20 sudo -n -u "$owner" git -C "$dir" "$@"
+    else
+        timeout 20 git -C "$dir" -c "safe.directory=$dir" "$@"
+    fi
+}
+
+# update_status <dir> - "current", "behind" or "unknown". Anything the check
+# cannot establish is "unknown", never "current": a failed fetch must not be
+# reported as being up to date.
+update_status() {
+    local dir="$1" branch upstream local_rev remote_rev
+    branch="$(git_in_repo "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+    [[ -n "$branch" && "$branch" != "HEAD" ]] || { printf 'unknown'; return 0; }
+    git_in_repo "$dir" fetch --quiet 2>/dev/null || { printf 'unknown'; return 0; }
+    upstream="$(git_in_repo "$dir" rev-parse --abbrev-ref '@{upstream}' 2>/dev/null)"
+    [[ -n "$upstream" ]] || { printf 'unknown'; return 0; }
+    local_rev="$(git_in_repo "$dir" rev-parse HEAD 2>/dev/null)"
+    remote_rev="$(git_in_repo "$dir" rev-parse "$upstream" 2>/dev/null)"
+    [[ -n "$local_rev" && -n "$remote_rev" ]] || { printf 'unknown'; return 0; }
+    [[ "$local_rev" == "$remote_rev" ]] && { printf 'current'; return 0; }
+    if [[ -n "$(git_in_repo "$dir" rev-list "${local_rev}..${remote_rev}" 2>/dev/null)" ]]; then
+        printf 'behind'
+    else
+        printf 'current'      # ahead, or diverged locally - not this check's business
+    fi
+}
+
+# check_for_update - run before anything else touches the system.
+check_for_update() {
+    (( UPDATE_CHECK )) || return 0
+
+    local dir status upstream
+    if ! dir="$(script_repo)"; then
+        if (( UPDATE_ONLY )); then
+            warn "$(script_path) is not inside a git checkout, so there is nothing to update from."
+            note "Copy the file over by hand, or clone the repository and run it from there."
+            exit 1
+        fi
+        return 0
+    fi
+
+    status="$(update_status "$dir")"
+    case "$status" in
+        current)
+            if (( UPDATE_ONLY )); then
+                ok "Already up to date ($(git_in_repo "$dir" rev-parse --short HEAD 2>/dev/null))."
+                exit 0
+            fi
+            return 0
+            ;;
+        unknown)
+            if (( UPDATE_ONLY )); then
+                warn "Could not work out whether this checkout is current; it is left alone."
+                exit 1
+            fi
+            # Silent on a normal launch: an offline machine is a supported way to
+            # run this, and a warning on every start would train people to ignore
+            # the one that matters.
+            return 0
+            ;;
+    esac
+
+    upstream="$(git_in_repo "$dir" rev-parse --abbrev-ref '@{upstream}' 2>/dev/null)"
+    printf '\n'
+    warn "This checkout is behind ${upstream:-its remote}. The following commits are missing:"
+    git_in_repo "$dir" log --oneline "HEAD..@{upstream}" 2>/dev/null \
+        | while read -r line; do note "  $line"; done
+    note "Running now runs the old code. It will look and log exactly like the new code."
+
+    if (( DRY_RUN )); then
+        note "--dry-run changes nothing, so the checkout is left as it is."
+        return 0
+    fi
+
+    if ! confirm "Update and restart the script?" "y"; then
+        (( UPDATE_ONLY )) && exit 0
+        warn "Continuing on the old code."
+        return 0
+    fi
+
+    if ! git_in_repo "$dir" pull --ff-only --quiet; then
+        warn "Update failed: the checkout has local changes, or it has diverged from the remote."
+        note "Sort it out with git, or use --no-update-check to run the old code deliberately."
+        exit 1
+    fi
+    ok "Updated to $(git_in_repo "$dir" rev-parse --short HEAD 2>/dev/null)."
+    (( UPDATE_ONLY )) && exit 0
+
+    # Re-exec so the rest of this run is the code that was just pulled, rather
+    # than the half of it bash has already parsed.
+    note "Restarting with the new code."
+    exec "$(script_path)" ${ORIGINAL_ARGV[@]+"${ORIGINAL_ARGV[@]}"}
+}
+
+# ---------------------------------------------------------------------------
 # Usage
 # ---------------------------------------------------------------------------
 usage() {
@@ -4366,6 +4504,8 @@ ${C_BOLD}OPTIONS${C_RESET}
   -y, --yes               Non-interactive; accept every recommended default.
   -n, --dry-run           Print what would happen without changing anything.
   -l, --list              Show the packages for this system and exit.
+      --update            Update this checkout from its remote and exit.
+      --no-update-check   Do not check for a newer version at startup.
   -h, --help              This help.
       --version           Print the version.
 
@@ -4415,6 +4555,8 @@ EOF
 # menu in place.
 parse_args() {
     local skey_on_cmdline=0
+    # Kept verbatim so check_for_update can re-exec the run exactly as asked.
+    ORIGINAL_ARGV=("$@")
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -d|--domain)   OPT_DOMAIN="${2:-}"; CLI_DIRECTED=1; shift 2 ;;
@@ -4448,6 +4590,8 @@ parse_args() {
             -y|--yes)      ASSUME_YES=1; CLI_DIRECTED=1; shift ;;
             -n|--dry-run)  DRY_RUN=1; shift ;;
             -l|--list)     LIST_ONLY=1; CLI_DIRECTED=1; shift ;;
+            --update)          UPDATE_ONLY=1; CLI_DIRECTED=1; shift ;;
+            --no-update-check) UPDATE_CHECK=0; shift ;;
             -h|--help)     usage; exit 0 ;;
             --version)     printf '%s %s\n' "$PROGRAM_NAME" "$SCRIPT_VERSION"; exit 0 ;;
             *)             err "Unknown option: $1"; printf '\n'; usage; exit 2 ;;
@@ -4520,6 +4664,7 @@ menu_wanted() {
 
 main() {
     parse_args "$@"
+    check_for_update    # before anything reads the system or edits a file
 
     detect_distro
     detect_de          # before the sudo re-exec, while the session vars exist
