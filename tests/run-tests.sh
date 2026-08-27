@@ -255,12 +255,12 @@ check "60x30 is not too small"       "0" "$ML_TOO_SMALL"
 layout_at 30 12
 check "30x12 reports too small"      "1" "$ML_TOO_SMALL"
 # The floor the README quotes. Adding a menu entry moves it, so it is pinned.
-layout_at 40 21
-check "40x21 is the smallest usable size" "0" "$ML_TOO_SMALL"
-layout_at 39 21
+layout_at 40 22
+check "40x22 is the smallest usable size" "0" "$ML_TOO_SMALL"
+layout_at 39 22
 check "39 columns is too narrow"          "1" "$ML_TOO_SMALL"
-layout_at 40 20
-check "20 rows is too short"              "1" "$ML_TOO_SMALL"
+layout_at 40 21
+check "21 rows is too short"              "1" "$ML_TOO_SMALL"
 
 # No drawn line may be wider than the terminal, or the redraw leaves debris.
 overlong=0
@@ -968,6 +968,127 @@ eval "$ASK_VALUE_REAL"
 ASSUME_YES=0
 rm -rf "$SUDO_TMP"
 SUDOERS_DIR="/etc/sudoers.d"
+
+section "WinApps: the flags"
+winapps_after() {
+    ( OPT_WINAPPS=-1; OPT_WINAPPS_BACKEND=""; OPT_WINAPPS_CREDS=""
+      OPT_WINAPPS_HOST=""; OPT_WINAPPS_RDP_USER=""; WINAPPS_REMOVE=0; ASSUME_YES=0
+      parse_args "$@" >/dev/null 2>&1
+      printf '%s|%s|%s|%s' "$OPT_WINAPPS" "$OPT_WINAPPS_BACKEND" \
+             "$OPT_WINAPPS_CREDS" "$WINAPPS_REMOVE" )
+}
+check "--winapps turns it on"        "1|||0"          "$(winapps_after --winapps)"
+check "--no-winapps turns it off"    "0|||0"          "$(winapps_after --no-winapps)"
+check "--winapps-backend implies on" "1|libvirt||0"   "$(winapps_after --winapps-backend libvirt)"
+check "--winapps-creds is stored"    "1||askpass|0"   "$(winapps_after --winapps-creds askpass)"
+check "--winapps-remove sets removal" "1|||1"         "$(winapps_after --winapps-remove)"
+
+# An invalid enum must stop the run rather than be carried into a config file.
+for bad in "--winapps-backend vmware" "--winapps-creds telepathy"; do
+    if ( parse_args $bad ) >/dev/null 2>&1; then
+        printf '  %s %s was accepted\n' "$(red FAIL)" "$bad"; ((FAIL++))
+    else
+        printf '  %s %s is rejected\n' "$(green PASS)" "$bad"; ((PASS++))
+    fi
+done
+
+# 'manual' has nothing to connect to without a host, and -y cannot ask.
+if ( ASSUME_YES=1; parse_args -y --winapps-backend manual ) >/dev/null 2>&1; then
+    printf '  %s manual backend with no host was accepted under -y\n' "$(red FAIL)"; ((FAIL++))
+else
+    printf '  %s manual backend demands --winapps-host under -y\n' "$(green PASS)"; ((PASS++))
+fi
+check "manual backend is fine with a host" "1|manual||0" \
+      "$(winapps_after --winapps-backend manual --winapps-host win.corp.example.com)"
+
+section "WinApps: the config template"
+WA_TMP="$(mktemp -d)"
+WINAPPS_TEMPLATE="$WA_TMP/winapps.conf.template"
+WINAPPS_ASKPASS="/usr/local/bin/winapps-askpass"
+DRY_RUN=0
+OPT_WINAPPS_RDP_USER=""; OPT_WINAPPS_RDP_PASS=""
+
+# check_contains matches whole space-delimited words, which cannot see a token
+# inside RDP_USER="...". These are plain substring assertions instead.
+check_line() {
+    local desc="$1" needle="$2" file="$3"
+    if grep -qF -- "$needle" "$file" 2>/dev/null; then
+        printf '  %s %s\n' "$(green PASS)" "$desc"; ((PASS++))
+    else
+        printf '  %s %s\n' "$(red FAIL)" "$desc"
+        printf '        %s not found in %s\n' "$needle" "$file"
+        ((FAIL++))
+    fi
+}
+
+winapps_write_template "CORP.EXAMPLE.COM" "libvirt" "askpass" "" "" "RDPWindows" >/dev/null 2>&1
+check_line "the template carries the substitution token" 'RDP_USER="@WINAPPS_USER@"' "$WINAPPS_TEMPLATE"
+check_line "the domain is written through"               'RDP_DOMAIN="CORP.EXAMPLE.COM"' "$WINAPPS_TEMPLATE"
+check_line "the backend is written through"              'WAFLAVOR="libvirt"' "$WINAPPS_TEMPLATE"
+if grep -q '^RDP_PASS=""' "$WINAPPS_TEMPLATE"; then
+    printf '  %s askpass mode stores no password\n' "$(green PASS)"; ((PASS++))
+else
+    printf '  %s askpass mode left a password in the template\n' "$(red FAIL)"; ((FAIL++))
+fi
+# libvirt discovers the guest address itself; a hard-coded one goes stale.
+if grep -qE '^RDP_IP=' "$WINAPPS_TEMPLATE"; then
+    printf '  %s libvirt pinned RDP_IP when it should not\n' "$(red FAIL)"; ((FAIL++))
+else
+    printf '  %s libvirt leaves RDP_IP for runtime discovery\n' "$(green PASS)"; ((PASS++))
+fi
+
+winapps_write_template "CORP" "manual" "askpass" "10.0.0.9" "3390" "" >/dev/null 2>&1
+check_line "manual pins the host"    'RDP_IP="10.0.0.9"' "$WINAPPS_TEMPLATE"
+check_line "manual honours the port" 'RDP_PORT="3390"'   "$WINAPPS_TEMPLATE"
+
+# Shared mode is the one path that writes a secret, so prove it lands and that
+# the token is gone - a leftover token would try to log in as '@WINAPPS_USER@'.
+OPT_WINAPPS_RDP_USER="svc-winapps"; OPT_WINAPPS_RDP_PASS="hunter2"
+winapps_write_template "CORP" "manual" "shared" "10.0.0.9" "" "" >/dev/null 2>&1
+check_line "shared mode writes the service account" 'RDP_USER="svc-winapps"' "$WINAPPS_TEMPLATE"
+check_line "shared mode writes the password"        'RDP_PASS="hunter2"'     "$WINAPPS_TEMPLATE"
+if grep -qF '@WINAPPS_USER@' "$WINAPPS_TEMPLATE" | grep -qv '^#'; then
+    printf '  %s shared mode left a substitution token behind\n' "$(red FAIL)"; ((FAIL++))
+else
+    printf '  %s shared mode substitutes nothing per user\n' "$(green PASS)"; ((PASS++))
+fi
+OPT_WINAPPS_RDP_USER=""; OPT_WINAPPS_RDP_PASS=""
+
+section "WinApps: the per-user generator"
+WINAPPS_SEEDER="$WA_TMP/winapps-user-config"
+winapps_write_template "CORP.EXAMPLE.COM" "libvirt" "askpass" "" "" "RDPWindows" >/dev/null 2>&1
+winapps_write_seeder >/dev/null 2>&1
+
+if bash -n "$WINAPPS_SEEDER" 2>/dev/null; then
+    printf '  %s the generated seeder parses\n' "$(green PASS)"; ((PASS++))
+else
+    printf '  %s the generated seeder has a syntax error\n' "$(red FAIL)"; ((FAIL++))
+fi
+
+# The point of the whole exercise: each user's own name reaches RDP_USER, with
+# the domain qualifier stripped off whichever way SSSD or Winbind presents it.
+seed_as() {
+    local login="$1" home="$WA_TMP/home/$1"
+    mkdir -p "$home"
+    HOME="$home" bash -c "
+        id() { case \"\$1\" in -u) echo 1001 ;; -un) echo '$login' ;; esac; }
+        export -f id 2>/dev/null
+        . '$WINAPPS_SEEDER'
+    " >/dev/null 2>&1
+    grep -h '^RDP_USER=' "$home/.config/winapps/winapps.conf" 2>/dev/null
+}
+check "a plain name is used as-is"        'RDP_USER="jdoe"' "$(seed_as jdoe)"
+check "an @realm suffix is stripped"      'RDP_USER="jdoe"' "$(seed_as 'jdoe@corp.example.com')"
+check 'a DOMAIN\ prefix is stripped'      'RDP_USER="jdoe"' "$(seed_as 'CORP\jdoe')"
+
+# A user who takes ownership of their copy keeps it.
+OWN="$WA_TMP/home/jdoe/.config/winapps/winapps.conf"
+printf 'RDP_USER="hand-edited"\n' >"$OWN"
+seed_as jdoe >/dev/null
+check "a copy without the marker is left alone" 'RDP_USER="hand-edited"' \
+      "$(grep '^RDP_USER=' "$OWN")"
+
+rm -rf "$WA_TMP"
 
 section "CLI smoke tests"
 for args in "--help" "--version"; do

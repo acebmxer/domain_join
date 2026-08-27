@@ -61,6 +61,28 @@ OPT_DUO_EXEMPT_GROUP="" # break-glass group whose members skip Duo
 DUO_ADD_REPO=-1         # -1 = ask before adding Duo's own package repository
 DUO_BUILD_SOURCE=-1     # -1 = ask before building Duo Unix from source
 
+# WinApps - Windows applications launched from the Linux desktop over RDP.
+#
+# The multi-user problem this solves: 'winapps' hard-codes its configuration
+# path to ${HOME}/.config/winapps/winapps.conf and has no system-wide fallback,
+# so a --system install puts the launchers in /usr/share/applications for
+# everyone while every one of those launchers still dies on a missing per-user
+# config. On a domain-joined machine the set of users is not known in advance,
+# so the config cannot be written per user ahead of time. It is generated at
+# login instead, from one root-owned template, with the account's own name
+# substituted in - which is also what makes the RDP session land in the right
+# Windows profile.
+OPT_WINAPPS=-1           # -1 = ask, 0 = no, 1 = yes
+OPT_WINAPPS_BACKEND=""   # libvirt | docker | podman | manual (empty = ask)
+OPT_WINAPPS_HOST=""      # RDP_IP: the Windows host, for the 'manual' backend
+OPT_WINAPPS_PORT=""      # RDP_PORT (empty = 3389)
+OPT_WINAPPS_VM=""        # VM_NAME, libvirt only (empty = RDPWindows)
+OPT_WINAPPS_DOMAIN=""    # RDP_DOMAIN (empty = derive from the joined realm)
+OPT_WINAPPS_CREDS=""     # askpass | kerberos | shared (empty = ask)
+OPT_WINAPPS_RDP_USER=""  # shared-credential mode only: the service account
+OPT_WINAPPS_RDP_PASS="${WINAPPS_RDP_PASS:-}"  # shared-credential mode only
+WINAPPS_REMOVE=0         # --winapps-remove: take the multi-user wiring back out
+
 # What to install. Filled in by the choice builders, or by the matching flags.
 BACKEND=""
 GUI_CHOICES=""
@@ -554,6 +576,33 @@ pkgs_for() {
         rhel:extra_duo)   echo "duo_unix" ;;
         suse:extra_duo)   echo "duo_unix" ;;
         arch:extra_duo)   echo "duo_unix" ;;
+
+        # --- WinApps ----------------------------------------------------------
+        # The client side: FreeRDP plus what setup.sh shells out to. Names come
+        # from the per-distribution dependency lists in the WinApps README.
+        # freerdp3-x11 is Debian's v3 package; the others ship v3 as 'freerdp'.
+        debian:extra_winapps) echo "curl dialog freerdp3-x11 git iproute2 libnotify-bin netcat-openbsd" ;;
+        rhel:extra_winapps)   echo "curl dialog freerdp git iproute libnotify nmap-ncat" ;;
+        suse:extra_winapps)   echo "curl dialog freerdp git iproute2 libnotify-tools netcat-openbsd" ;;
+        arch:extra_winapps)   echo "curl dialog freerdp git iproute2 libnotify openbsd-netcat" ;;
+
+        # Backend that hosts the Windows guest. Only the chosen one is
+        # installed, and 'manual' (an existing RDP host on the network) needs
+        # none of it.
+        debian:winapps_libvirt) echo "qemu-kvm libvirt-daemon-system libvirt-clients virt-manager virtiofsd libvirt-daemon-config-network" ;;
+        rhel:winapps_libvirt)   echo "qemu-kvm libvirt virt-manager virt-install virtiofsd libvirt-daemon-config-network" ;;
+        suse:winapps_libvirt)   echo "qemu-kvm libvirt virt-manager virt-install" ;;
+        arch:winapps_libvirt)   echo "qemu-full libvirt virt-manager dnsmasq iptables-nft" ;;
+
+        debian:winapps_docker) echo "docker.io docker-compose-v2" ;;
+        rhel:winapps_docker)   echo "docker docker-compose" ;;
+        suse:winapps_docker)   echo "docker docker-compose" ;;
+        arch:winapps_docker)   echo "docker docker-compose" ;;
+
+        debian:winapps_podman) echo "podman podman-compose" ;;
+        rhel:winapps_podman)   echo "podman podman-compose" ;;
+        suse:winapps_podman)   echo "podman podman-compose" ;;
+        arch:winapps_podman)   echo "podman podman-compose" ;;
 
         # Build dependencies for Duo's source release, used where no package
         # carrying pam_duo.so exists.
@@ -3061,6 +3110,682 @@ configure_sudo_access() {
 }
 
 # ---------------------------------------------------------------------------
+# WinApps - Windows applications as Linux desktop launchers
+# ---------------------------------------------------------------------------
+# WinApps runs a Windows instance (a local VM, a container, or an existing RDP
+# host) and launches individual Windows programs through FreeRDP so they appear
+# as ordinary entries in the Linux application menu.
+#
+# Upstream installs one of two ways:
+#
+#   setup.sh --user    launchers in ~/.local/share/applications, binary in
+#                      ~/.local/bin - visible to exactly one account
+#   setup.sh --system  launchers in /usr/share/applications, binary in
+#                      /usr/local/bin - visible to every account
+#
+# '--system' is therefore already the multi-user answer for the launchers, and
+# the advice you will find in older write-ups - run setup.sh per user, or copy
+# .desktop files into /usr/share/applications by hand - is obsolete.
+#
+# What '--system' does *not* solve is the configuration. bin/winapps opens
+#
+#   readonly CONFIG_PATH="${HOME}/.config/winapps/winapps.conf"
+#
+# and exits if it is missing. There is no /etc/winapps fallback, so every one of
+# those shared launchers still needs a file in the home directory of whoever
+# clicks it. That is the gap this section fills, and on a domain-joined machine
+# it cannot be filled by writing the files in advance: the accounts arrive from
+# the directory, and the first time you learn a user exists is when they log in.
+#
+# So the config is generated at login from a single root-owned template, with
+# the account's own short name substituted into RDP_USER. That is what makes the
+# session land in *that* user's Windows profile with *that* user's mapped
+# drives, instead of everyone sharing one.
+WINAPPS_ETC_DIR="/etc/winapps"
+WINAPPS_TEMPLATE="$WINAPPS_ETC_DIR/winapps.conf.template"
+WINAPPS_SEEDER="/usr/local/bin/winapps-user-config"
+WINAPPS_ASKPASS="/usr/local/bin/winapps-askpass"
+WINAPPS_PROFILE_D="/etc/profile.d/winapps-user-config.sh"
+WINAPPS_AUTOSTART="/etc/xdg/autostart/winapps-user-config.desktop"
+WINAPPS_SKEL_DIR="/etc/skel/.config/winapps"
+WINAPPS_UPSTREAM_URL="https://raw.githubusercontent.com/winapps-org/winapps/main/setup.sh"
+WINAPPS_CONFIGURED=0
+
+# winapps_install_file <dest> <mode> - content arrives on stdin.
+#
+# Written through a temporary file in the destination directory and moved into
+# place, so a launcher or a login hook is never observed half-written. stdin is
+# drained under --dry-run as well, or the caller's heredoc would back up.
+winapps_install_file() {
+    local dest="$1" mode="$2" tmp dir
+    dir="$(dirname "$dest")"
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        cat >/dev/null
+        printf '%s  [dry-run]%s write %s (mode %s)\n' "$C_CYAN" "$C_RESET" "$dest" "$mode"
+        return 0
+    fi
+
+    if [[ ! -d "$dir" ]]; then
+        mkdir -p "$dir" || { err "Could not create $dir."; return 1; }
+    fi
+
+    tmp="$(mktemp "${dir}/.${PROGRAM_NAME}.XXXXXX")" || {
+        err "Could not create a temporary file in $dir."
+        return 1
+    }
+    cat >"$tmp" || { rm -f "$tmp"; err "Could not write $dest."; return 1; }
+    chmod "$mode" "$tmp" || { rm -f "$tmp"; err "Could not set mode on $dest."; return 1; }
+    (( EUID == 0 )) && chown root:root "$tmp" 2>/dev/null
+
+    [[ -f "$dest" ]] && backup_file "$dest" "$OUT_OF_TREE_BACKUP_DIR"
+
+    if mv -f "$tmp" "$dest"; then
+        ok "$dest"
+        log_to_file "WINAPPS wrote $dest"
+        return 0
+    fi
+    rm -f "$tmp"
+    err "Could not install $dest."
+    return 1
+}
+
+# The realm this machine is joined to, upper-cased, as RDP_DOMAIN wants it.
+# Falls back to whatever -d/--domain said so a pre-join run still produces a
+# usable template.
+winapps_default_domain() {
+    local d=""
+    if have realm; then
+        d="$(realm list --name-only 2>/dev/null | head -n1)"
+    fi
+    [[ -z "$d" ]] && d="$OPT_DOMAIN"
+    [[ -z "$d" ]] && d="$(hostname -d 2>/dev/null)"
+    printf '%s' "${d^^}"
+}
+
+# Which FreeRDP is actually installed. WinApps auto-detects this itself, so an
+# empty result is a warning rather than a failure - but if it is empty *after*
+# the packages went in, the launchers will not work and it is worth saying so
+# now rather than at first click.
+winapps_freerdp_cmd() {
+    local c
+    for c in xfreerdp3 xfreerdp sdl-freerdp3 sdl3-freerdp sdl-freerdp; do
+        have "$c" && { printf '%s' "$c"; return 0; }
+    done
+    if have flatpak && flatpak list --columns=application 2>/dev/null | grep -q '^com.freerdp.FreeRDP$'; then
+        printf 'flatpak run --command=xfreerdp com.freerdp.FreeRDP'
+        return 0
+    fi
+    return 1
+}
+
+winapps_choose_backend() {
+    local -a entries=()
+    entries+=("libvirt|Local Windows VM via libvirt/KVM  ${C_GREEN}(recommended here)${C_RESET}|Runs Windows as a full virtual machine on this PC. The VM is joined to the domain in its own right, so a user's Windows profile, group policy and mapped drives all come from Active Directory exactly as they would on a physical Windows box. Best for a workstation that is used by one person at a time.")
+    entries+=("manual|An existing Windows host on the network|No VM is run here at all: the launchers point at a Windows machine you already have, typically a Remote Desktop Session Host joined to the same domain. Much lighter on the client, and the only sensible option if you are rolling this out to more than a handful of PCs. You will be asked for its address.")
+    entries+=("docker|Windows in a Docker container|Uses the dockur/windows image to run Windows under Docker. Quicker to stand up than libvirt and easy to reset, but it is still a full Windows install underneath and joining it to the domain is on you.")
+    entries+=("podman|Windows in a Podman container|As above but rootless-capable under Podman. Note that FreeRDP has to be invoked through 'podman unshare' for rootless networking, which WinApps handles for you.")
+
+    menu_single OPT_WINAPPS_BACKEND "Where should the Windows side run?" "libvirt" "${entries[@]}"
+}
+
+winapps_choose_creds() {
+    local -a entries=()
+    entries+=("askpass|Ask each user for their own AD password  ${C_GREEN}(recommended)${C_RESET}|Nothing secret is stored on disk. The first time a user opens a Windows app they are prompted for their Active Directory password, which is handed to FreeRDP through its askpass interface and never appears on a command line or in a log. It is cached in the kernel session keyring where available, so they are asked once per login rather than once per app.")
+    entries+=("kerberos|Single sign-on with the user's Kerberos ticket|No password prompt at all: FreeRDP reuses the ticket SSSD obtained when the user logged into Linux. The cleanest experience by far, but it needs the Windows host domain-joined with a correct SPN and a ticket cache FreeRDP can read, so treat it as the thing to aim for rather than the thing to switch on blind. Falls back to a prompt if the ticket is refused.")
+    entries+=("shared|One shared service account for everybody|Every user connects as the same Windows account, with its password stored in the root-owned template. Simple, and appropriate for a kiosk or a single shared appliance - but it defeats the point of the domain join, because all users land in one Windows profile and the directory cannot tell them apart. Not recommended on a multi-user machine.")
+
+    menu_single OPT_WINAPPS_CREDS "How should users authenticate to Windows?" "askpass" "${entries[@]}"
+}
+
+# ---------------------------------------------------------------------------
+# The generated pieces
+# ---------------------------------------------------------------------------
+# The askpass helper. FreeRDP runs whatever FREERDP_ASKPASS names and reads the
+# password from its stdout, which keeps it out of both the process list and the
+# WinApps debug log - unlike RDP_PASS, which becomes a '/p:' argument.
+winapps_write_askpass() {
+    info "Installing the password helper"
+    winapps_install_file "$WINAPPS_ASKPASS" 0755 <<'WINAPPS_ASKPASS_EOF'
+#!/bin/sh
+#
+# Written by domain-join-setup. Prints an Active Directory password on stdout
+# for FreeRDP, which invokes this via FREERDP_ASKPASS.
+#
+# The password is cached in the *session* keyring, not a file: it dies with the
+# login session, is unreadable by other users, and never touches disk.
+set -u
+
+KEY_DESC="winapps:rdp"
+KEY_TIMEOUT=36000   # seconds; re-prompt roughly every ten hours
+
+prompt_text="Active Directory password for ${USER:-$(id -un 2>/dev/null)}"
+prompt_title="Windows application sign-in"
+
+# --- Cached? -----------------------------------------------------------------
+if command -v keyctl >/dev/null 2>&1; then
+    key_id=$(keyctl request user "$KEY_DESC" 2>/dev/null)
+    if [ -n "${key_id:-}" ]; then
+        if keyctl pipe "$key_id" 2>/dev/null; then
+            exit 0
+        fi
+    fi
+fi
+
+# --- Ask ---------------------------------------------------------------------
+# A graphical prompt is required: this is invoked from a desktop launcher, so
+# there is usually no terminal attached to read from.
+pass=""
+if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && command -v kdialog >/dev/null 2>&1; then
+    pass=$(kdialog --title "$prompt_title" --password "$prompt_text" 2>/dev/null)
+elif [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && command -v zenity >/dev/null 2>&1; then
+    pass=$(zenity --password --title "$prompt_title" 2>/dev/null)
+elif command -v systemd-ask-password >/dev/null 2>&1; then
+    pass=$(systemd-ask-password --no-tty "$prompt_text:" 2>/dev/null)
+elif [ -t 0 ]; then
+    stty -echo 2>/dev/null
+    printf '%s: ' "$prompt_text" >&2
+    IFS= read -r pass
+    stty echo 2>/dev/null
+    printf '\n' >&2
+fi
+
+[ -n "$pass" ] || exit 1
+
+# --- Cache and emit ----------------------------------------------------------
+if command -v keyctl >/dev/null 2>&1; then
+    key_id=$(printf '%s' "$pass" | keyctl padd user "$KEY_DESC" @s 2>/dev/null)
+    [ -n "${key_id:-}" ] && keyctl timeout "$key_id" "$KEY_TIMEOUT" >/dev/null 2>&1
+fi
+
+printf '%s' "$pass"
+WINAPPS_ASKPASS_EOF
+}
+
+# The template every user's config is generated from. Root-owned and the single
+# place any of this is edited: change it here and every user picks the change up
+# at their next login.
+winapps_write_template() {
+    local domain="$1" backend="$2" creds="$3" host="$4" port="$5" vm="$6"
+    local rdp_user_line rdp_pass_line askpass_line ip_line flags
+
+    # '@WINAPPS_USER@' is the substitution the seeder makes per user. In shared
+    # mode there is nothing to substitute - everyone is the same account.
+    if [[ "$creds" == "shared" ]]; then
+        rdp_user_line="RDP_USER=\"${OPT_WINAPPS_RDP_USER}\""
+        rdp_pass_line="RDP_PASS=\"${OPT_WINAPPS_RDP_PASS}\""
+        askpass_line='RDP_ASKPASS=""'
+    else
+        rdp_user_line='RDP_USER="@WINAPPS_USER@"'
+        rdp_pass_line='RDP_PASS=""'
+        askpass_line="RDP_ASKPASS=\"$WINAPPS_ASKPASS\""
+    fi
+
+    # Kerberos SSO: no password at all, and NLA told to use the ticket cache
+    # SSSD populated at login.
+    flags='/cert:tofu /sound /microphone +home-drive'
+    if [[ "$creds" == "kerberos" ]]; then
+        askpass_line="RDP_ASKPASS=\"$WINAPPS_ASKPASS\"   # fallback if the ticket is refused"
+        flags="$flags /sec:nla"
+    fi
+
+    ip_line="RDP_IP=\"${host:-127.0.0.1}\""
+    # libvirt discovers the guest address from the VM itself, and hard-coding
+    # one here would override that with something that goes stale on reboot.
+    [[ "$backend" == "libvirt" ]] && ip_line='#RDP_IP=""   # libvirt: discovered from VM_NAME at runtime'
+
+    info "Writing the configuration template"
+    winapps_install_file "$WINAPPS_TEMPLATE" 0644 <<WINAPPS_TEMPLATE_EOF
+##############################################################################
+# WinApps configuration template
+#
+# Written by $PROGRAM_NAME on $(date '+%Y-%m-%d %H:%M:%S').
+#
+# THIS FILE IS THE MASTER COPY. Do not edit the per-user copies under
+# ~/.config/winapps/winapps.conf - they are regenerated from this file at
+# login whenever this one changes, and your edits there would be overwritten.
+#
+# '@WINAPPS_USER@' is replaced with the login name of whoever is logging in,
+# with any 'DOMAIN\\' prefix or '@realm' suffix stripped, so that each user
+# reaches their own Windows profile.
+#
+# After editing, users pick the change up at their next login. To push it out
+# to everyone who is already logged in:
+#     sudo $WINAPPS_SEEDER --all
+##############################################################################
+
+# [WINDOWS USERNAME]
+$rdp_user_line
+
+# [WINDOWS PASSWORD]
+# Left empty deliberately. RDP_ASKPASS names a helper whose stdout is used as
+# the password, so nothing secret is stored on disk and nothing appears in the
+# process list or the WinApps log.
+$rdp_pass_line
+$askpass_line
+
+# [WINDOWS DOMAIN]
+RDP_DOMAIN="$domain"
+
+# [WINDOWS IPV4 ADDRESS]
+$ip_line
+
+# [RDP PORT]
+RDP_PORT="${port:-3389}"
+
+# [VM NAME] - libvirt only; must match the domain name shown by 'virsh list'.
+VM_NAME="${vm:-RDPWindows}"
+
+# [WINAPPS BACKEND]
+WAFLAVOR="$backend"
+
+# [DISPLAY SCALING] - 100, 140 or 180.
+RDP_SCALE="100"
+
+# [ADDITIONAL FREERDP FLAGS]
+# '+home-drive' maps the user's Linux home into the Windows session, which is
+# what lets a Windows program open and save files that live on this machine.
+RDP_FLAGS="$flags"
+
+# [DEBUG LOGGING] - writes ~/.local/share/winapps/winapps.log on each launch.
+DEBUG="false"
+WINAPPS_TEMPLATE_EOF
+}
+
+# The seeder. Runs as the logging-in user, generates their config from the
+# template, and is deliberately incapable of failing loudly: anything that goes
+# wrong here must not be allowed to block a login.
+winapps_write_seeder() {
+    info "Installing the per-user configuration generator"
+    winapps_install_file "$WINAPPS_SEEDER" 0755 <<WINAPPS_SEEDER_EOF
+#!/bin/sh
+#
+# Written by $PROGRAM_NAME.
+#
+# Generates ~/.config/winapps/winapps.conf from $WINAPPS_TEMPLATE for the
+# user running it, substituting their own account name into RDP_USER.
+#
+# Runs at every login (from $WINAPPS_PROFILE_D for shell and SSH
+# sessions, and from $WINAPPS_AUTOSTART for graphical ones -
+# display managers do not reliably source /etc/profile.d, so both are wired
+# up and the second one to run is a no-op).
+#
+# With --all, walks every home directory instead and seeds each one. That is
+# for pushing a template change out to users who are already logged in; the
+# per-user path needs no arguments and no privileges.
+#
+# Exits 0 on every path it can. A login must not fail because a Windows
+# application launcher could not be configured.
+set -u
+
+TEMPLATE="$WINAPPS_TEMPLATE"
+MARKER="# Generated by $PROGRAM_NAME from \$TEMPLATE"
+
+[ -r "\$TEMPLATE" ] || exit 0
+
+# seed_for <login-name> <home-directory>
+seed_for() {
+    _login="\$1"
+    _home="\$2"
+    [ -n "\$_login" ] && [ -n "\$_home" ] && [ -d "\$_home" ] || return 0
+
+    # Strip 'DOMAIN\\' (Winbind) and '@realm' (SSSD fully-qualified names) so
+    # what reaches RDP_USER is the bare sAMAccountName that Windows expects.
+    _short="\${_login##*\\\\}"
+    _short="\${_short%%@*}"
+    [ -n "\$_short" ] || return 0
+
+    _dir="\$_home/.config/winapps"
+    _conf="\$_dir/winapps.conf"
+    _stamp="\$MARKER (\$(cksum <"\$TEMPLATE" 2>/dev/null))"
+
+    # Leave a hand-edited file alone. A user who wants to keep their own copy
+    # deletes the marker line and this never touches it again.
+    if [ -f "\$_conf" ]; then
+        grep -qF "\$MARKER" "\$_conf" 2>/dev/null || return 0
+        grep -qF "\$_stamp" "\$_conf" 2>/dev/null && return 0
+    fi
+
+    mkdir -p "\$_dir" 2>/dev/null || return 0
+
+    _tmp="\$_conf.\$\$.tmp"
+    {
+        printf '%s\\n' "\$_stamp"
+        printf '%s\\n' "# Edits here are overwritten at the next login. Change \$TEMPLATE instead,"
+        printf '%s\\n' "# or delete the line above to keep this copy and stop it being regenerated."
+        printf '%s\\n' ""
+        sed "s/@WINAPPS_USER@/\$_short/g" "\$TEMPLATE"
+    } >"\$_tmp" 2>/dev/null || { rm -f "\$_tmp" 2>/dev/null; return 0; }
+
+    chmod 600 "\$_tmp" 2>/dev/null
+    mv -f "\$_tmp" "\$_conf" 2>/dev/null || { rm -f "\$_tmp" 2>/dev/null; return 0; }
+
+    # Only meaningful under --all, where this runs as root.
+    if [ "\$(id -u)" = "0" ]; then
+        chown -R "\$_login" "\$_dir" 2>/dev/null
+    fi
+    return 0
+}
+
+if [ "\${1:-}" = "--all" ]; then
+    [ "\$(id -u)" = "0" ] || { echo "--all must be run as root." >&2; exit 1; }
+    # getent covers domain accounts from SSSD/Winbind as well as local ones.
+    getent passwd 2>/dev/null | while IFS=: read -r _n _x _u _g _c _h _s; do
+        [ "\$_u" -ge 1000 ] 2>/dev/null || continue
+        case "\$_s" in */nologin|*/false) continue ;; esac
+        seed_for "\$_n" "\$_h"
+    done
+    exit 0
+fi
+
+# Per-user path: skip root and the system accounts entirely.
+_uid="\$(id -u 2>/dev/null)" || exit 0
+[ "\$_uid" -ge 1000 ] 2>/dev/null || exit 0
+seed_for "\$(id -un 2>/dev/null)" "\${HOME:-}"
+exit 0
+WINAPPS_SEEDER_EOF
+}
+
+# Both login hooks call the same seeder. Display managers are inconsistent about
+# sourcing /etc/profile.d for a graphical session - SDDM and GDM each do it only
+# under some configurations - so the XDG autostart entry is what actually
+# guarantees a desktop user gets seeded, and profile.d covers SSH and consoles.
+winapps_wire_login_hooks() {
+    info "Wiring the generator into login"
+
+    winapps_install_file "$WINAPPS_PROFILE_D" 0644 <<WINAPPS_PROFILE_EOF
+# Written by $PROGRAM_NAME.
+#
+# Generates this user's WinApps configuration from $WINAPPS_TEMPLATE.
+# Backgrounded and silenced: a login must not wait on it or fail with it.
+if [ -x "$WINAPPS_SEEDER" ]; then
+    "$WINAPPS_SEEDER" >/dev/null 2>&1 || true
+fi
+WINAPPS_PROFILE_EOF
+
+    winapps_install_file "$WINAPPS_AUTOSTART" 0644 <<WINAPPS_AUTOSTART_EOF
+[Desktop Entry]
+Type=Application
+Name=WinApps user configuration
+Comment=Generates this user's WinApps configuration from the system template
+Exec=$WINAPPS_SEEDER
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-Phase=Initialization
+OnlyShowIn=GNOME;KDE;XFCE;MATE;LXQt;Cinnamon;Budgie;COSMIC;Unity;
+WINAPPS_AUTOSTART_EOF
+
+    # /etc/skel is copied by pam_mkhomedir when a domain user's home is created,
+    # which covers the very first login - before either hook above has had a
+    # chance to run in a session that already has a desktop starting up.
+    if [[ $DRY_RUN -eq 1 ]]; then
+        printf '%s  [dry-run]%s seed %s from the template\n' "$C_CYAN" "$C_RESET" "$WINAPPS_SKEL_DIR"
+    elif mkdir -p "$WINAPPS_SKEL_DIR" 2>/dev/null; then
+        # Copied with the @WINAPPS_USER@ token still in it. The seeder replaces
+        # the token on the user's first login; until then the file is inert
+        # rather than wrong, which is the safer of the two failure modes.
+        if cp -f "$WINAPPS_TEMPLATE" "$WINAPPS_SKEL_DIR/winapps.conf" 2>/dev/null; then
+            chmod 600 "$WINAPPS_SKEL_DIR/winapps.conf"
+            ok "$WINAPPS_SKEL_DIR/winapps.conf"
+        fi
+    fi
+    return 0
+}
+
+# Seed every existing account now, so a machine that already has users logged
+# in does not have to wait for the next login to pick the template up.
+winapps_seed_all() {
+    info "Generating the configuration for existing accounts"
+    if [[ $DRY_RUN -eq 1 ]]; then
+        printf '%s  [dry-run]%s %s --all\n' "$C_CYAN" "$C_RESET" "$WINAPPS_SEEDER"
+        return 0
+    fi
+    if "$WINAPPS_SEEDER" --all; then
+        ok "Existing home directories seeded"
+    else
+        warn "Could not seed every home directory; they will be done at next login."
+    fi
+    return 0
+}
+
+# Run the upstream installer with --system, which is what puts the launchers in
+# /usr/share/applications for every account.
+#
+# It cannot be run blind: the installer connects to Windows and enumerates the
+# installed programs, so Windows has to be up, reachable over RDP and - for this
+# to be worth anything - already joined to the domain. When it is not, the
+# groundwork is left in place and the command is printed for later.
+winapps_install_upstream() {
+    local installer="$WINAPPS_ETC_DIR/setup.sh" rc=0
+
+    if ! confirm "Is the Windows side already installed, domain-joined and reachable over RDP?" "n"; then
+        printf '\n'
+        note "Leaving the WinApps launchers for later - Windows has to be up first."
+        note "Once it is, run:"
+        printf '    %ssudo %s --system%s\n' "$C_CYAN" "$installer" "$C_RESET"
+        return 0
+    fi
+
+    info "Fetching the WinApps installer"
+    if [[ $DRY_RUN -eq 1 ]]; then
+        printf '%s  [dry-run]%s download %s to %s\n' \
+            "$C_CYAN" "$C_RESET" "$WINAPPS_UPSTREAM_URL" "$installer"
+        printf '%s  [dry-run]%s %s --system\n' "$C_CYAN" "$C_RESET" "$installer"
+        return 0
+    fi
+
+    mkdir -p "$WINAPPS_ETC_DIR" || { err "Could not create $WINAPPS_ETC_DIR."; return 1; }
+    if ! fetch_url "$WINAPPS_UPSTREAM_URL" "$installer"; then
+        err "Could not download the WinApps installer."
+        note "The rest of the configuration is in place; re-run this step when the"
+        note "network allows, or install WinApps by hand with --system."
+        return 1
+    fi
+    chmod 0755 "$installer"
+
+    # The installer reads its config from $HOME, and $HOME here is root's. Seed
+    # root from the same template so the app scan has something to connect with.
+    if [[ -n "${HOME:-}" && -r "$WINAPPS_TEMPLATE" ]]; then
+        "$WINAPPS_SEEDER" >/dev/null 2>&1 || true
+        if [[ ! -f "$HOME/.config/winapps/winapps.conf" ]]; then
+            mkdir -p "$HOME/.config/winapps"
+            sed "s/@WINAPPS_USER@/${OPT_WINAPPS_RDP_USER:-Administrator}/g" \
+                "$WINAPPS_TEMPLATE" >"$HOME/.config/winapps/winapps.conf"
+            chmod 600 "$HOME/.config/winapps/winapps.conf"
+        fi
+    fi
+
+    info "Running the WinApps installer (system-wide)"
+    run "$installer" --system || rc=$?
+    if (( rc != 0 )); then
+        warn "The WinApps installer exited non-zero; the launchers may be incomplete."
+        note "Re-run it once Windows is reachable:  sudo $installer --system"
+        return 1
+    fi
+    ok "WinApps launchers installed in /usr/share/applications"
+    return 0
+}
+
+# Take the multi-user wiring back out. Deliberately leaves the per-user configs
+# and the launchers alone - those belong to the upstream installer's --uninstall
+# and to the users themselves.
+winapps_remove() {
+    heading "Remove the WinApps multi-user configuration"
+
+    local f
+    for f in "$WINAPPS_PROFILE_D" "$WINAPPS_AUTOSTART" "$WINAPPS_SEEDER" \
+             "$WINAPPS_ASKPASS" "$WINAPPS_TEMPLATE" "$WINAPPS_SKEL_DIR/winapps.conf"; do
+        if [[ -e "$f" ]]; then
+            if [[ $DRY_RUN -eq 1 ]]; then
+                printf '%s  [dry-run]%s remove %s\n' "$C_CYAN" "$C_RESET" "$f"
+            else
+                backup_file "$f" "$OUT_OF_TREE_BACKUP_DIR"
+                rm -f "$f" && ok "Removed $f"
+            fi
+        fi
+    done
+
+    printf '\n'
+    note "Left in place on purpose:"
+    note "  - each user's ~/.config/winapps/winapps.conf"
+    note "  - the launchers in /usr/share/applications"
+    note "To remove those too:  sudo $WINAPPS_ETC_DIR/setup.sh --uninstall"
+    return 0
+}
+
+winapps_print_summary() {
+    local freerdp
+    freerdp="$(winapps_freerdp_cmd)" || freerdp=""
+
+    heading "WinApps summary"
+    printf '  Backend        : %s%s%s\n' "$C_BOLD" "$OPT_WINAPPS_BACKEND" "$C_RESET"
+    printf '  Credentials    : %s%s%s\n' "$C_BOLD" "$OPT_WINAPPS_CREDS" "$C_RESET"
+    printf '  RDP domain     : %s\n' "${OPT_WINAPPS_DOMAIN:-<none>}"
+    case "$OPT_WINAPPS_BACKEND" in
+        manual) printf '  Windows host   : %s:%s\n' "${OPT_WINAPPS_HOST:-?}" "${OPT_WINAPPS_PORT:-3389}" ;;
+        libvirt) printf '  libvirt VM     : %s\n' "${OPT_WINAPPS_VM:-RDPWindows}" ;;
+    esac
+    if [[ -n "$freerdp" ]]; then
+        printf '  FreeRDP        : %s\n' "$freerdp"
+    else
+        printf '  FreeRDP        : %snot found%s\n' "$C_YELLOW" "$C_RESET"
+    fi
+    printf '  Template       : %s\n' "$WINAPPS_TEMPLATE"
+
+    printf '\n'
+    printf '  %sHow this works for a domain user:%s\n' "$C_BOLD" "$C_RESET"
+    printf '  They log in, the generator writes their own ~/.config/winapps/winapps.conf\n'
+    printf '  with their account name in RDP_USER, and the Windows launchers in the\n'
+    printf '  application menu open under their own Windows profile.\n'
+
+    printf '\n'
+    printf '  %sTo change the settings for everyone:%s\n' "$C_BOLD" "$C_RESET"
+    printf '    %ssudo nano %s%s\n' "$C_CYAN" "$WINAPPS_TEMPLATE" "$C_RESET"
+    printf '    %ssudo %s --all%s\n' "$C_CYAN" "$WINAPPS_SEEDER" "$C_RESET"
+    printf '\n'
+    printf '  %sTo add applications after installing them in Windows:%s\n' "$C_BOLD" "$C_RESET"
+    printf '    %ssudo %s/setup.sh --system%s\n' "$C_CYAN" "$WINAPPS_ETC_DIR" "$C_RESET"
+    return 0
+}
+
+# The whole WinApps step.
+configure_winapps() {
+    heading "WinApps - Windows applications for every domain user"
+
+    (( WINAPPS_REMOVE )) && { winapps_remove; return $?; }
+
+    wrap_text "  " "WinApps makes individual Windows programs appear as ordinary entries in this machine's application menu, launched over RDP. Installed system-wide the launchers are shared by every account, and this step adds what upstream leaves out: a per-user configuration generated at login, so each domain user reaches Windows as themselves."
+    printf '\n'
+
+    # --- Choices ------------------------------------------------------------
+    [[ -z "$OPT_WINAPPS_BACKEND" ]] && winapps_choose_backend
+    if [[ ! "$OPT_WINAPPS_BACKEND" =~ ^(libvirt|docker|podman|manual)$ ]]; then
+        err "Invalid WinApps backend '$OPT_WINAPPS_BACKEND'."
+        return 1
+    fi
+
+    [[ -z "$OPT_WINAPPS_CREDS" ]] && winapps_choose_creds
+    if [[ ! "$OPT_WINAPPS_CREDS" =~ ^(askpass|kerberos|shared)$ ]]; then
+        err "Invalid WinApps credential mode '$OPT_WINAPPS_CREDS'."
+        return 1
+    fi
+
+    if [[ -z "$OPT_WINAPPS_DOMAIN" ]]; then
+        OPT_WINAPPS_DOMAIN="$(winapps_default_domain)"
+        if [[ -z "$OPT_WINAPPS_DOMAIN" ]]; then
+            warn "This machine does not look domain-joined yet."
+            note "RDP_DOMAIN is being left blank; set it in the template once joined."
+        else
+            ask_value OPT_WINAPPS_DOMAIN "Active Directory domain for the RDP session" "$OPT_WINAPPS_DOMAIN"
+        fi
+    fi
+
+    if [[ "$OPT_WINAPPS_BACKEND" == "manual" && -z "$OPT_WINAPPS_HOST" ]]; then
+        ask_value OPT_WINAPPS_HOST "Address of the Windows host (hostname or IP)" ""
+        if [[ -z "$OPT_WINAPPS_HOST" ]]; then
+            err "The 'manual' backend needs an address to connect to."
+            return 1
+        fi
+    fi
+    [[ "$OPT_WINAPPS_BACKEND" == "libvirt" && -z "$OPT_WINAPPS_VM" ]] && \
+        ask_value OPT_WINAPPS_VM "libvirt VM name" "RDPWindows"
+
+    if [[ "$OPT_WINAPPS_CREDS" == "shared" ]]; then
+        warn "Every user will connect to Windows as the same account."
+        note "Their AD identity will not reach Windows, so profiles and mapped"
+        note "drives will be shared rather than per-user."
+        [[ -z "$OPT_WINAPPS_RDP_USER" ]] && \
+            ask_value OPT_WINAPPS_RDP_USER "Windows service account" ""
+        [[ -z "$OPT_WINAPPS_RDP_PASS" ]] && \
+            ask_secret OPT_WINAPPS_RDP_PASS "Password for $OPT_WINAPPS_RDP_USER"
+        if [[ -z "$OPT_WINAPPS_RDP_USER" || -z "$OPT_WINAPPS_RDP_PASS" ]]; then
+            err "Shared-credential mode needs both an account and a password."
+            return 1
+        fi
+    fi
+
+    # --- Packages -----------------------------------------------------------
+    local -a pkgs=() add=()
+    read -r -a pkgs <<<"$(pkgs_for extra_winapps)"
+    if [[ "$OPT_WINAPPS_BACKEND" != "manual" ]]; then
+        local group_pkgs
+        group_pkgs="$(pkgs_for "winapps_${OPT_WINAPPS_BACKEND}")"
+        [[ -n "$group_pkgs" ]] && { read -r -a add <<<"$group_pkgs"; pkgs+=("${add[@]}"); }
+    fi
+
+    refresh_repos
+    filter_available "${pkgs[@]}"
+    if [[ ${#SKIPPED_PACKAGES[@]} -gt 0 ]]; then
+        warn "Not available on this system: ${SKIPPED_PACKAGES[*]}"
+        note "Docker in particular is often only in the vendor's own repository."
+    fi
+    if [[ ${#AVAILABLE_PACKAGES[@]} -gt 0 ]]; then
+        printf '\n'
+        info "Packages: ${AVAILABLE_PACKAGES[*]}"
+        if confirm "Install these?" "y"; then
+            install_packages "${AVAILABLE_PACKAGES[@]}" || {
+                err "Package installation failed; stopping before anything is written."
+                return 1
+            }
+        else
+            note "Skipping the package install; the configuration is still written."
+        fi
+    fi
+
+    # --- The configuration --------------------------------------------------
+    printf '\n'
+    winapps_write_askpass || return 1
+    winapps_write_template "$OPT_WINAPPS_DOMAIN" "$OPT_WINAPPS_BACKEND" \
+        "$OPT_WINAPPS_CREDS" "$OPT_WINAPPS_HOST" "$OPT_WINAPPS_PORT" \
+        "$OPT_WINAPPS_VM" || return 1
+    winapps_wire_login_hooks || return 1
+    winapps_seed_all
+
+    # --- Backend services ---------------------------------------------------
+    case "$OPT_WINAPPS_BACKEND" in
+        libvirt) enable_service libvirtd.service ;;
+        docker)  enable_service docker.service ;;
+        podman)  enable_service podman.socket ;;
+    esac
+
+    if ! winapps_freerdp_cmd >/dev/null; then
+        printf '\n'
+        warn "No FreeRDP command was found on this system."
+        note "WinApps launchers cannot connect without it. Install FreeRDP 3 and"
+        note "re-run this step, or set FREERDP_COMMAND in $WINAPPS_TEMPLATE."
+    fi
+
+    # --- Launchers ----------------------------------------------------------
+    printf '\n'
+    winapps_install_upstream || true
+
+    WINAPPS_CONFIGURED=1
+    printf '\n'
+    winapps_print_summary
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # Choice builders - only offer what makes sense here
 # ---------------------------------------------------------------------------
 choose_backend() {
@@ -3122,6 +3847,7 @@ choose_extras() {
     entries+=("shares|Access to Windows file shares|cifs-utils and smbclient so the workstation can browse and mount SMB shares, including mounting with your Kerberos ticket instead of a stored password.")
     entries+=("sudo|SSSD sudo rules from the directory|Lets sudo read sudoers rules published in Active Directory, so admin rights are managed centrally rather than in /etc/sudoers on every machine.")
     entries+=("duo|Duo Security two-factor authentication|Adds a second factor in front of this machine's logins, for local and domain accounts alike. Needs an integration key, secret key and API hostname from the Duo Admin Panel, and asks separately which services to protect. Duo Unix is text-only, so a graphical greeter gets a push notification rather than a prompt.")
+    entries+=("winapps|Windows applications for every domain user|Installs WinApps so Windows programs appear in the Linux application menu and open over RDP. The launchers are installed system-wide and each domain user's configuration is generated at login with their own account name, so everyone reaches their own Windows profile. Needs a Windows VM on this machine or a Remote Desktop host on the network.")
 
     menu_multi EXTRA_CHOICES "Which supporting components should be included?" "mkhomedir,timesync,troubleshoot" "${entries[@]}"
 }
@@ -3240,6 +3966,7 @@ declare -a WANTED_PACKAGES=()
 WANT_MKHOMEDIR=0
 WANT_TIMESYNC=0
 WANT_DUO=0
+WANT_WINAPPS=0
 
 build_package_list() {
     local -a wanted=() add=()
@@ -3249,6 +3976,7 @@ build_package_list() {
     WANT_MKHOMEDIR=0
     WANT_TIMESYNC=0
     WANT_DUO=0
+    WANT_WINAPPS=0
 
     case "$BACKEND" in
         sssd)    read -r -a wanted <<<"$(pkgs_for core_sssd)" ;;
@@ -3281,6 +4009,10 @@ build_package_list() {
             # carries pam_duo.so, and whether a repository has to be added or the
             # module built, is not knowable until configure_duo has looked.
             duo)          WANT_DUO=1 ;;
+            # Same reasoning as Duo: which backend packages are needed depends
+            # on answers configure_winapps has not asked for yet, so it does its
+            # own install rather than joining this preview.
+            winapps)      WANT_WINAPPS=1 ;;
         esac
     done
 
@@ -3401,6 +4133,13 @@ action_guided_setup() {
         configure_sudo_access
     fi
 
+    # WinApps reads the joined realm for RDP_DOMAIN, so it runs after the join
+    # but before Duo - it is ordinary desktop plumbing and cannot lock anyone out.
+    local winapps_now=$WANT_WINAPPS
+    (( OPT_WINAPPS == 1 )) && winapps_now=1
+    (( OPT_WINAPPS == 0 )) && winapps_now=0
+    (( winapps_now == 1 )) && configure_winapps
+
     # Duo goes last, deliberately. It is the only step that can leave the machine
     # unable to authenticate, so everything else is already done and verifiable
     # before the authentication stack is touched.
@@ -3475,6 +4214,10 @@ action_sudo_access() {
 
 action_duo() {
     configure_duo
+}
+
+action_winapps() {
+    configure_winapps
 }
 
 action_sddm_greeter() {
@@ -3564,7 +4307,7 @@ fi
 
 MENU_TITLE="Active Directory Domain Join - Setup and Configuration"
 
-# Left column is indices 0-4, right column 5-9, and index 10 is a full-width
+# Left column is indices 0-4, right column 5-10, and index 11 is a full-width
 # row centred underneath both. The columns need not be the same length.
 MENU_NAMES=(
     "Guided setup"
@@ -3577,6 +4320,7 @@ MENU_NAMES=(
     "Post-join login settings"
     "Grant sudo to a user or group"
     "Duo two-factor authentication"
+    "Windows apps for every user"
     "Preflight checks and domain status"
 )
 # One line of explanation per entry, shown for whichever entry the cursor is
@@ -3593,19 +4337,23 @@ MENU_HINTS=(
     "Short usernames, who is allowed to log in, and then the sudo rights"
     "Give an account or a group sudo through its own /etc/sudoers.d file"
     "Second factor for local and domain logins via Duo Unix, or remove it"
+    "Windows programs in the app menu, configured per domain user via WinApps"
     "Read-only: hostname, clock, DNS, membership and service state"
 )
 
 MENU_LEFT_COUNT=5
-MENU_RIGHT_COUNT=5
-MENU_TOTAL=11
+MENU_RIGHT_COUNT=6
+MENU_TOTAL=12
 MENU_CURSOR=0
-MENU_SELECTED=(0 0 0 0 0 0 0 0 0 0 0)
+MENU_SELECTED=(0 0 0 0 0 0 0 0 0 0 0 0)
 
 # The order selections run in: install first, then configure, then join, then
 # the settings that only make sense once the machine is a domain member - and
 # Duo last of all, since it is the only entry that can stop a login working.
-MENU_RUN_ORDER=(0 1 2 4 5 10 3 7 6 8 9)
+#
+# WinApps sits after the join (index 10, run late) because it reads the joined
+# realm to fill in RDP_DOMAIN, but still ahead of Duo.
+MENU_RUN_ORDER=(0 1 2 4 5 11 3 7 6 8 10 9)
 
 MCOL=0
 MROW=0
@@ -4268,7 +5016,8 @@ menu_run_action() {
         7) action_post_join ;;
         8) action_sudo_access ;;
         9) action_duo ;;
-        10) action_status ;;
+        10) action_winapps ;;
+        11) action_status ;;
         *) return 1 ;;
     esac
 }
@@ -4492,7 +5241,8 @@ ${C_BOLD}OPTIONS${C_RESET}
   -u, --user USER         Domain account used to perform the join.
   -b, --backend NAME      sssd | winbind | both
   -g, --gui LIST          Comma separated: cockpit,gnome,yast,adsys,none
-  -e, --extras LIST       Comma separated: mkhomedir,timesync,troubleshoot,shares,sudo,duo
+  -e, --extras LIST       Comma separated: mkhomedir,timesync,troubleshoot,shares,
+                          sudo,duo,winapps
       --sudo-user LIST    Grant sudo to these accounts, comma separated. Local
                           or domain; a name may contain spaces.
       --sudo-group LIST   Grant sudo to these groups, comma separated. Each one
@@ -4525,6 +5275,26 @@ ${C_BOLD}DUO TWO-FACTOR AUTHENTICATION${C_RESET}
 
 The secret key is also read from the DUO_SKEY environment variable, which keeps
 it out of the process list and the shell history.
+
+${C_BOLD}WINDOWS APPLICATIONS (WINAPPS)${C_RESET}
+      --winapps           Set up WinApps for all users (same as -e winapps).
+      --no-winapps        Never set up WinApps, whatever the extras say.
+      --winapps-backend B libvirt (local VM), manual (existing RDP host on the
+                          network), docker or podman.
+      --winapps-host ADDR Windows hostname or IP. Required for 'manual'.
+      --winapps-port PORT RDP port (default 3389).
+      --winapps-vm NAME   libvirt VM name (default RDPWindows).
+      --winapps-domain D  RDP_DOMAIN (default: the realm this machine joined).
+      --winapps-creds M   askpass  - prompt each user for their own AD password
+                          kerberos - single sign-on from the user's ticket
+                          shared   - one service account for everyone
+      --winapps-user USER Windows service account, 'shared' mode only.
+      --winapps-remove    Remove the multi-user wiring (template, generator,
+                          login hooks). Leaves per-user configs and launchers.
+
+The shared-mode password is read from the WINAPPS_RDP_PASS environment variable
+so it stays out of the process list. Note that 'shared' puts every user into the
+same Windows profile, which defeats the point of the domain join.
 
 ${C_BOLD}EXAMPLES${C_RESET}
   # Interactive menu of everything the script can do
@@ -4580,6 +5350,16 @@ parse_args() {
             --duo-failmode)  OPT_DUO_FAILMODE="${2:-}"; OPT_DUO=1; CLI_DIRECTED=1; shift 2 ;;
             --duo-autopush)  OPT_DUO_AUTOPUSH="${2:-}"; OPT_DUO=1; CLI_DIRECTED=1; shift 2 ;;
             --duo-exempt)    OPT_DUO_EXEMPT_GROUP="${2:-}"; OPT_DUO=1; CLI_DIRECTED=1; shift 2 ;;
+            --winapps)          OPT_WINAPPS=1; CLI_DIRECTED=1; shift ;;
+            --no-winapps)       OPT_WINAPPS=0; CLI_DIRECTED=1; shift ;;
+            --winapps-backend)  OPT_WINAPPS_BACKEND="${2:-}"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift 2 ;;
+            --winapps-host)     OPT_WINAPPS_HOST="${2:-}"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift 2 ;;
+            --winapps-port)     OPT_WINAPPS_PORT="${2:-}"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift 2 ;;
+            --winapps-vm)       OPT_WINAPPS_VM="${2:-}"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift 2 ;;
+            --winapps-domain)   OPT_WINAPPS_DOMAIN="${2:-}"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift 2 ;;
+            --winapps-creds)    OPT_WINAPPS_CREDS="${2:-}"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift 2 ;;
+            --winapps-user)     OPT_WINAPPS_RDP_USER="${2:-}"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift 2 ;;
+            --winapps-remove)   WINAPPS_REMOVE=1; OPT_WINAPPS=1; CLI_DIRECTED=1; shift ;;
             --duo-repo)      DUO_ADD_REPO=1; shift ;;
             --no-duo-repo)   DUO_ADD_REPO=0; shift ;;
             --duo-build)     DUO_BUILD_SOURCE=1; shift ;;
@@ -4604,6 +5384,24 @@ parse_args() {
 
     if [[ -n "$OPT_DUO_FAILMODE" && ! "$OPT_DUO_FAILMODE" =~ ^(safe|secure)$ ]]; then
         die "Invalid --duo-failmode '$OPT_DUO_FAILMODE' (expected safe or secure)."
+    fi
+
+    if [[ -n "$OPT_WINAPPS_BACKEND" && ! "$OPT_WINAPPS_BACKEND" =~ ^(libvirt|docker|podman|manual)$ ]]; then
+        die "Invalid --winapps-backend '$OPT_WINAPPS_BACKEND' (expected libvirt, docker, podman or manual)."
+    fi
+
+    if [[ -n "$OPT_WINAPPS_CREDS" && ! "$OPT_WINAPPS_CREDS" =~ ^(askpass|kerberos|shared)$ ]]; then
+        die "Invalid --winapps-creds '$OPT_WINAPPS_CREDS' (expected askpass, kerberos or shared)."
+    fi
+
+    if [[ "$OPT_WINAPPS_BACKEND" == "manual" && -n "$OPT_WINAPPS_HOST" ]]; then
+        :
+    elif [[ "$OPT_WINAPPS_BACKEND" == "manual" && $ASSUME_YES -eq 1 ]]; then
+        die "--winapps-backend manual needs --winapps-host to say where Windows is."
+    fi
+
+    if [[ "$OPT_WINAPPS_CREDS" == "shared" && $ASSUME_YES -eq 1 && -z "$OPT_WINAPPS_RDP_USER" ]]; then
+        die "--winapps-creds shared needs --winapps-user (and WINAPPS_RDP_PASS in the environment)."
     fi
 
     if [[ -n "$OPT_DUO_AUTOPUSH" ]]; then

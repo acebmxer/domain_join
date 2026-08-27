@@ -36,6 +36,7 @@ step is still available as a flag for unattended runs.
    [ ] Graphical management tools           [ ] Post-join login settings
    [ ] Join an Active Directory domain      [ ] Grant sudo to a user or group
    [ ] Home directories on first login      [ ] Duo two-factor authentication
+                                            [ ] Windows apps for every user
                       [ ] Preflight checks and domain status
       Install, configure, then offer to join - the whole setup in one pass
  ──────────────────────────────────────────────────────────────────────────────
@@ -63,9 +64,10 @@ whether the machine is already joined.
 | **Post-join login settings** | Short usernames, who may log in, then the sudo rights below. |
 | **Grant sudo to a user or group** | Asks for an account, a group, or one of each, and writes a `/etc/sudoers.d` drop-in for each. See [sudo rights](#sudo-rights). |
 | **Duo two-factor authentication** | Installs Duo Unix, writes `/etc/duo/pam_duo.conf`, and adds `pam_duo.so` to the services you pick — or takes it back out again. See [Duo](#duo-security-two-factor-authentication). |
+| **Windows apps for every user** | Installs WinApps system-wide and generates each domain user's configuration at login, so Windows programs in the app menu open under their own account. See [WinApps](#windows-applications-for-every-domain-user). |
 | **Preflight checks and domain status** | Read-only: hostname, clock, DNS SRV records, membership and service state. |
 
-The terminal only has to be 40x21; below that the menu says so rather than
+The terminal only has to be 40x22; below that the menu says so rather than
 drawing something broken. It reflows live as the window is resized, dropping
 detail — the hint line, then the banner box — before it gives up two columns.
 
@@ -143,6 +145,7 @@ Only the entries valid for your system are shown.
 | **Access to Windows file shares** | off | `cifs-utils` + `smbclient`, including Kerberos-authenticated mounts. |
 | **SSSD sudo rules from the directory** | off | Lets `sudo` read sudoers rules *published in AD*, so admin rights are managed centrally. This is not the same thing as [granting sudo here](#sudo-rights), which writes a rule on this machine. |
 | **Duo two-factor authentication** | off | A second factor in front of logins, for local *and* domain accounts. Asks separately which services to protect. See [Duo](#duo-security-two-factor-authentication). |
+| **Windows applications (WinApps)** | off | Windows programs as entries in the Linux app menu, launched over RDP, configured per domain user. See [WinApps](#windows-applications-for-every-domain-user). |
 
 ---
 
@@ -157,7 +160,7 @@ sudo ./domain-join-setup.sh [options]
   -u, --user USER         Domain account used to perform the join
   -b, --backend NAME      sssd | winbind | both
   -g, --gui LIST          cockpit,gnome,yast,adsys,none
-  -e, --extras LIST       mkhomedir,timesync,troubleshoot,shares,sudo,duo
+  -e, --extras LIST       mkhomedir,timesync,troubleshoot,shares,sudo,duo,winapps
       --sudo-user LIST    Grant sudo to these accounts, comma separated
       --sudo-group LIST   Grant sudo to these groups, comma separated
       --join              Join the domain after installing
@@ -183,10 +186,23 @@ Duo two-factor authentication:
       --duo-exempt GROUP  Break-glass group whose members skip Duo
       --duo-repo          Allow adding Duo's own package repository
       --duo-build         Allow building Duo Unix from source where unpackaged
+
+Windows applications (WinApps):
+      --winapps           Set up WinApps for all users (same as -e winapps)
+      --no-winapps        Never set up WinApps, whatever the extras say
+      --winapps-backend B libvirt | manual | docker | podman
+      --winapps-host ADDR Windows hostname or IP. Required for 'manual'
+      --winapps-port PORT RDP port (default 3389)
+      --winapps-vm NAME   libvirt VM name (default RDPWindows)
+      --winapps-domain D  RDP_DOMAIN (default: the realm this machine joined)
+      --winapps-creds M   askpass | kerberos | shared
+      --winapps-user USER Windows service account, 'shared' mode only
+      --winapps-remove    Remove the multi-user wiring
 ```
 
 The secret key is also read from the `DUO_SKEY` environment variable, which
-keeps it out of the process list and the shell history.
+keeps it out of the process list and the shell history. The shared-mode WinApps
+password is read from `WINAPPS_RDP_PASS` the same way.
 
 Any option that says *what to do* skips the menu and runs the guided setup
 directly. `--dry-run` and the internal `--detected-de` only change *how* it is
@@ -719,6 +735,111 @@ for `UsePAM yes` and `KbdInteractiveAuthentication yes` and offers to write them
 to `/etc/ssh/sshd_config.d/99-duo.conf` — validated with `sshd -t` and removed
 again if `sshd` rejects it. Note that public-key authentication bypasses the PAM
 auth stack entirely, so a key-only login gets no second factor.
+
+---
+
+## Windows applications for every domain user
+
+[WinApps](https://github.com/winapps-org/winapps) makes individual Windows
+programs appear as ordinary entries in the Linux application menu, launched over
+RDP against a Windows instance. This section covers what it takes to make that
+work for *every* domain user rather than for one account.
+
+### The problem this solves
+
+Upstream WinApps installs one of two ways:
+
+| Mode | Launchers | Binary |
+| --- | --- | --- |
+| `setup.sh --user` | `~/.local/share/applications` | `~/.local/bin` |
+| `setup.sh --system` | `/usr/share/applications` | `/usr/local/bin` |
+
+So `--system` already shares the launchers with every account, and the advice
+you will find in older write-ups — run `setup.sh` per user, or copy `.desktop`
+files into `/usr/share/applications` by hand — is obsolete.
+
+What `--system` does **not** solve is the configuration. `bin/winapps` opens
+
+```bash
+readonly CONFIG_PATH="${HOME}/.config/winapps/winapps.conf"
+```
+
+and exits if it is missing. There is no `/etc/winapps` fallback, so every one of
+those shared launchers still dies without a file in the home directory of
+whoever clicks it. On a domain-joined machine you cannot write those files in
+advance: the accounts come from the directory, and the first time you learn a
+user exists is when they log in.
+
+### How it works here
+
+One root-owned template, expanded per user at login:
+
+```
+/etc/winapps/winapps.conf.template     the master copy - the only file you edit
+/usr/local/bin/winapps-user-config     generates ~/.config/winapps/winapps.conf
+/usr/local/bin/winapps-askpass         supplies the password to FreeRDP
+/etc/profile.d/winapps-user-config.sh  runs the generator for shell/SSH logins
+/etc/xdg/autostart/winapps-user-config.desktop   ...and for graphical ones
+/etc/skel/.config/winapps/winapps.conf covers the very first login
+```
+
+The generator substitutes `@WINAPPS_USER@` with the login name, stripping a
+`DOMAIN\` prefix or an `@realm` suffix so what reaches `RDP_USER` is the bare
+`sAMAccountName` Windows expects. **That substitution is the whole point** — it
+is what makes the RDP session land in that user's own Windows profile, with
+their own mapped drives, instead of everyone sharing one.
+
+Both login hooks are installed because display managers are inconsistent about
+sourcing `/etc/profile.d` for a graphical session. Whichever runs second is a
+no-op. The generator cannot fail a login: every path in it exits 0.
+
+A user who wants to keep a hand-edited copy deletes the marker line at the top
+of their file and it is never regenerated.
+
+### Where Windows runs
+
+| Choice | Description |
+| --- | --- |
+| **libvirt** *(default)* | A local Windows VM via KVM. Join the VM to the domain in its own right and each user's profile, GPOs and mapped drives come from AD as on a physical box. Best when the PC is used by one person at a time. |
+| **manual** | No VM here at all — the launchers point at a Windows host you already have, typically a Remote Desktop Session Host on the domain. Much lighter, and the sane option beyond a handful of PCs. |
+| **docker** / **podman** | Windows in a container via `dockur/windows`. Quick to stand up and easy to reset; joining it to the domain is still on you. |
+
+### Credentials
+
+| Mode | Description |
+| --- | --- |
+| **askpass** *(default)* | Each user is prompted for their own AD password, handed to FreeRDP through its askpass interface — so it never appears on a command line or in the WinApps log. Cached in the kernel *session* keyring where `keyctl` is available, so it is asked once per login rather than once per app, and it dies with the session. Nothing is stored on disk. |
+| **kerberos** | Single sign-on from the ticket SSSD obtained at login. The best experience when it works, but it needs the Windows host domain-joined with a correct SPN and a ticket cache FreeRDP can read. **Not verified against a live domain — treat it as the thing to aim for, not to switch on blind.** Falls back to a prompt. |
+| **shared** | Everyone connects as one service account. Appropriate for a kiosk; on a multi-user machine it defeats the domain join, because all users land in one Windows profile and the directory cannot tell them apart. |
+
+### Order of operations
+
+The launchers are built by scanning the Windows side for installed programs, so
+Windows has to exist first:
+
+1. Install Linux and **join it to the domain** — WinApps reads the joined realm
+   to fill in `RDP_DOMAIN`.
+2. Run this script's WinApps step. It installs FreeRDP and the backend, writes
+   the template, generator and login hooks, and seeds existing accounts.
+3. Deploy Windows (the VM, container, or RDS host) and **join it to the domain**.
+4. Re-run the scan to create the launchers:
+   `sudo /etc/winapps/setup.sh --system`
+
+Step 2 asks whether Windows is already up. If it is not, the groundwork is still
+written and it prints the command for step 4 — so the script is safe to run
+before Windows exists.
+
+### Day-to-day
+
+```bash
+sudo nano /etc/winapps/winapps.conf.template   # change a setting for everyone
+sudo /usr/local/bin/winapps-user-config --all  # push it out now, not at next login
+sudo /etc/winapps/setup.sh --system            # after installing a new Windows app
+sudo ./domain-join-setup.sh --winapps-remove   # take the wiring back out
+```
+
+New apps installed in Windows need one re-scan on the machine; new *users* need
+nothing at all — they are configured the moment they log in.
 
 ---
 
