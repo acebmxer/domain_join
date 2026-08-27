@@ -2885,6 +2885,14 @@ sudoers_write_rule() {
     return 1
 }
 
+# Why a name was rejected. Split out of sudo_grant_one so the interactive
+# prompt can say the same thing before it asks again.
+sudo_principal_syntax_error() {
+    err "'$1' holds a character that sudoers cannot carry in a name."
+    note "Letters, digits, spaces and . _ - @ \$ only: ',', '=', ':', '!' and '#'"
+    note "are sudoers syntax, so a name containing them cannot be written as a rule."
+}
+
 # sudo_grant_one <user|group> <name> [forced]
 #
 # forced=1 means the name came from a flag rather than a prompt, so an
@@ -2893,9 +2901,7 @@ sudo_grant_one() {
     local kind="$1" name="$2" forced="${3:-0}" rc=0
 
     if ! valid_sudo_principal "$name"; then
-        err "'$name' holds a character that sudoers cannot carry in a name."
-        note "Letters, digits, spaces and . _ - @ \$ only: ',', '=', ':', '!' and '#'"
-        note "are sudoers syntax, so a name containing them cannot be written as a rule."
+        sudo_principal_syntax_error "$name"
         return 1
     fi
 
@@ -2945,7 +2951,10 @@ sudo_grant_one() {
     return 0
 }
 
-# Ask for one name and grant it.
+# Ask for one name and grant it. A name sudoers cannot spell is a typo, not a
+# decision, so it is asked again rather than abandoning the grant - the reason
+# the name was refused is on screen and the answer is one correction away.
+# Enter on an empty line is the way out.
 sudo_grant_interactive() {
     local kind="$1" name prompt domain
     domain="$(sudo_domain_suffix)"
@@ -2957,15 +2966,28 @@ sudo_grant_interactive() {
         prompt="Account to grant sudo (e.g. jdoe or jdoe@${domain})"
     fi
 
-    printf '\n'
-    ask_value name "$prompt" ""
-    name="${name#"${name%%[![:space:]]*}"}"
-    name="${name%"${name##*[![:space:]]}"}"
+    while true; do
+        printf '\n'
+        ask_value name "$prompt" ""
+        name="${name#"${name%%[![:space:]]*}"}"
+        name="${name%"${name##*[![:space:]]}"}"
 
-    if [[ -z "$name" ]]; then
-        note "No $kind given; nothing granted."
-        return 0
-    fi
+        if [[ -z "$name" ]]; then
+            note "No $kind given; nothing granted."
+            return 0
+        fi
+
+        if valid_sudo_principal "$name"; then
+            break
+        fi
+
+        sudo_principal_syntax_error "$name"
+        note "Type it again, or press Enter on an empty line to grant nothing."
+        # ASSUME_YES makes ask_value return the (empty) default without reading,
+        # so looping here would spin forever on a bad --sudo-user default.
+        (( ASSUME_YES )) && return 1
+    done
+
     sudo_grant_one "$kind" "$name"
 }
 
@@ -4251,10 +4273,25 @@ menu_run_action() {
     esac
 }
 
+# The once-per-run guards on the steps that are reachable from more than one
+# place - configure_sudo_access from both the menu and post_join_tuning, and so
+# on. They exist to stop one batch prompting twice for the same thing, so they
+# are scoped to a batch: the menu loops back for another ENTER, and without
+# this reset a step already run would return success without a word, leaving
+# "Done." printed over a selection that did nothing.
+reset_step_guards() {
+    SDDM_GREETER_DONE=0
+    DUO_DONE=0
+    POST_JOIN_TUNING_DONE=0
+    SUDO_ACCESS_DONE=0
+}
+
 # Run everything that was ticked, in MENU_RUN_ORDER.
 process_menu_selections() {
     local -a queue=()
     local idx
+
+    reset_step_guards
 
     for idx in "${MENU_RUN_ORDER[@]}"; do
         (( MENU_SELECTED[idx] == 1 )) && queue+=("$idx")

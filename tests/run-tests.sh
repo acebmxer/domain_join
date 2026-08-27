@@ -915,6 +915,60 @@ section "sudo rights: the guard against asking twice"
   check "a second call is a no-op" "" "$(configure_sudo_access 2>&1)" )
 PASS=$((PASS + 1))
 
+# ...but the guard is scoped to one batch of menu selections. The menu loops
+# back for another ENTER, and a step ticked again then has to run again rather
+# than returning success silently and leaving "Done." over a no-op.
+# Deliberately not in a subshell: check() counts into PASS/FAIL, and a subshell
+# would throw the FAIL away.
+SDDM_GREETER_DONE=1; DUO_DONE=1; POST_JOIN_TUNING_DONE=1; SUDO_ACCESS_DONE=1
+reset_step_guards
+check "a new batch clears the sudo guard"      "0" "$SUDO_ACCESS_DONE"
+check "a new batch clears the post-join guard" "0" "$POST_JOIN_TUNING_DONE"
+check "a new batch clears the SDDM guard"      "0" "$SDDM_GREETER_DONE"
+check "a new batch clears the Duo guard"       "0" "$DUO_DONE"
+
+section "sudo rights: a mistyped name is asked again"
+# A name sudoers cannot spell is a typo, not an answer: the prompt repeats
+# instead of abandoning the grant. The stub pops one scripted reply per call.
+SUDO_TMP="$(mktemp -d)"
+SUDO_RETRY_OUT="$(
+  SUDOERS_DIR="$SUDO_TMP"; DRY_RUN=0; ASSUME_YES=0
+  ANSWERS=("Linux Admins," "Linux Admins")
+  ask_value() { printf -v "$1" '%s' "${ANSWERS[0]:-}"; ANSWERS=("${ANSWERS[@]:1}"); }
+  confirm()   { return 0; }   # "write the rule anyway?" - the name will not resolve
+  sudo_grant_interactive group 2>&1
+)"
+check "the mistyped name is rejected" "yes" \
+      "$([[ "$SUDO_RETRY_OUT" == *"'Linux Admins,' holds a character"* ]] && echo yes || echo no)"
+check "the prompt says how to back out" "yes" \
+      "$([[ "$SUDO_RETRY_OUT" == *"press Enter on an empty line"* ]] && echo yes || echo no)"
+check "the corrected name is written" "yes" \
+      "$([[ -f "$SUDO_TMP/domain-join-group-linux-admins" ]] && echo yes || echo no)"
+
+# The remaining two need a stubbed ask_value but their result has to be counted,
+# so the real one is put back by hand rather than by leaving a subshell.
+ASK_VALUE_REAL="$(declare -f ask_value)"
+
+# An empty answer is still the way out, and still not a failure.
+SUDOERS_DIR="$SUDO_TMP"; DRY_RUN=0; ASSUME_YES=0
+ask_value() { printf -v "$1" '%s' ""; }
+sudo_grant_interactive user >/dev/null 2>&1
+check "an empty name grants nothing and succeeds" "0" "$?"
+check "an empty name writes no file" "1" "$(ls -1 "$SUDO_TMP" | wc -l)"
+
+# -y never reads, so ask_value hands back the same unusable name every time.
+# The loop has to give up rather than spin: it returns 1, and a hang here would
+# stall the suite, which is the other half of the assertion.
+ASSUME_YES=1
+ask_value() { printf -v "$1" '%s' "Bad,Name"; }
+sudo_grant_interactive group >/dev/null 2>&1
+check "-y gives up on an unusable name instead of looping" "1" "$?"
+
+eval "$ASK_VALUE_REAL"
+ASSUME_YES=0
+rm -rf "$SUDO_TMP"
+SUDOERS_DIR="/etc/sudoers.d"
+
 section "CLI smoke tests"
 for args in "--help" "--version"; do
     if "$TARGET" $args >/dev/null 2>&1; then
