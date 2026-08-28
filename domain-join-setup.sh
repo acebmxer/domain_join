@@ -4289,6 +4289,7 @@ configure_winapps() {
     winapps_write_template "$OPT_WINAPPS_DOMAIN" "$OPT_WINAPPS_BACKEND" \
         "$OPT_WINAPPS_CREDS" "$OPT_WINAPPS_HOST" "$OPT_WINAPPS_PORT" \
         "$OPT_WINAPPS_VM" || return 1
+    winapps_write_seeder || return 1
     winapps_wire_login_hooks || return 1
     winapps_seed_all
 
