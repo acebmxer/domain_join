@@ -822,7 +822,12 @@ With the **libvirt** backend the script can stand up the Windows guest itself
 (`--winapps-deploy`, or answer yes when it offers). It installs a
 `winapps-vm-deploy` helper and runs it:
 
-- an **unattended** Windows 11 Pro install — no clicking through setup
+- an **unattended** Windows 11 Pro install — no clicking through setup. The
+  helper prepares a copy of the ISO under `/var/lib/libvirt/images/` with the
+  "Press any key to boot from CD or DVD…" prompt removed so the guest boots
+  Setup on its own; if that cannot be done for a given ISO it says so and falls
+  back to sending a keypress at boot (watch the first boot in `virt-viewer` and
+  press a key if it stalls)
 - **virtio** drivers staged so the installer sees the disk, guest tools and the
   QEMU agent installed on first boot
 - **Remote Desktop and RemoteApp** switched on, idle sleep disabled, the LAN set

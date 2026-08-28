@@ -3624,7 +3624,8 @@ FORCE=0
 
 CACHE="/var/lib/winapps/iso"
 VIRTIO_ISO="$CACHE/virtio-win.iso"
-STAGED_WIN_ISO=""      # set if the Windows ISO has to be copied somewhere the hypervisor can read
+STAGED_WIN_ISO=""      # the pool copy of the Windows ISO, re-mastered to boot without the CD prompt
+SRC_WIN_ISO=""         # the operator's / cached / Mido-fetched source ISO before preparation
 UNATTEND_ISO=""        # set once the answer disk is built
 VIRTIO_URL="https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso"
 MIDO_URL="https://raw.githubusercontent.com/ElliotKillick/Mido/main/Mido.sh"
@@ -3688,8 +3689,9 @@ if virsh -c "$LIBVIRT_URI" dominfo "$VM_NAME" >/dev/null 2>&1; then
         # by path. The system disk and the VM-named staged ISOs are removed by
         # name below instead.
         virsh -c "$LIBVIRT_URI" undefine --nvram "$VM_NAME" >/dev/null 2>&1 || true
-        # The staged '-install.iso' is kept: it is only a copy of the source ISO
-        # and the size check below refreshes it if the source changed.
+        # The prepared '-install.iso' (+ its '.src' marker) is kept: it is a
+        # re-mastered copy of the source ISO and the marker check below rebuilds
+        # it when the source ISO changes.
         rm -f "$POOL_DIR/${VM_NAME}.qcow2" \
               "$POOL_DIR/${VM_NAME}-unattend.iso" 2>/dev/null || true
     else
@@ -3742,37 +3744,93 @@ hyp_can_read() {
     fi
 }
 
+# iso_efi_noprompt SRC DST
+# Copy SRC to DST, then patch DST so the guest boots without the Windows
+# install media's "Press any key to boot from CD or DVD..." prompt. That
+# prompt hangs an unattended build: nothing is watching the console, so OVMF
+# drops the CD after a few seconds and Setup never starts. ('virsh send-key'
+# is not a reliable cure - the guest keyboard is not up that early.)
+#
+# Microsoft ships a prompt-free 'efisys_noprompt.bin' right next to the
+# prompting 'efisys.bin', identical in size, and the El Torito UEFI entry
+# points at that file's sectors. So we overwrite those sectors in place with
+# the no-prompt image - no re-mastering, which keeps the UDF structure and
+# any >4 GiB install.wim byte-for-byte intact. Returns non-zero on any
+# problem; the caller then falls back to a plain copy.
+iso_efi_noprompt() {
+    local src="$1" dst="$2" d g nppath ppath np_sz p_sz start
+    command -v xorriso >/dev/null 2>&1 || return 1
+    command -v dd >/dev/null 2>&1 || return 1
+    d="$(mktemp -d "$WORK/noprompt.XXXXXX")" || return 1
+
+    # Locate both boot images by name, whatever case/tree xorriso reads them
+    # from. report_lba prints "... , '<iso-path>'" as the last field.
+    nppath=""; ppath=""
+    for g in 'efisys_noprompt.bin' 'EFISYS_NOPROMPT.BIN' \
+             'efisys_noprompt*' 'EFISYS_NOPROMPT*'; do
+        nppath="$(xorriso -indev "$src" -find / -name "$g" -exec report_lba -- \
+                    2>/dev/null | awk -F\' '/lba:/ {print $2; exit}')"
+        [ -n "$nppath" ] && break
+    done
+    for g in 'efisys.bin' 'EFISYS.BIN'; do
+        ppath="$(xorriso -indev "$src" -find / -name "$g" -exec report_lba -- \
+                   2>/dev/null | awk -F\' '/lba:/ {print $2; exit}')"
+        [ -n "$ppath" ] && break
+    done
+    { [ -n "$nppath" ] && [ -n "$ppath" ]; } || { rm -rf "$d"; return 1; }
+
+    xorriso -osirrox on -indev "$src" -extract "$nppath" "$d/np.bin" >/dev/null 2>&1
+    xorriso -osirrox on -indev "$src" -extract "$ppath"  "$d/p.bin"  >/dev/null 2>&1
+    { [ -s "$d/np.bin" ] && [ -s "$d/p.bin" ]; } || { rm -rf "$d"; return 1; }
+
+    np_sz=$(stat -c %s "$d/np.bin" 2>/dev/null || echo 0)
+    p_sz=$(stat -c %s "$d/p.bin" 2>/dev/null || echo 0)
+    # Same size means the sectors line up and 'dd' overwrites the extent exactly.
+    [ "$np_sz" -gt 0 ] && [ "$np_sz" = "$p_sz" ] || { rm -rf "$d"; return 1; }
+
+    # 2048-byte sector where efisys.bin starts in the image. On Microsoft media
+    # the El Torito UEFI entry points at exactly this file's extent, so writing
+    # the no-prompt image here is what OVMF ends up loading from the CD.
+    #   report_lba: "File data lba:  <idx> , <start> , <blocks> , '<path>'"
+    start=$(xorriso -indev "$src" -find "$ppath" -exec report_lba -- 2>/dev/null \
+              | awk -F, '/data lba:/ {gsub(/[^0-9]/,"",$2); print $2; exit}')
+    case "$start" in ''|*[!0-9]*|0) rm -rf "$d"; return 1;; esac
+
+    rm -f "$dst"
+    cp --reflink=auto -f "$src" "$dst" 2>/dev/null || cp -f "$src" "$dst" \
+        || { rm -rf "$d"; return 1; }
+
+    if dd if="$d/np.bin" of="$dst" bs=2048 seek="$start" conv=notrunc status=none 2>/dev/null; then
+        rm -rf "$d"; return 0
+    fi
+    rm -rf "$d"; rm -f "$dst"; return 1
+}
+
 # --- Windows ISO -----------------------------------------------------------
+SRC_WIN_ISO=""
 if [ -n "$WIN_ISO" ]; then
     [ -d "$WIN_ISO" ] && die "the ISO path is a directory ($WIN_ISO) - give the full path to the .iso file, filename included."
     [ -f "$WIN_ISO" ] || die "Windows ISO not found: $WIN_ISO (pass the full path including the .iso filename)"
-    if hyp_can_read "$WIN_ISO"; then
-        log "Using Windows ISO: $WIN_ISO"
-    else
-        STAGED_WIN_ISO="$POOL_DIR/${VM_NAME}-install.iso"
-        _src_sz=$(stat -c %s "$WIN_ISO" 2>/dev/null || echo 0)
-        _dst_sz=$(stat -c %s "$STAGED_WIN_ISO" 2>/dev/null || echo 0)
-        if [ "$_src_sz" -gt 0 ] && [ "$_src_sz" = "$_dst_sz" ]; then
-            log "Reusing the staged Windows ISO at $STAGED_WIN_ISO"
-        else
-            log "Windows ISO is not reachable by the '$QEMU_USER' user; copying it to $STAGED_WIN_ISO"
-            log "(this is a one-time copy of a multi-GB file and can take a few minutes)"
-            cp --reflink=auto -f "$WIN_ISO" "$STAGED_WIN_ISO" 2>/dev/null \
-                || cp -f "$WIN_ISO" "$STAGED_WIN_ISO" \
-                || die "could not copy the Windows ISO into $POOL_DIR."
-        fi
-        chmod 0644 "$STAGED_WIN_ISO"
-        WIN_ISO="$STAGED_WIN_ISO"
-    fi
+    SRC_WIN_ISO="$WIN_ISO"
+    log "Using Windows ISO: $WIN_ISO"
 elif [ -f "$POOL_DIR/${VM_NAME}-install.iso" ]; then
-    # A previous run staged the operator's ISO here. Reuse it rather than
-    # falling back to a fresh (and often broken) Mido download.
-    WIN_ISO="$POOL_DIR/${VM_NAME}-install.iso"
-    log "Reusing the staged Windows ISO: $WIN_ISO"
+    # A previous run left its ISO here. Reuse it rather than falling back to a
+    # fresh (and often broken) Mido download. The prepare step below is skipped
+    # ('.src' marker present) or re-runs against this copy as its own source.
+    if [ -f "$POOL_DIR/${VM_NAME}-install.iso.src" ]; then
+        WIN_ISO="$POOL_DIR/${VM_NAME}-install.iso"
+        log "Reusing the prepared Windows ISO: $WIN_ISO"
+    else
+        _stale="$POOL_DIR/${VM_NAME}-install.stale.iso"
+        mv -f "$POOL_DIR/${VM_NAME}-install.iso" "$_stale" \
+            && SRC_WIN_ISO="$_stale" \
+            || die "could not move the stale staged ISO aside."
+        log "Re-preparing the previously staged Windows ISO."
+    fi
 else
-    WIN_ISO="$CACHE/windows.iso"
-    if [ -f "$WIN_ISO" ]; then
-        log "Using cached Windows ISO: $WIN_ISO"
+    SRC_WIN_ISO="$CACHE/windows.iso"
+    if [ -f "$SRC_WIN_ISO" ]; then
+        log "Using cached Windows ISO: $SRC_WIN_ISO"
     else
         log "No ISO given - fetching Windows 11 with Mido (from Microsoft's own servers)."
         warn "Mido drives Microsoft's download API and can break without notice."
@@ -3782,10 +3840,10 @@ else
         chmod +x "$_mido"
         ( cd "$CACHE" && "$_mido" win11x64 ) || die "Mido could not fetch the Windows ISO."
         if [ -f "$CACHE/win11x64.iso" ]; then
-            mv -f "$CACHE/win11x64.iso" "$WIN_ISO"
+            mv -f "$CACHE/win11x64.iso" "$SRC_WIN_ISO"
         else
             _got=$(ls -1t "$CACHE"/*.iso 2>/dev/null | grep -v virtio | head -1)
-            [ -n "$_got" ] && mv -f "$_got" "$WIN_ISO" || die "Mido finished but produced no ISO."
+            [ -n "$_got" ] && mv -f "$_got" "$SRC_WIN_ISO" || die "Mido finished but produced no ISO."
         fi
     fi
 fi
@@ -3803,6 +3861,46 @@ WORK="$(mktemp -d /var/tmp/winapps-deploy.XXXXXX)" || die "could not create a wo
 ISO_ROOT="$WORK/iso"
 DRV="$ISO_ROOT/\$WinPEDriver\$"
 mkdir -p "$DRV" "$ISO_ROOT/oem"
+
+# --- prepare the Windows ISO (strip the "press any key" CD boot prompt) ---
+# Always work on a copy in the pool: the operator's original ISO is never
+# touched and the QEMU user can always read what is under $POOL_DIR.
+# NOPROMPT_OK=1 once the staged ISO is known to boot without the CD prompt.
+NOPROMPT_OK=0
+if [ -n "$SRC_WIN_ISO" ]; then
+    [ -f "$SRC_WIN_ISO" ] || die "Windows ISO vanished: $SRC_WIN_ISO"
+    STAGED_WIN_ISO="$POOL_DIR/${VM_NAME}-install.iso"
+    _mk="$STAGED_WIN_ISO.src"
+    _src_sz=$(stat -c %s "$SRC_WIN_ISO" 2>/dev/null || echo 0)
+    [ "$SRC_WIN_ISO" = "$STAGED_WIN_ISO" ] && die "internal: source and staged ISO path collide."
+    if [ "$_src_sz" -gt 0 ] && [ -f "$STAGED_WIN_ISO" ] && \
+       [ "$(cut -d' ' -f1 "$_mk" 2>/dev/null)" = "$_src_sz" ]; then
+        log "Reusing the prepared Windows ISO at $STAGED_WIN_ISO"
+        [ "$(cut -d' ' -f2 "$_mk" 2>/dev/null)" = "noprompt" ] && NOPROMPT_OK=1
+    else
+        rm -f "$STAGED_WIN_ISO" "$_mk"
+        log "Preparing the Windows ISO for an unattended boot."
+        log "(makes a copy in $POOL_DIR without the 'press any key' CD prompt - a"
+        log " few minutes, once per source ISO)"
+        _mode=plain
+        if iso_efi_noprompt "$SRC_WIN_ISO" "$STAGED_WIN_ISO"; then
+            NOPROMPT_OK=1; _mode=noprompt
+        else
+            warn "could not remove the CD boot prompt from this ISO - using a plain copy."
+            warn "Watch the first boot in virt-viewer and press a key at the"
+            warn "'Press any key to boot from CD or DVD...' prompt if it appears."
+            cp --reflink=auto -f "$SRC_WIN_ISO" "$STAGED_WIN_ISO" 2>/dev/null \
+                || cp -f "$SRC_WIN_ISO" "$STAGED_WIN_ISO" \
+                || die "could not stage the Windows ISO into $POOL_DIR."
+        fi
+        chmod 0644 "$STAGED_WIN_ISO"
+        printf '%s %s\n' "$_src_sz" "$_mode" > "$_mk"
+        [ -n "${_stale:-}" ] && rm -f "$_stale"
+    fi
+    WIN_ISO="$STAGED_WIN_ISO"
+fi
+[ -f "$WIN_ISO" ] || die "no Windows ISO to install from."
+hyp_can_read "$WIN_ISO" || warn "the prepared ISO ($WIN_ISO) may not be readable by the '$QEMU_USER' user."
 
 # Stage the boot-critical virtio drivers where Windows Setup auto-loads them
 # (a folder named $WinPEDriver$ at the root of the attached media). Pulled
@@ -4026,17 +4124,19 @@ virt-install \
 
 virsh -c "$LIBVIRT_URI" autostart "$VM_NAME" >/dev/null 2>&1 || true
 
-# The system disk boots first (boot.order=1) but is empty on the very first
-# boot, so OVMF falls through to the Windows install CD - which stops at
-# "Press any key to boot from CD or DVD..." and gives up after ~5s. With
-# nobody at the console the install never starts. Tap a key every couple of
-# seconds for the first few minutes to get past that one prompt; once Setup
-# is running, Autounattend.xml drives every screen and the stray keystrokes
-# are harmless. After install the disk is bootable, so later reboots skip
-# the CD and this never matters again.
+# Belt and braces for the CD boot prompt. The install ISO is patched to boot
+# straight through (see iso_efi_noprompt), but in case that did not take on
+# this media, also tap a key every couple of seconds for the first few
+# minutes: on the first boot the empty system disk (boot.order=1) fails and
+# OVMF falls through to the CD, which otherwise stops at "Press any key to
+# boot from CD or DVD...". 'send-key' is unreliable that early in firmware,
+# hence the ISO patch is the real fix - but the extra keystrokes are free
+# insurance and harmless once Setup (driven by Autounattend.xml) is running.
+# After install the disk boots directly and none of this fires again.
 (
-    for _ in $(seq 1 90); do
-        virsh -c "$LIBVIRT_URI" send-key "$VM_NAME" KEY_ENTER >/dev/null 2>&1 || break
+    sleep 5
+    for _ in $(seq 1 150); do
+        virsh -c "$LIBVIRT_URI" send-key "$VM_NAME" KEY_ENTER >/dev/null 2>&1
         sleep 2
     done
 ) >/dev/null 2>&1 &
@@ -4047,6 +4147,13 @@ echo "  The Windows guest '$VM_NAME' is installing."
 echo ""
 echo "    Watch it:   virt-viewer --connect $LIBVIRT_URI $VM_NAME"
 echo ""
+if [ "${NOPROMPT_OK:-0}" != "1" ]; then
+echo "  NOTE: the CD boot prompt could not be removed from this ISO. If the"
+echo "  first boot stops at 'Press any key to boot from CD or DVD...', open"
+echo "  the viewer above and press a key. (A key is also sent automatically,"
+echo "  but that can miss the ~5-second window.)"
+echo ""
+fi
 echo "  The install is unattended and reboots itself a few times. Give it"
 echo "  20-45 minutes to settle on the desktop."
 echo ""
