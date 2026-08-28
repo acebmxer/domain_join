@@ -1172,6 +1172,7 @@ check_line "it stages an unreachable ISO into the pool" '${VM_NAME}-install.iso'
 check_line "it builds the answer disk in the pool"  'UNATTEND_ISO="$POOL_DIR' "$WINAPPS_VM_DEPLOYER"
 check_line "it stages the virtio boot driver"      'viostor'                "$WINAPPS_VM_DEPLOYER"
 check_line "it creates the guest with an emulated TPM" 'backend.type=emulator' "$WINAPPS_VM_DEPLOYER"
+check_line "it taps a key past the CD boot prompt"  'send-key "$VM_NAME" KEY_ENTER' "$WINAPPS_VM_DEPLOYER"
 check_line "it points the user at the app scan"    'setup.sh --system'      "$WINAPPS_VM_DEPLOYER"
 # The '--help' banner must not fall through to the argument parser.
 if ( "$WINAPPS_VM_DEPLOYER" --nonsense ) >/dev/null 2>&1; then

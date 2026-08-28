@@ -4026,6 +4026,21 @@ virt-install \
 
 virsh -c "$LIBVIRT_URI" autostart "$VM_NAME" >/dev/null 2>&1 || true
 
+# The system disk boots first (boot.order=1) but is empty on the very first
+# boot, so OVMF falls through to the Windows install CD - which stops at
+# "Press any key to boot from CD or DVD..." and gives up after ~5s. With
+# nobody at the console the install never starts. Tap a key every couple of
+# seconds for the first few minutes to get past that one prompt; once Setup
+# is running, Autounattend.xml drives every screen and the stray keystrokes
+# are harmless. After install the disk is bootable, so later reboots skip
+# the CD and this never matters again.
+(
+    for _ in $(seq 1 90); do
+        virsh -c "$LIBVIRT_URI" send-key "$VM_NAME" KEY_ENTER >/dev/null 2>&1 || break
+        sleep 2
+    done
+) >/dev/null 2>&1 &
+
 echo ""
 echo "  ---------------------------------------------------------------------------"
 echo "  The Windows guest '$VM_NAME' is installing."
