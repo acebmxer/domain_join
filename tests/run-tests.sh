@@ -219,6 +219,12 @@ check "one hint per entry"  "${#MENU_NAMES[@]}" "${#MENU_HINTS[@]}"
 check "MENU_TOTAL matches the names" "${#MENU_NAMES[@]}" "$MENU_TOTAL"
 check "the columns account for every entry" "$MENU_TOTAL" \
       "$(( MENU_LEFT_COUNT + MENU_RIGHT_COUNT + (MENU_TOTAL - MENU_LEFT_COUNT - MENU_RIGHT_COUNT) ))"
+# An even list fills two whole columns; an odd list leaves exactly one over for
+# the centred row. Anything else is a layout mistake.
+_leftover=$(( MENU_TOTAL - MENU_LEFT_COUNT - MENU_RIGHT_COUNT ))
+check "an even list has no centred row"      "0" "$(( MENU_TOTAL % 2 == 0 ? _leftover : 0 ))"
+check "the split is even within one row"     "1" "$(( MENU_LEFT_COUNT == MENU_RIGHT_COUNT || MENU_LEFT_COUNT == MENU_RIGHT_COUNT + 1 ? 1 : 0 ))"
+check "at most one entry is ever centred"    "1" "$(( _leftover <= 1 ? 1 : 0 ))"
 check "the run order covers every entry once" "$MENU_TOTAL" "${#MENU_RUN_ORDER[@]}"
 check "the run order is a permutation of the indices" \
       "$(seq 0 $((MENU_TOTAL - 1)) | sort -n | tr '\n' ' ')" \
@@ -275,40 +281,59 @@ done
 check "every drawn line fits the terminal" "0" "$overlong"
 
 section "Menu navigation"
+# Mirrors the UP/DOWN handlers in run_menu: with an even list there is no
+# centred row, so a wrap at a column edge stays inside that column.
 nav() {
-    # Places the cursor, applies a key, and reports where it landed.
     MENU_CURSOR="$1"
     menu_get_pos "$MENU_CURSOR"
+    local has_centre=$(( MENU_TOTAL > MENU_LEFT_COUNT + MENU_RIGHT_COUNT ))
     case "$2" in
-        up)    if (( MCOL == 2 )); then menu_set_cursor 0 $(( MENU_LEFT_COUNT - 1 ))
-               elif (( MROW == 0 )); then menu_set_cursor 2 0
-               else menu_set_cursor "$MCOL" $(( MROW - 1 )); fi ;;
-        down)  if (( MCOL == 2 )); then menu_set_cursor 0 0
-               else
-                   col_size=$MENU_LEFT_COUNT
-                   (( MCOL == 1 )) && col_size=$MENU_RIGHT_COUNT
-                   if (( MROW >= col_size - 1 )); then menu_set_cursor 2 0
-                   else menu_set_cursor "$MCOL" $(( MROW + 1 )); fi
-               fi ;;
+        up)
+            if (( MCOL == 2 )); then menu_set_cursor 0 $(( MENU_LEFT_COUNT - 1 ))
+            elif (( MROW == 0 )); then
+                if (( has_centre )); then menu_set_cursor 2 0
+                else
+                    col_size=$MENU_LEFT_COUNT
+                    (( MCOL == 1 )) && col_size=$MENU_RIGHT_COUNT
+                    menu_set_cursor "$MCOL" $(( col_size - 1 ))
+                fi
+            else menu_set_cursor "$MCOL" $(( MROW - 1 )); fi ;;
+        down)
+            if (( MCOL == 2 )); then menu_set_cursor 0 0
+            else
+                col_size=$MENU_LEFT_COUNT
+                (( MCOL == 1 )) && col_size=$MENU_RIGHT_COUNT
+                if (( MROW >= col_size - 1 )); then
+                    if (( has_centre )); then menu_set_cursor 2 0
+                    else menu_set_cursor "$MCOL" 0; fi
+                else menu_set_cursor "$MCOL" $(( MROW + 1 )); fi
+            fi ;;
     esac
     printf '%s' "$MENU_CURSOR"
 }
 ML_TWO_COL=1
-centre_idx=$(( MENU_LEFT_COUNT + MENU_RIGHT_COUNT ))
+right_top=$MENU_LEFT_COUNT
 right_foot=$(( MENU_LEFT_COUNT + MENU_RIGHT_COUNT - 1 ))
 left_foot=$(( MENU_LEFT_COUNT - 1 ))
 check "index 0 is the top of the left column"  "0 0" "$(menu_get_pos 0; printf '%s %s' "$MCOL" "$MROW")"
 check "the first right-column index is its top" "1 0" \
-      "$(menu_get_pos "$MENU_LEFT_COUNT"; printf '%s %s' "$MCOL" "$MROW")"
-check "the last index is the centred row"      "2 0" \
-      "$(menu_get_pos "$centre_idx"; printf '%s %s' "$MCOL" "$MROW")"
+      "$(menu_get_pos "$right_top"; printf '%s %s' "$MCOL" "$MROW")"
 check "the right column's foot is in column 1" "1 $(( MENU_RIGHT_COUNT - 1 ))" \
       "$(menu_get_pos "$right_foot"; printf '%s %s' "$MCOL" "$MROW")"
-check "up from the top wraps to the centre"    "$centre_idx" "$(nav 0 up)"
-check "down off the left column reaches it too" "$centre_idx" "$(nav "$left_foot" down)"
-check "down off the right column reaches it too" "$centre_idx" "$(nav "$right_foot" down)"
-check "down from the centre returns to the top" "0" "$(nav "$centre_idx" down)"
-check "up from the centre enters the left column" "$left_foot" "$(nav "$centre_idx" up)"
+check "up from the left top wraps to the left foot"   "$left_foot"  "$(nav 0 up)"
+check "up from the right top wraps to the right foot" "$right_foot" "$(nav "$right_top" up)"
+check "down off the left foot wraps to the left top"  "0"           "$(nav "$left_foot" down)"
+check "down off the right foot wraps to the right top" "$right_top" "$(nav "$right_foot" down)"
+check "down within the left column steps by one"      "1"           "$(nav 0 down)"
+
+# The centred-row path still has to work for a hypothetical odd list.
+_sL=$MENU_LEFT_COUNT _sR=$MENU_RIGHT_COUNT _sT=$MENU_TOTAL
+MENU_LEFT_COUNT=2; MENU_RIGHT_COUNT=2; MENU_TOTAL=5
+_ci=$(( MENU_LEFT_COUNT + MENU_RIGHT_COUNT ))
+check "odd list: up from a column top reaches the centred row" "$_ci" "$(nav 0 up)"
+check "odd list: up from the centred row enters the left column" "1" "$(nav "$_ci" up)"
+check "odd list: down from the centred row returns to the top"  "0" "$(nav "$_ci" down)"
+MENU_LEFT_COUNT=$_sL; MENU_RIGHT_COUNT=$_sR; MENU_TOTAL=$_sT
 MENU_CURSOR=0
 
 # The columns need not be the same length, and the draw loop used to walk only
@@ -1001,6 +1026,35 @@ fi
 check "manual backend is fine with a host" "1|manual||0" \
       "$(winapps_after --winapps-backend manual --winapps-host win.corp.example.com)"
 
+section "WinApps: the VM builder flags"
+winapps_deploy_after() {
+    ( OPT_WINAPPS=-1; OPT_WINAPPS_BACKEND=""; OPT_WINAPPS_DEPLOY=-1
+      OPT_WINAPPS_ISO=""; OPT_WINAPPS_VM_RAM=""; OPT_WINAPPS_VM_CPUS=""
+      OPT_WINAPPS_VM_DISK=""; WINAPPS_VM_REMOVE=0; WINAPPS_REMOVE=0; ASSUME_YES=0
+      parse_args "$@" >/dev/null 2>&1
+      printf '%s|%s|%s|%s|%s' "$OPT_WINAPPS_DEPLOY" "$OPT_WINAPPS_VM_RAM" \
+             "$OPT_WINAPPS_VM_CPUS" "$OPT_WINAPPS_VM_DISK" "$WINAPPS_VM_REMOVE" )
+}
+check "--winapps-deploy implies on"     "1||||0"     "$(winapps_deploy_after --winapps-deploy)"
+check "--no-winapps-deploy turns it off" "0||||0"    "$(winapps_deploy_after --no-winapps-deploy)"
+check "--winapps-vm-ram/-cpus/-disk stored" "1|8192|6|128|0" \
+      "$(winapps_deploy_after --winapps-deploy --winapps-vm-ram 8192 --winapps-vm-cpus 6 --winapps-vm-disk 128)"
+check "--winapps-vm-remove sets both flags" "1" \
+      "$( ( WINAPPS_VM_REMOVE=0; WINAPPS_REMOVE=0
+            parse_args --winapps-vm-remove >/dev/null 2>&1
+            printf '%s' "$(( WINAPPS_VM_REMOVE & WINAPPS_REMOVE ))" ) )"
+
+# Non-libvirt backend + deploy must be refused, and a bad size must stop the run.
+for bad in "--winapps-deploy --winapps-backend docker" \
+           "--winapps-deploy --winapps-vm-ram plenty" \
+           "--winapps-iso /nonexistent/windows.iso"; do
+    if ( parse_args $bad ) >/dev/null 2>&1; then
+        printf '  %s %s was accepted\n' "$(red FAIL)" "$bad"; ((FAIL++))
+    else
+        printf '  %s %s is rejected\n' "$(green PASS)" "$bad"; ((PASS++))
+    fi
+done
+
 section "WinApps: the config template"
 WA_TMP="$(mktemp -d)"
 WINAPPS_TEMPLATE="$WA_TMP/winapps.conf.template"
@@ -1087,6 +1141,29 @@ printf 'RDP_USER="hand-edited"\n' >"$OWN"
 seed_as jdoe >/dev/null
 check "a copy without the marker is left alone" 'RDP_USER="hand-edited"' \
       "$(grep '^RDP_USER=' "$OWN")"
+
+section "WinApps: the VM builder script"
+WINAPPS_VM_DEPLOYER="$WA_TMP/winapps-vm-deploy"
+winapps_write_vm_deployer >/dev/null 2>&1
+if bash -n "$WINAPPS_VM_DEPLOYER" 2>/dev/null; then
+    printf '  %s the generated VM builder parses\n' "$(green PASS)"; ((PASS++))
+else
+    printf '  %s the generated VM builder has a syntax error\n' "$(red FAIL)"; ((FAIL++))
+fi
+check_line "it authors an unattended answer file"  'Autounattend.xml'        "$WINAPPS_VM_DEPLOYER"
+check_line "it installs Windows 11 Pro"            '<Value>Windows 11 Pro</Value>' "$WINAPPS_VM_DEPLOYER"
+check_line "it bypasses the Win11 hardware checks" 'BypassTPMCheck'          "$WINAPPS_VM_DEPLOYER"
+check_line "it enables Remote Desktop"             'fDenyTSConnections'      "$WINAPPS_VM_DEPLOYER"
+check_line "it imports the RemoteApp registry"     'RDPApps.reg'             "$WINAPPS_VM_DEPLOYER"
+check_line "it stages the virtio boot driver"      'viostor'                "$WINAPPS_VM_DEPLOYER"
+check_line "it creates the guest with an emulated TPM" 'backend.type=emulator' "$WINAPPS_VM_DEPLOYER"
+check_line "it points the user at the app scan"    'setup.sh --system'      "$WINAPPS_VM_DEPLOYER"
+# The '--help' banner must not fall through to the argument parser.
+if ( "$WINAPPS_VM_DEPLOYER" --nonsense ) >/dev/null 2>&1; then
+    printf '  %s the VM builder accepts a bogus argument\n' "$(red FAIL)"; ((FAIL++))
+else
+    printf '  %s the VM builder rejects a bogus argument\n' "$(green PASS)"; ((PASS++))
+fi
 
 rm -rf "$WA_TMP"
 

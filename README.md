@@ -22,24 +22,23 @@ step is still available as a flag for unattended runs.
 ## The menu
 
 ```
- ╔════════════════════════════════════════════════════════════════════════════╗
- ║           Active Directory Domain Join - Setup and Configuration           ║
- ╚════════════════════════════════════════════════════════════════════════════╝
-          Distribution    : Fedora Linux 44 (KDE Plasma Desktop Edition)
-          Package manager : dnf5 (rhel family)
-          Desktop         : KDE Plasma
-          Domain          : not joined
-          Mode            : changes will be applied
- ──────────────────────────────────────────────────────────────────────────────
- ▸ [✓] Guided setup                         [✓] Network time synchronisation
-   [ ] Install packages only                [ ] SDDM login screen
-   [ ] Graphical management tools           [ ] Post-join login settings
-   [ ] Join an Active Directory domain      [ ] Grant sudo to a user or group
-   [ ] Home directories on first login      [ ] Duo two-factor authentication
-                                            [ ] Windows apps for every user
-                      [ ] Preflight checks and domain status
+ ╔═════════════════════════════════════════════════════════════════════════════════╗
+ ║              Active Directory Domain Join - Setup and Configuration              ║
+ ╚═════════════════════════════════════════════════════════════════════════════════╝
+             Distribution    : Fedora Linux 44 (KDE Plasma Desktop Edition)
+             Package manager : dnf5 (rhel family)
+             Desktop         : KDE Plasma
+             Domain          : not joined
+             Mode            : changes will be applied
+ ───────────────────────────────────────────────────────────────────────────────────
+ ▸ [✓] Guided setup                        [ ] SDDM login screen
+   [ ] Install packages only               [ ] Post-join login settings
+   [ ] Graphical management tools          [ ] Grant sudo to a user or group
+   [ ] Join an Active Directory domain     [ ] Duo two-factor authentication
+   [ ] Home directories on first login     [ ] Windows apps for every user
+   [✓] Network time synchronisation        [ ] Preflight checks and domain status
       Install, configure, then offer to join - the whole setup in one pass
- ──────────────────────────────────────────────────────────────────────────────
+ ───────────────────────────────────────────────────────────────────────────────────
  Selected: 2
  ↑↓←→ Navigate   SPACE Select/Deselect   ENTER Confirm   D Dry-run   Q Quit
  Legend: [✓] selected  [ ] not selected
@@ -64,12 +63,14 @@ whether the machine is already joined.
 | **Post-join login settings** | Short usernames, who may log in, then the sudo rights below. |
 | **Grant sudo to a user or group** | Asks for an account, a group, or one of each, and writes a `/etc/sudoers.d` drop-in for each. See [sudo rights](#sudo-rights). |
 | **Duo two-factor authentication** | Installs Duo Unix, writes `/etc/duo/pam_duo.conf`, and adds `pam_duo.so` to the services you pick — or takes it back out again. See [Duo](#duo-security-two-factor-authentication). |
-| **Windows apps for every user** | Installs WinApps system-wide and generates each domain user's configuration at login, so Windows programs in the app menu open under their own account. See [WinApps](#windows-applications-for-every-domain-user). |
+| **Windows apps for every user** | Installs WinApps system-wide and generates each domain user's configuration at login, so Windows programs in the app menu open under their own account. Can also build the Windows 11 VM (libvirt). See [WinApps](#windows-applications-for-every-domain-user). |
 | **Preflight checks and domain status** | Read-only: hostname, clock, DNS SRV records, membership and service state. |
 
-The terminal only has to be 40x22; below that the menu says so rather than
-drawing something broken. It reflows live as the window is resized, dropping
-detail — the hint line, then the banner box — before it gives up two columns.
+The entries fill two even columns. The terminal only has to be 40x22; below that
+the menu says so rather than drawing something broken. It reflows live as the
+window is resized, first tightening the spacing between the columns, then
+dropping detail — the hint line, then the banner box — before it finally gives
+up the second column and stacks everything into one.
 
 ---
 
@@ -198,11 +199,20 @@ Windows applications (WinApps):
       --winapps-creds M   askpass | kerberos | shared
       --winapps-user USER Windows service account, 'shared' mode only
       --winapps-remove    Remove the multi-user wiring
+      --winapps-vm-remove With --winapps-remove, also delete the libvirt guest
+      --winapps-deploy    Build the Windows 11 VM (libvirt backend only)
+      --no-winapps-deploy Never build the VM; just install the builder script
+      --winapps-iso PATH  Windows ISO to install from (else fetched with Mido)
+      --winapps-vm-ram N  Guest RAM in MiB  (default 4096)
+      --winapps-vm-cpus N Guest vCPUs       (default 4)
+      --winapps-vm-disk N Guest disk in GiB (default 64)
 ```
 
 The secret key is also read from the `DUO_SKEY` environment variable, which
 keeps it out of the process list and the shell history. The shared-mode WinApps
-password is read from `WINAPPS_RDP_PASS` the same way.
+password is read from `WINAPPS_RDP_PASS` the same way, and the built VM's local
+administrator password from `WINAPPS_VM_PASS` (a random one is generated and
+printed once if unset).
 
 Any option that says *what to do* skips the menu and runs the guided setup
 directly. `--dry-run` and the internal `--detected-de` only change *how* it is
@@ -781,6 +791,7 @@ One root-owned template, expanded per user at login:
 /etc/profile.d/winapps-user-config.sh  runs the generator for shell/SSH logins
 /etc/xdg/autostart/winapps-user-config.desktop   ...and for graphical ones
 /etc/skel/.config/winapps/winapps.conf covers the very first login
+/usr/local/bin/winapps-vm-deploy       builds the Windows VM (libvirt backend)
 ```
 
 The generator substitutes `@WINAPPS_USER@` with the login name, stripping a
@@ -800,9 +811,42 @@ of their file and it is never regenerated.
 
 | Choice | Description |
 | --- | --- |
-| **libvirt** *(default)* | A local Windows VM via KVM. Join the VM to the domain in its own right and each user's profile, GPOs and mapped drives come from AD as on a physical box. Best when the PC is used by one person at a time. |
+| **libvirt** *(default)* | A local Windows VM via KVM. Join the VM to the domain in its own right and each user's profile, GPOs and mapped drives come from AD as on a physical box. Best when the PC is used by one person at a time. This is the only backend the script can **build** for you — see [Building the VM](#building-the-vm). |
 | **manual** | No VM here at all — the launchers point at a Windows host you already have, typically a Remote Desktop Session Host on the domain. Much lighter, and the sane option beyond a handful of PCs. |
 | **docker** / **podman** | Windows in a container via `dockur/windows`. Quick to stand up and easy to reset; joining it to the domain is still on you. |
+
+### Building the VM
+
+With the **libvirt** backend the script can stand up the Windows guest itself
+(`--winapps-deploy`, or answer yes when it offers). It installs a
+`winapps-vm-deploy` helper and runs it:
+
+- an **unattended** Windows 11 Pro install — no clicking through setup
+- **virtio** drivers staged so the installer sees the disk, guest tools and the
+  QEMU agent installed on first boot
+- **Remote Desktop and RemoteApp** switched on, idle sleep disabled, the LAN set
+  to a private profile
+- a local administrator account (`WINAPPS_VM_PASS`, or a random password printed
+  once), `q35` + UEFI + an emulated TPM 2.0, and the Windows 11 hardware checks
+  bypassed in the answer file so it installs regardless of host firmware
+- `virsh autostart` on, so WinApps can wake it
+
+Supply the install media with `--winapps-iso PATH`. Without it the helper calls
+[Mido](https://github.com/ElliotKillick/Mido) to pull a Windows 11 ISO from
+Microsoft — convenient, but Mido scrapes Microsoft's download API and breaks
+from time to time, so a local ISO is more reliable. ISOs are cached under
+`/var/lib/winapps/iso/`.
+
+Size it with `--winapps-vm-ram` (MiB, default 4096), `--winapps-vm-cpus`
+(default 4) and `--winapps-vm-disk` (GiB, default 64).
+
+**What it does not do:** anything domain-related. The guest comes up in a
+workgroup; join it to Active Directory yourself (`sysdm.cpl`, or `Add-Computer`
+in PowerShell) once it reaches the desktop. That, plus RDS licensing for more
+than one session at a time, is out of scope here.
+
+Rebuild any time with `sudo winapps-vm-deploy --force` (destroys the old guest
+and its disk first).
 
 ### Credentials
 
@@ -820,26 +864,35 @@ Windows has to exist first:
 1. Install Linux and **join it to the domain** — WinApps reads the joined realm
    to fill in `RDP_DOMAIN`.
 2. Run this script's WinApps step. It installs FreeRDP and the backend, writes
-   the template, generator and login hooks, and seeds existing accounts.
-3. Deploy Windows (the VM, container, or RDS host) and **join it to the domain**.
-4. Re-run the scan to create the launchers:
-   `sudo /etc/winapps/setup.sh --system`
+   the template, generator and login hooks, and seeds existing accounts. With
+   the libvirt backend it also offers to **build the Windows VM**
+   ([above](#building-the-vm)); otherwise deploy Windows yourself (container or
+   RDS host).
+3. **Join Windows to the domain.** The script never does this — not even for a
+   VM it built.
+4. Scan Windows for installed programs to create the launchers:
+   `sudo /etc/winapps/setup.sh --system` — and re-run that same command whenever
+   a program is added to or removed from Windows.
 
 Step 2 asks whether Windows is already up. If it is not, the groundwork is still
 written and it prints the command for step 4 — so the script is safe to run
-before Windows exists.
+before Windows exists. A VM built in step 2 takes 20–45 minutes to finish
+installing in the background; wait for it to reach the desktop before step 4.
 
 ### Day-to-day
 
 ```bash
 sudo nano /etc/winapps/winapps.conf.template   # change a setting for everyone
 sudo /usr/local/bin/winapps-user-config --all  # push it out now, not at next login
-sudo /etc/winapps/setup.sh --system            # after installing a new Windows app
+sudo /etc/winapps/setup.sh --system            # scan / re-scan Windows for apps
+sudo winapps-vm-deploy --force                 # rebuild the Windows VM (libvirt)
 sudo ./domain-join-setup.sh --winapps-remove   # take the wiring back out
+sudo ./domain-join-setup.sh --winapps-vm-remove # ...and delete the libvirt guest
 ```
 
-New apps installed in Windows need one re-scan on the machine; new *users* need
-nothing at all — they are configured the moment they log in.
+New apps installed in Windows need one re-scan on the machine
+(`setup.sh --system`); new *users* need nothing at all — they are configured the
+moment they log in.
 
 ---
 

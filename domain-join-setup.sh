@@ -83,6 +83,18 @@ OPT_WINAPPS_RDP_USER=""  # shared-credential mode only: the service account
 OPT_WINAPPS_RDP_PASS="${WINAPPS_RDP_PASS:-}"  # shared-credential mode only
 WINAPPS_REMOVE=0         # --winapps-remove: take the multi-user wiring back out
 
+# Building the Windows guest. libvirt backend only: the script can stand up a
+# WinApps-ready Windows 11 Pro VM (unattended install, virtio drivers, RDP and
+# RemoteApp enabled). It does nothing domain-related - joining the guest to AD,
+# and anything else inside Windows, is left to the operator.
+OPT_WINAPPS_DEPLOY=-1    # -1 = ask, 0 = no, 1 = yes  (libvirt backend only)
+OPT_WINAPPS_ISO=""       # path to a Windows 10/11 ISO; empty = fetch with Mido
+OPT_WINAPPS_VM_RAM=""    # guest RAM in MiB   (empty = 4096)
+OPT_WINAPPS_VM_CPUS=""   # guest vCPUs        (empty = 4)
+OPT_WINAPPS_VM_DISK=""   # guest disk in GiB  (empty = 64)
+OPT_WINAPPS_VM_PASS="${WINAPPS_VM_PASS:-}"  # local admin password for the built VM
+WINAPPS_VM_REMOVE=0      # --winapps-vm-remove: also undefine the libvirt guest
+
 # What to install. Filled in by the choice builders, or by the matching flags.
 BACKEND=""
 GUI_CHOICES=""
@@ -593,6 +605,14 @@ pkgs_for() {
         rhel:winapps_libvirt)   echo "qemu-kvm libvirt virt-manager virt-install virtiofsd libvirt-daemon-config-network" ;;
         suse:winapps_libvirt)   echo "qemu-kvm libvirt virt-manager virt-install" ;;
         arch:winapps_libvirt)   echo "qemu-full libvirt virt-manager dnsmasq iptables-nft" ;;
+
+        # Extra tooling for '--winapps-deploy': UEFI firmware and an emulated TPM
+        # (Windows 11 needs both), an ISO authoring tool for the unattended
+        # answer disk, and virt-viewer to watch the install.
+        debian:winapps_deploy) echo "ovmf swtpm swtpm-tools xorriso virt-viewer qemu-utils" ;;
+        rhel:winapps_deploy)   echo "edk2-ovmf swtpm swtpm-tools xorriso virt-viewer qemu-img" ;;
+        suse:winapps_deploy)   echo "qemu-ovmf-x86_64 swtpm swtpm-tools xorriso virt-viewer qemu-tools" ;;
+        arch:winapps_deploy)   echo "edk2-ovmf swtpm libisoburn virt-viewer" ;;
 
         debian:winapps_docker) echo "docker.io docker-compose-v2" ;;
         rhel:winapps_docker)   echo "docker docker-compose" ;;
@@ -3151,6 +3171,14 @@ WINAPPS_SKEL_DIR="/etc/skel/.config/winapps"
 WINAPPS_UPSTREAM_URL="https://raw.githubusercontent.com/winapps-org/winapps/main/setup.sh"
 WINAPPS_CONFIGURED=0
 
+# --winapps-deploy: building the Windows guest.
+WINAPPS_VM_DEPLOYER="/usr/local/bin/winapps-vm-deploy"
+WINAPPS_ISO_CACHE="/var/lib/winapps/iso"
+WINAPPS_VIRTIO_URL="https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso"
+WINAPPS_MIDO_URL="https://raw.githubusercontent.com/ElliotKillick/Mido/main/Mido.sh"
+WINAPPS_RDPAPPS_URL="https://raw.githubusercontent.com/winapps-org/winapps/main/install/RDPApps.reg"
+WINAPPS_VM_DEPLOYED=0
+
 # winapps_install_file <dest> <mode> - content arrives on stdin.
 #
 # Written through a temporary file in the destination directory and moved into
@@ -3548,6 +3576,451 @@ winapps_seed_all() {
     return 0
 }
 
+# ---------------------------------------------------------------------------
+# --winapps-deploy - build the Windows guest (libvirt backend only)
+# ---------------------------------------------------------------------------
+# This is the one part of the WinApps step that touches Windows itself. It
+# stands up an *unattended* Windows 11 Pro install with the virtio drivers,
+# Remote Desktop and RemoteApp already switched on, so 'winapps' has something
+# to connect to. It does nothing with Active Directory: joining the guest to
+# the domain, and anything else inside Windows, is the operator's job.
+#
+# The work is done by a standalone script installed at $WINAPPS_VM_DEPLOYER so
+# the VM can be rebuilt later without re-running this installer.
+winapps_write_vm_deployer() {
+    info "Installing the Windows VM builder ($WINAPPS_VM_DEPLOYER)"
+    winapps_install_file "$WINAPPS_VM_DEPLOYER" 0755 <<'WINAPPS_VMDEPLOY_EOF'
+#!/bin/bash
+#
+# winapps-vm-deploy - build a WinApps-ready Windows 11 Pro VM under libvirt/KVM.
+#
+# Written by domain-join-setup. Runs an unattended Windows install with the
+# virtio drivers, Remote Desktop and RemoteApp enabled. It does NOTHING
+# domain-related - join the guest to Active Directory yourself if you want it.
+#
+# Re-runnable: refuses when the guest already exists unless --force is given,
+# which destroys the existing guest and its disk first.
+#
+#   Environment (all optional):
+#     WA_VM_NAME   libvirt domain name           (default RDPWindows)
+#     WA_VM_ADMIN  local administrator account   (default Docker)
+#     WA_VM_PASS   local administrator password  (default: random, printed once)
+#     WA_VM_RAM    guest RAM in MiB              (default 4096)
+#     WA_VM_CPUS   guest vCPUs                   (default 4)
+#     WA_VM_DISK   guest disk in GiB            (default 64)
+#     WA_ISO       path to a Windows 10/11 ISO   (default: fetch with Mido)
+#
+set -u
+
+VM_NAME="${WA_VM_NAME:-RDPWindows}"
+VM_ADMIN="${WA_VM_ADMIN:-Docker}"
+VM_PASS="${WA_VM_PASS:-}"
+VM_RAM="${WA_VM_RAM:-4096}"
+VM_CPUS="${WA_VM_CPUS:-4}"
+VM_DISK="${WA_VM_DISK:-64}"
+WIN_ISO="${WA_ISO:-}"
+FORCE=0
+
+CACHE="/var/lib/winapps/iso"
+VIRTIO_ISO="$CACHE/virtio-win.iso"
+VIRTIO_URL="https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso"
+MIDO_URL="https://raw.githubusercontent.com/ElliotKillick/Mido/main/Mido.sh"
+RDPAPPS_URL="https://raw.githubusercontent.com/winapps-org/winapps/main/install/RDPApps.reg"
+LIBVIRT_URI="qemu:///system"
+POOL_DIR="/var/lib/libvirt/images"
+
+log()  { printf '==> %s\n' "$*"; }
+warn() { printf 'warn: %s\n' "$*" >&2; }
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+fetch() {   # <url> <dest>
+    if command -v curl >/dev/null 2>&1; then
+        curl -fL --proto '=https' --tlsv1.2 -o "$2" "$1"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q --https-only -O "$2" "$1"
+    else
+        return 1
+    fi
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --force)   FORCE=1; shift ;;
+        --iso)     WIN_ISO="${2:-}"; shift 2 ;;
+        --name)    VM_NAME="${2:-}"; shift 2 ;;
+        -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+        *)         die "unknown argument: $1" ;;
+    esac
+done
+
+[ "$(id -u)" = "0" ] || die "must run as root."
+
+WORK=""
+cleanup() { [ -n "$WORK" ] && rm -rf "$WORK" 2>/dev/null; }
+trap cleanup EXIT INT TERM
+
+# --- preflight --------------------------------------------------------------
+for c in virt-install virsh qemu-img xorriso; do
+    command -v "$c" >/dev/null 2>&1 || die "$c is not installed."
+done
+[ -e /dev/kvm ] || die "/dev/kvm is missing - enable VT-x/AMD-V in the firmware."
+{ [ -r /dev/kvm ] && [ -w /dev/kvm ]; } || \
+    warn "no read/write access to /dev/kvm - the guest may fail to start."
+virsh -c "$LIBVIRT_URI" version >/dev/null 2>&1 || \
+    die "cannot reach libvirt at $LIBVIRT_URI - is libvirtd running?"
+
+_ovmf=""
+for f in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd \
+         /usr/share/edk2/ovmf/OVMF_CODE.fd /usr/share/edk2-ovmf/x64/OVMF_CODE.fd \
+         /usr/share/qemu/ovmf-x86_64-code.bin; do
+    [ -f "$f" ] && { _ovmf="$f"; break; }
+done
+[ -n "$_ovmf" ] || warn "no OVMF firmware found - 'virt-install --boot uefi' may fail. Install the OVMF/edk2 package."
+
+if virsh -c "$LIBVIRT_URI" dominfo "$VM_NAME" >/dev/null 2>&1; then
+    if [ "$FORCE" = "1" ]; then
+        log "Removing the existing '$VM_NAME' guest (--force)."
+        virsh -c "$LIBVIRT_URI" destroy "$VM_NAME" >/dev/null 2>&1 || true
+        virsh -c "$LIBVIRT_URI" undefine --nvram --remove-all-storage "$VM_NAME" >/dev/null 2>&1 \
+            || virsh -c "$LIBVIRT_URI" undefine --nvram "$VM_NAME" >/dev/null 2>&1 || true
+    else
+        die "a libvirt guest named '$VM_NAME' already exists - re-run with --force to rebuild it."
+    fi
+fi
+
+if virsh -c "$LIBVIRT_URI" net-info default >/dev/null 2>&1; then
+    virsh -c "$LIBVIRT_URI" net-info default 2>/dev/null | grep -qi 'Active:.*yes' || {
+        virsh -c "$LIBVIRT_URI" net-start default >/dev/null 2>&1 || true
+    }
+    virsh -c "$LIBVIRT_URI" net-autostart default >/dev/null 2>&1 || true
+else
+    warn "the libvirt 'default' network is not defined - the guest will have no network."
+fi
+
+mkdir -p "$CACHE" "$POOL_DIR"
+
+# --- Windows ISO -----------------------------------------------------------
+if [ -n "$WIN_ISO" ]; then
+    [ -f "$WIN_ISO" ] || die "Windows ISO not found: $WIN_ISO"
+    log "Using Windows ISO: $WIN_ISO"
+else
+    WIN_ISO="$CACHE/windows.iso"
+    if [ -f "$WIN_ISO" ]; then
+        log "Using cached Windows ISO: $WIN_ISO"
+    else
+        log "No ISO given - fetching Windows 11 with Mido (from Microsoft's own servers)."
+        warn "Mido drives Microsoft's download API and can break without notice."
+        warn "If it fails, fetch a Windows 10/11 ISO yourself and re-run with --iso PATH."
+        _mido="$CACHE/Mido.sh"
+        fetch "$MIDO_URL" "$_mido" || die "could not download Mido."
+        chmod +x "$_mido"
+        ( cd "$CACHE" && "$_mido" win11x64 ) || die "Mido could not fetch the Windows ISO."
+        if [ -f "$CACHE/win11x64.iso" ]; then
+            mv -f "$CACHE/win11x64.iso" "$WIN_ISO"
+        else
+            _got=$(ls -1t "$CACHE"/*.iso 2>/dev/null | grep -v virtio | head -1)
+            [ -n "$_got" ] && mv -f "$_got" "$WIN_ISO" || die "Mido finished but produced no ISO."
+        fi
+    fi
+fi
+
+# --- virtio-win ISO ------------------------------------------------------
+if [ -f "$VIRTIO_ISO" ]; then
+    log "Using cached virtio-win ISO."
+else
+    log "Downloading the virtio-win driver ISO."
+    fetch "$VIRTIO_URL" "$VIRTIO_ISO" || die "could not download virtio-win.iso."
+fi
+
+# --- build the unattended answer disk ----------------------------------
+WORK="$(mktemp -d /var/tmp/winapps-deploy.XXXXXX)" || die "could not create a work directory."
+ISO_ROOT="$WORK/iso"
+DRV="$ISO_ROOT/\$WinPEDriver\$"
+mkdir -p "$DRV" "$ISO_ROOT/oem"
+
+# Stage the boot-critical virtio drivers where Windows Setup auto-loads them
+# (a folder named $WinPEDriver$ at the root of the attached media). Pulled
+# straight out of the virtio ISO with xorriso, so no loop mount is needed.
+_staged=0
+for d in viostor vioscsi NetKVM Balloon vioserial qemufwcfg qemupciserial pvpanic smbus; do
+    for a in w11 w10; do
+        if xorriso -osirrox on -indev "$VIRTIO_ISO" \
+             -extract "/$d/$a/amd64" "$DRV/$d" >/dev/null 2>&1; then
+            if [ -n "$(ls -A "$DRV/$d" 2>/dev/null)" ]; then _staged=$((_staged+1)); break; fi
+        fi
+        rm -rf "$DRV/$d" 2>/dev/null
+    done
+done
+[ "$_staged" -gt 0 ] || warn "no virtio drivers were staged - if Setup shows no disks, click 'Load driver' and point it at the virtio CD."
+
+fetch "$RDPAPPS_URL" "$ISO_ROOT/oem/RDPApps.reg" || \
+    warn "could not download RDPApps.reg - RemoteApp will need enabling inside Windows by hand."
+
+if [ -z "$VM_PASS" ]; then
+    VM_PASS="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 18)Aa1!"
+    PASS_GENERATED=1
+else
+    PASS_GENERATED=0
+fi
+
+xesc() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'; }
+X_ADMIN="$(xesc "$VM_ADMIN")"
+X_PASS="$(xesc "$VM_PASS")"
+
+cat > "$ISO_ROOT/Autounattend.xml" <<XML
+<?xml version="1.0" encoding="utf-8"?>
+<unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+  <settings pass="windowsPE">
+    <component name="Microsoft-Windows-International-Core-WinPE" processorArchitecture="amd64" language="neutral" versionScope="nonSxS">
+      <SetupUILanguage><UILanguage>en-US</UILanguage></SetupUILanguage>
+      <InputLocale>0409:00000409</InputLocale>
+      <SystemLocale>en-US</SystemLocale>
+      <UILanguage>en-US</UILanguage>
+      <UserLocale>en-US</UserLocale>
+    </component>
+    <component name="Microsoft-Windows-Setup" processorArchitecture="amd64" language="neutral" versionScope="nonSxS">
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add"><Order>1</Order><Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassTPMCheck /t REG_DWORD /d 1 /f</Path></RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add"><Order>2</Order><Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassSecureBootCheck /t REG_DWORD /d 1 /f</Path></RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add"><Order>3</Order><Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassRAMCheck /t REG_DWORD /d 1 /f</Path></RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add"><Order>4</Order><Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassStorageCheck /t REG_DWORD /d 1 /f</Path></RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add"><Order>5</Order><Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassCPUCheck /t REG_DWORD /d 1 /f</Path></RunSynchronousCommand>
+      </RunSynchronous>
+      <DiskConfiguration>
+        <Disk wcm:action="add">
+          <DiskID>0</DiskID>
+          <WillWipeDisk>true</WillWipeDisk>
+          <CreatePartitions>
+            <CreatePartition wcm:action="add"><Order>1</Order><Type>EFI</Type><Size>300</Size></CreatePartition>
+            <CreatePartition wcm:action="add"><Order>2</Order><Type>MSR</Type><Size>16</Size></CreatePartition>
+            <CreatePartition wcm:action="add"><Order>3</Order><Type>Primary</Type><Extend>true</Extend></CreatePartition>
+          </CreatePartitions>
+          <ModifyPartitions>
+            <ModifyPartition wcm:action="add"><Order>1</Order><PartitionID>1</PartitionID><Format>FAT32</Format><Label>System</Label></ModifyPartition>
+            <ModifyPartition wcm:action="add"><Order>2</Order><PartitionID>2</PartitionID></ModifyPartition>
+            <ModifyPartition wcm:action="add"><Order>3</Order><PartitionID>3</PartitionID><Format>NTFS</Format><Label>Windows</Label><Letter>C</Letter></ModifyPartition>
+          </ModifyPartitions>
+        </Disk>
+      </DiskConfiguration>
+      <ImageInstall>
+        <OSImage>
+          <InstallFrom>
+            <MetaData wcm:action="add"><Key>/IMAGE/NAME</Key><Value>Windows 11 Pro</Value></MetaData>
+          </InstallFrom>
+          <InstallTo><DiskID>0</DiskID><PartitionID>3</PartitionID></InstallTo>
+        </OSImage>
+      </ImageInstall>
+      <UserData>
+        <ProductKey><Key>W269N-WFGWX-YVC9B-4J6C9-T83GX</Key><WillShowUI>OnError</WillShowUI></ProductKey>
+        <AcceptEula>true</AcceptEula>
+      </UserData>
+    </component>
+  </settings>
+  <settings pass="specialize">
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" language="neutral" versionScope="nonSxS">
+      <ComputerName>*</ComputerName>
+    </component>
+    <component name="Microsoft-Windows-Deployment" processorArchitecture="amd64" language="neutral" versionScope="nonSxS">
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add"><Order>1</Order><Path>reg add HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE /v BypassNRO /t REG_DWORD /d 1 /f</Path></RunSynchronousCommand>
+      </RunSynchronous>
+    </component>
+  </settings>
+  <settings pass="oobeSystem">
+    <component name="Microsoft-Windows-International-Core" processorArchitecture="amd64" language="neutral" versionScope="nonSxS">
+      <InputLocale>0409:00000409</InputLocale>
+      <SystemLocale>en-US</SystemLocale>
+      <UILanguage>en-US</UILanguage>
+      <UserLocale>en-US</UserLocale>
+    </component>
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" language="neutral" versionScope="nonSxS">
+      <OOBE>
+        <HideEULAPage>true</HideEULAPage>
+        <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
+        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+        <HideLocalAccountScreen>true</HideLocalAccountScreen>
+        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+        <ProtectYourPC>3</ProtectYourPC>
+      </OOBE>
+      <UserAccounts>
+        <LocalAccounts>
+          <LocalAccount wcm:action="add">
+            <Name>$X_ADMIN</Name>
+            <Group>Administrators</Group>
+            <DisplayName>$X_ADMIN</DisplayName>
+            <Password><Value>$X_PASS</Value><PlainText>true</PlainText></Password>
+          </LocalAccount>
+        </LocalAccounts>
+      </UserAccounts>
+      <AutoLogon>
+        <Username>$X_ADMIN</Username>
+        <Enabled>true</Enabled>
+        <LogonCount>1</LogonCount>
+        <Password><Value>$X_PASS</Value><PlainText>true</PlainText></Password>
+      </AutoLogon>
+      <FirstLogonCommands>
+        <SynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <CommandLine>cmd /c "for %i in (D E F G H I J K) do @if exist %i:\oem\setup.cmd call %i:\oem\setup.cmd %i:"</CommandLine>
+          <Description>WinApps first-boot setup</Description>
+        </SynchronousCommand>
+      </FirstLogonCommands>
+    </component>
+  </settings>
+</unattend>
+XML
+
+cat > "$ISO_ROOT/oem/setup.cmd" <<'CMD'
+@echo off
+set "SRC=%~1"
+if "%SRC%"=="" set "SRC=%~d0"
+if exist "%SRC%\oem\RDPApps.reg" reg import "%SRC%\oem\RDPApps.reg"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%SRC%\oem\setup.ps1" > "%SystemDrive%\winapps-deploy.log" 2>&1
+exit /b 0
+CMD
+
+cat > "$ISO_ROOT/oem/setup.ps1" <<'PS1'
+$ErrorActionPreference = 'Continue'
+
+# Remote Desktop on, firewall group opened.
+Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
+try { Enable-NetFirewallRule -Group '@FirewallAPI.dll,-28752' } catch {}
+
+# A suspended guest cannot answer RDP - disable every idle timeout.
+powercfg /setactive SCHEME_MIN 2>$null
+powercfg /change standby-timeout-ac 0
+powercfg /change standby-timeout-dc 0
+powercfg /change hibernate-timeout-ac 0
+powercfg /change hibernate-timeout-dc 0
+powercfg /hibernate off 2>$null
+
+# Treat the LAN as private so sharing and discovery work.
+try { Get-NetConnectionProfile | Set-NetConnectionProfile -NetworkCategory Private } catch {}
+
+# RemoteApp: allow any program to be launched (WinApps needs this).
+$rail = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Terminal Server\TSAppAllowList'
+New-Item -Path $rail -Force | Out-Null
+Set-ItemProperty -Path $rail -Name fDisabledAllowList -Value 1
+
+# virtio guest tools + QEMU guest agent, from whichever CD carries them.
+$vt = Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=5' |
+      Where-Object { Test-Path (Join-Path $_.DeviceID 'virtio-win-guest-tools.exe') } |
+      Select-Object -First 1
+if ($vt) {
+    Start-Process (Join-Path $vt.DeviceID 'virtio-win-guest-tools.exe') `
+        -ArgumentList '/quiet','/norestart' -Wait
+}
+
+shutdown /r /t 5 /c "WinApps deploy: first-boot configuration complete"
+PS1
+
+xorriso -as mkisofs -quiet -J -r -V WAUNATTEND \
+    -o "$WORK/unattend.iso" "$ISO_ROOT" || die "could not build the unattend ISO."
+
+# --- create the guest ------------------------------------------------------
+DISK_PATH="$POOL_DIR/${VM_NAME}.qcow2"
+if [ -f "$DISK_PATH" ]; then
+    [ "$FORCE" = "1" ] && rm -f "$DISK_PATH" || die "$DISK_PATH already exists - use --force."
+fi
+qemu-img create -f qcow2 "$DISK_PATH" "${VM_DISK}G" >/dev/null || die "could not create the system disk."
+
+log "Defining and starting '$VM_NAME' (${VM_RAM} MiB RAM, ${VM_CPUS} vCPU, ${VM_DISK} GiB disk)."
+virt-install \
+    --connect "$LIBVIRT_URI" \
+    --name "$VM_NAME" \
+    --os-variant win11 \
+    --memory "$VM_RAM" \
+    --vcpus "$VM_CPUS" \
+    --cpu host-passthrough \
+    --machine q35 \
+    --boot uefi \
+    --tpm backend.type=emulator,backend.version=2.0,model=tpm-crb \
+    --disk "path=$DISK_PATH,bus=virtio,format=qcow2,boot.order=1" \
+    --disk "path=$WIN_ISO,device=cdrom,boot.order=2" \
+    --disk "path=$VIRTIO_ISO,device=cdrom" \
+    --disk "path=$WORK/unattend.iso,device=cdrom" \
+    --network network=default,model=virtio \
+    --graphics spice \
+    --video qxl \
+    --sound default \
+    --noautoconsole \
+    --wait 0 \
+    || die "virt-install failed."
+
+virsh -c "$LIBVIRT_URI" autostart "$VM_NAME" >/dev/null 2>&1 || true
+
+echo ""
+echo "  ---------------------------------------------------------------------------"
+echo "  The Windows guest '$VM_NAME' is installing."
+echo ""
+echo "    Watch it:   virt-viewer --connect $LIBVIRT_URI $VM_NAME"
+echo ""
+echo "  The install is unattended and reboots itself a few times. Give it"
+echo "  20-45 minutes to settle on the desktop."
+echo ""
+echo "    Local administrator : $VM_ADMIN"
+if [ "$PASS_GENERATED" = "1" ]; then
+echo "    Password (generated): $VM_PASS"
+echo "                          ^ shown once - write it down now."
+else
+echo "    Password             : (the one you supplied)"
+fi
+echo ""
+echo "  When Windows is up and reachable over RDP, scan it for installed"
+echo "  programs and create the launchers:"
+echo ""
+echo "    sudo /etc/winapps/setup.sh --system"
+echo ""
+echo "  Re-run that same command any time you install or remove a program in"
+echo "  Windows, to refresh the launchers."
+echo ""
+echo "  This guest is NOT domain-joined - do that from inside Windows if you"
+echo "  want AD logins and network shares."
+echo "  ---------------------------------------------------------------------------"
+echo ""
+WINAPPS_VMDEPLOY_EOF
+}
+
+# Collect the guest parameters and run the deployer. libvirt backend only.
+winapps_deploy_vm() {
+    local ram="${OPT_WINAPPS_VM_RAM:-4096}" cpus="${OPT_WINAPPS_VM_CPUS:-4}"
+    local disk="${OPT_WINAPPS_VM_DISK:-64}" iso="$OPT_WINAPPS_ISO"
+    local vm="${OPT_WINAPPS_VM:-RDPWindows}"
+
+    if [[ -z "$iso" && $ASSUME_YES -ne 1 ]]; then
+        printf '\n'
+        note "A Windows 10/11 ISO is needed. Leave this blank to let Mido fetch"
+        note "Windows 11 from Microsoft - a local ISO is more reliable."
+        ask_value iso "Path to a Windows ISO" ""
+    fi
+    if [[ -n "$iso" && ! -f "$iso" ]]; then
+        err "No such file: $iso"
+        return 1
+    fi
+    if [[ $ASSUME_YES -ne 1 ]]; then
+        ask_value ram  "Guest RAM (MiB)"  "$ram"
+        ask_value cpus "Guest vCPUs"      "$cpus"
+        ask_value disk "Guest disk (GiB)" "$disk"
+    fi
+
+    info "Deploying the Windows guest '$vm'"
+    if [[ $DRY_RUN -eq 1 ]]; then
+        printf '%s  [dry-run]%s %s %s\n' "$C_CYAN" "$C_RESET" "$WINAPPS_VM_DEPLOYER" \
+            "${iso:+--iso $iso}"
+        return 0
+    fi
+
+    WA_VM_NAME="$vm" WA_VM_RAM="$ram" WA_VM_CPUS="$cpus" WA_VM_DISK="$disk" \
+    WA_VM_PASS="$OPT_WINAPPS_VM_PASS" WA_ISO="$iso" \
+        "$WINAPPS_VM_DEPLOYER" || {
+        err "The Windows guest could not be deployed."
+        note "Fix the problem above, then re-run:  sudo $WINAPPS_VM_DEPLOYER"
+        return 1
+    }
+    WINAPPS_VM_DEPLOYED=1
+    return 0
+}
+
 # Run the upstream installer with --system, which is what puts the launchers in
 # /usr/share/applications for every account.
 #
@@ -3614,7 +4087,8 @@ winapps_remove() {
 
     local f
     for f in "$WINAPPS_PROFILE_D" "$WINAPPS_AUTOSTART" "$WINAPPS_SEEDER" \
-             "$WINAPPS_ASKPASS" "$WINAPPS_TEMPLATE" "$WINAPPS_SKEL_DIR/winapps.conf"; do
+             "$WINAPPS_ASKPASS" "$WINAPPS_TEMPLATE" "$WINAPPS_VM_DEPLOYER" \
+             "$WINAPPS_SKEL_DIR/winapps.conf"; do
         if [[ -e "$f" ]]; then
             if [[ $DRY_RUN -eq 1 ]]; then
                 printf '%s  [dry-run]%s remove %s\n' "$C_CYAN" "$C_RESET" "$f"
@@ -3625,10 +4099,35 @@ winapps_remove() {
         fi
     done
 
+    # The Windows guest is only torn down when explicitly asked - its disk holds
+    # a full Windows install and whatever was saved inside it.
+    local vm="${OPT_WINAPPS_VM:-RDPWindows}"
+    if have virsh && virsh -c qemu:///system dominfo "$vm" >/dev/null 2>&1; then
+        printf '\n'
+        if (( WINAPPS_VM_REMOVE )) || { [[ $DRY_RUN -ne 1 ]] && \
+             confirm "Also destroy the libvirt guest '$vm' and its disk? This cannot be undone." "n"; }; then
+            if [[ $DRY_RUN -eq 1 ]]; then
+                printf '%s  [dry-run]%s virsh undefine --nvram --remove-all-storage %s\n' \
+                    "$C_CYAN" "$C_RESET" "$vm"
+            else
+                virsh -c qemu:///system destroy "$vm" >/dev/null 2>&1 || true
+                if virsh -c qemu:///system undefine --nvram --remove-all-storage "$vm" >/dev/null 2>&1 \
+                   || virsh -c qemu:///system undefine --nvram "$vm" >/dev/null 2>&1; then
+                    ok "Removed the libvirt guest '$vm'"
+                else
+                    warn "Could not remove the guest '$vm'; do it by hand with virsh."
+                fi
+            fi
+        else
+            note "Left the libvirt guest '$vm' in place."
+        fi
+    fi
+
     printf '\n'
     note "Left in place on purpose:"
     note "  - each user's ~/.config/winapps/winapps.conf"
     note "  - the launchers in /usr/share/applications"
+    note "  - the cached ISOs in $WINAPPS_ISO_CACHE"
     note "To remove those too:  sudo $WINAPPS_ETC_DIR/setup.sh --uninstall"
     return 0
 }
@@ -3643,7 +4142,8 @@ winapps_print_summary() {
     printf '  RDP domain     : %s\n' "${OPT_WINAPPS_DOMAIN:-<none>}"
     case "$OPT_WINAPPS_BACKEND" in
         manual) printf '  Windows host   : %s:%s\n' "${OPT_WINAPPS_HOST:-?}" "${OPT_WINAPPS_PORT:-3389}" ;;
-        libvirt) printf '  libvirt VM     : %s\n' "${OPT_WINAPPS_VM:-RDPWindows}" ;;
+        libvirt) printf '  libvirt VM     : %s%s\n' "${OPT_WINAPPS_VM:-RDPWindows}" \
+                     "$( (( WINAPPS_VM_DEPLOYED )) && printf ' (installing now)' )" ;;
     esac
     if [[ -n "$freerdp" ]]; then
         printf '  FreeRDP        : %s\n' "$freerdp"
@@ -3663,8 +4163,17 @@ winapps_print_summary() {
     printf '    %ssudo nano %s%s\n' "$C_CYAN" "$WINAPPS_TEMPLATE" "$C_RESET"
     printf '    %ssudo %s --all%s\n' "$C_CYAN" "$WINAPPS_SEEDER" "$C_RESET"
     printf '\n'
-    printf '  %sTo add applications after installing them in Windows:%s\n' "$C_BOLD" "$C_RESET"
+    printf '  %sTo scan (or re-scan) Windows for programs and refresh the launchers:%s\n' "$C_BOLD" "$C_RESET"
     printf '    %ssudo %s/setup.sh --system%s\n' "$C_CYAN" "$WINAPPS_ETC_DIR" "$C_RESET"
+    printf '    Run it after the first install, and again whenever a program is\n'
+    printf '    added to or removed from Windows.\n'
+
+    if [[ "$OPT_WINAPPS_BACKEND" == "libvirt" && -x "$WINAPPS_VM_DEPLOYER" ]]; then
+        printf '\n'
+        printf '  %sTo build or rebuild the Windows VM:%s\n' "$C_BOLD" "$C_RESET"
+        printf '    %ssudo %s%s            %s(--force to replace an existing one)%s\n' \
+            "$C_CYAN" "$WINAPPS_VM_DEPLOYER" "$C_RESET" "$C_DIM" "$C_RESET"
+    fi
     return 0
 }
 
@@ -3767,6 +4276,39 @@ configure_winapps() {
         docker)  enable_service docker.service ;;
         podman)  enable_service podman.socket ;;
     esac
+
+    # --- Build the Windows guest (libvirt backend only) --------------------
+    if [[ "$OPT_WINAPPS_BACKEND" == "libvirt" ]]; then
+        local do_deploy=0
+        case "$OPT_WINAPPS_DEPLOY" in
+            1) do_deploy=1 ;;
+            0) do_deploy=0 ;;
+            *) [[ $ASSUME_YES -ne 1 ]] \
+                 && confirm "Build the Windows 11 VM now with virt-install (unattended, ~20-45 min)?" "n" \
+                 && do_deploy=1 ;;
+        esac
+
+        if (( do_deploy )); then
+            printf '\n'
+            local -a dep_pkgs=()
+            read -r -a dep_pkgs <<<"$(pkgs_for winapps_deploy)"
+            if [[ ${#dep_pkgs[@]} -gt 0 ]]; then
+                filter_available "${dep_pkgs[@]}"
+                if [[ ${#AVAILABLE_PACKAGES[@]} -gt 0 ]]; then
+                    info "Deploy dependencies: ${AVAILABLE_PACKAGES[*]}"
+                    install_packages "${AVAILABLE_PACKAGES[@]}" \
+                        || warn "Some deploy dependencies did not install; virt-install may fail."
+                fi
+                [[ ${#SKIPPED_PACKAGES[@]} -gt 0 ]] && \
+                    warn "Not available here: ${SKIPPED_PACKAGES[*]}"
+            fi
+            winapps_write_vm_deployer || return 1
+            winapps_deploy_vm || true
+        else
+            winapps_write_vm_deployer || true
+            note "Skipping the VM build. When you want it:  sudo $WINAPPS_VM_DEPLOYER"
+        fi
+    fi
 
     if ! winapps_freerdp_cmd >/dev/null; then
         printf '\n'
@@ -4307,8 +4849,11 @@ fi
 
 MENU_TITLE="Active Directory Domain Join - Setup and Configuration"
 
-# Left column is indices 0-4, right column 5-10, and index 11 is a full-width
-# row centred underneath both. The columns need not be the same length.
+# The entries fill a two-column grid, left column first. An even number of
+# entries splits evenly (here 6 and 6); an odd number leaves one over, drawn as
+# a full-width row centred underneath both columns. MENU_LEFT_COUNT and
+# MENU_RIGHT_COUNT below say where the split falls - keep their sum equal to the
+# entry count for an even list, or one short of it for an odd list.
 MENU_NAMES=(
     "Guided setup"
     "Install packages only"
@@ -4341,7 +4886,7 @@ MENU_HINTS=(
     "Read-only: hostname, clock, DNS, membership and service state"
 )
 
-MENU_LEFT_COUNT=5
+MENU_LEFT_COUNT=6
 MENU_RIGHT_COUNT=6
 MENU_TOTAL=12
 MENU_CURSOR=0
@@ -4369,8 +4914,12 @@ MENU_RESIZED=0
 # so the worst-case delay between resizing the window and seeing the reflow.
 MENU_READ_TIMEOUT=0.2
 
-# Blank columns between the two menu columns.
-MENU_COL_GAP=4
+# Blank columns between the two menu columns, and blank columns held clear on
+# the right of the grid so the longest right-column entry does not run into the
+# banner border.
+MENU_COL_GAP=3
+MENU_GRID_RMARGIN=3
+ML_GRID_RMARGIN_EFF=3   # RMARGIN after the fit-to-width shrink in menu_compute_layout
 
 # Layout state, recomputed from the terminal size on every draw. None of it is
 # a fixed dimension.
@@ -4499,17 +5048,27 @@ menu_compute_layout() {
     (( avail < 20 )) && avail=$ML_TERM_W
 
     # Width ladder: two columns while they fit, otherwise one stacked column.
-    # The stacked form is four rows taller, so it is the second choice - on a
-    # default 80x24 terminal height is the scarcer resource.
-    local body_w
-    if (( left_w + MENU_COL_GAP + right_w <= avail )); then
+    # The stacked form is several rows taller, so it is the second choice - on a
+    # default 80x24 terminal height is the scarcer resource. Before giving up the
+    # second column, shrink the cosmetic spacing: first the right margin, then
+    # the inter-column gap down to a single space.
+    local body_w gap=$MENU_COL_GAP rmargin=$MENU_GRID_RMARGIN
+    while (( left_w + gap + right_w + rmargin > avail && rmargin > 0 )); do
+        (( rmargin-- ))
+    done
+    while (( left_w + gap + right_w > avail && gap > 1 )); do
+        (( gap-- ))
+    done
+    if (( left_w + gap + right_w <= avail )); then
         ML_TWO_COL=1
-        ML_COL_W=$(( left_w + MENU_COL_GAP ))
-        body_w=$(( left_w + MENU_COL_GAP + right_w ))
+        ML_COL_W=$(( left_w + gap ))
+        ML_GRID_RMARGIN_EFF=$rmargin
+        body_w=$(( left_w + gap + right_w + rmargin ))
         (( center_w > body_w )) && body_w=$center_w
     else
         ML_TWO_COL=0
         ML_COL_W=$single_w
+        ML_GRID_RMARGIN_EFF=0
         body_w=$single_w
     fi
 
@@ -4696,8 +5255,11 @@ draw_menu() {
     local idx
     if (( ML_TWO_COL )); then
         # The two columns are independent lengths, so the grid is as deep as the
-        # longer of them and a row may hold only one entry.
-        local row right_w=$(( content_width - ML_COL_W ))
+        # longer of them and a row may hold only one entry. Hold MENU_GRID_RMARGIN
+        # columns clear on the right, unless the terminal is too tight to afford
+        # it and the space is needed for the text itself.
+        local row right_w=$(( content_width - ML_COL_W - ML_GRID_RMARGIN_EFF ))
+        (( right_w < 16 )) && right_w=$(( content_width - ML_COL_W ))
         local grid_rows=$MENU_LEFT_COUNT
         (( MENU_RIGHT_COUNT > grid_rows )) && grid_rows=$MENU_RIGHT_COUNT
 
@@ -4887,7 +5449,8 @@ menu_cleanup() {
 # Draw the menu and collect the selections. Returns 1 when the user quit.
 run_menu() {
     MENU_CURSOR=0
-    MENU_SELECTED=(0 0 0 0 0 0 0 0 0 0 0)
+    MENU_SELECTED=(); local _s
+    for ((_s=0; _s<MENU_TOTAL; _s++)); do MENU_SELECTED[_s]=0; done
     menu_gather_info
 
     MENU_SAVED_STTY="$(stty -g 2>/dev/null)" || MENU_SAVED_STTY=""
@@ -4926,8 +5489,15 @@ run_menu() {
                     # From the centred row, up into the foot of the left column.
                     menu_set_cursor 0 $(( MENU_LEFT_COUNT - 1 ))
                 elif (( MROW == 0 )); then
-                    # From the top of a column, wrap round to the centred row.
-                    menu_set_cursor 2 0
+                    if (( MENU_TOTAL > MENU_LEFT_COUNT + MENU_RIGHT_COUNT )); then
+                        # An odd list has a centred row - wrap to it.
+                        menu_set_cursor 2 0
+                    else
+                        # Even list, no centred row - wrap to this column's foot.
+                        col_size=$MENU_LEFT_COUNT
+                        (( MCOL == 1 )) && col_size=$MENU_RIGHT_COUNT
+                        menu_set_cursor "$MCOL" $(( col_size - 1 ))
+                    fi
                 else
                     menu_set_cursor "$MCOL" $(( MROW - 1 ))
                 fi
@@ -4945,7 +5515,11 @@ run_menu() {
                     col_size=$MENU_LEFT_COUNT
                     (( MCOL == 1 )) && col_size=$MENU_RIGHT_COUNT
                     if (( MROW >= col_size - 1 )); then
-                        menu_set_cursor 2 0
+                        if (( MENU_TOTAL > MENU_LEFT_COUNT + MENU_RIGHT_COUNT )); then
+                            menu_set_cursor 2 0
+                        else
+                            menu_set_cursor "$MCOL" 0
+                        fi
                     else
                         menu_set_cursor "$MCOL" $(( MROW + 1 ))
                     fi
@@ -5291,10 +5865,27 @@ ${C_BOLD}WINDOWS APPLICATIONS (WINAPPS)${C_RESET}
       --winapps-user USER Windows service account, 'shared' mode only.
       --winapps-remove    Remove the multi-user wiring (template, generator,
                           login hooks). Leaves per-user configs and launchers.
+      --winapps-vm-remove With --winapps-remove, also 'virsh undefine' the guest
+                          and delete its disk.
+
+Building the Windows guest (libvirt backend only):
+      --winapps-deploy    Build a WinApps-ready Windows 11 Pro VM: unattended
+                          install, virtio drivers, RDP and RemoteApp on. Nothing
+                          domain-related - join it to AD yourself.
+      --no-winapps-deploy Never build the VM; just install the builder script.
+      --winapps-iso PATH  Windows 10/11 ISO to install from. Without it, Mido
+                          fetches Windows 11 from Microsoft (less reliable).
+      --winapps-vm-ram N   Guest RAM in MiB   (default 4096).
+      --winapps-vm-cpus N  Guest vCPUs        (default 4).
+      --winapps-vm-disk N  Guest disk in GiB  (default 64).
 
 The shared-mode password is read from the WINAPPS_RDP_PASS environment variable
 so it stays out of the process list. Note that 'shared' puts every user into the
 same Windows profile, which defeats the point of the domain join.
+
+The built VM's local administrator password is read from WINAPPS_VM_PASS; if
+unset, a random one is generated and printed once. The builder is also installed
+as 'winapps-vm-deploy' so the VM can be rebuilt later without re-running this.
 
 ${C_BOLD}EXAMPLES${C_RESET}
   # Interactive menu of everything the script can do
@@ -5360,6 +5951,13 @@ parse_args() {
             --winapps-creds)    OPT_WINAPPS_CREDS="${2:-}"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift 2 ;;
             --winapps-user)     OPT_WINAPPS_RDP_USER="${2:-}"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift 2 ;;
             --winapps-remove)   WINAPPS_REMOVE=1; OPT_WINAPPS=1; CLI_DIRECTED=1; shift ;;
+            --winapps-vm-remove) WINAPPS_VM_REMOVE=1; WINAPPS_REMOVE=1; OPT_WINAPPS=1; CLI_DIRECTED=1; shift ;;
+            --winapps-deploy)    OPT_WINAPPS_DEPLOY=1; OPT_WINAPPS=1; CLI_DIRECTED=1; shift ;;
+            --no-winapps-deploy) OPT_WINAPPS_DEPLOY=0; CLI_DIRECTED=1; shift ;;
+            --winapps-iso)       OPT_WINAPPS_ISO="${2:-}"; OPT_WINAPPS_DEPLOY=1; OPT_WINAPPS=1; CLI_DIRECTED=1; shift 2 ;;
+            --winapps-vm-ram)    OPT_WINAPPS_VM_RAM="${2:-}"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift 2 ;;
+            --winapps-vm-cpus)   OPT_WINAPPS_VM_CPUS="${2:-}"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift 2 ;;
+            --winapps-vm-disk)   OPT_WINAPPS_VM_DISK="${2:-}"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift 2 ;;
             --duo-repo)      DUO_ADD_REPO=1; shift ;;
             --no-duo-repo)   DUO_ADD_REPO=0; shift ;;
             --duo-build)     DUO_BUILD_SOURCE=1; shift ;;
@@ -5403,6 +6001,18 @@ parse_args() {
     if [[ "$OPT_WINAPPS_CREDS" == "shared" && $ASSUME_YES -eq 1 && -z "$OPT_WINAPPS_RDP_USER" ]]; then
         die "--winapps-creds shared needs --winapps-user (and WINAPPS_RDP_PASS in the environment)."
     fi
+
+    if [[ "$OPT_WINAPPS_DEPLOY" == "1" && -n "$OPT_WINAPPS_BACKEND" && "$OPT_WINAPPS_BACKEND" != "libvirt" ]]; then
+        die "--winapps-deploy only applies to the libvirt backend (got '$OPT_WINAPPS_BACKEND')."
+    fi
+    if [[ -n "$OPT_WINAPPS_ISO" && ! -f "$OPT_WINAPPS_ISO" ]]; then
+        die "--winapps-iso: no such file '$OPT_WINAPPS_ISO'."
+    fi
+    for _p in "ram:$OPT_WINAPPS_VM_RAM" "cpus:$OPT_WINAPPS_VM_CPUS" "disk:$OPT_WINAPPS_VM_DISK"; do
+        [[ -z "${_p#*:}" ]] && continue
+        [[ "${_p#*:}" =~ ^[1-9][0-9]*$ ]] || die "--winapps-vm-${_p%%:*} must be a positive integer (got '${_p#*:}')."
+    done
+    unset _p
 
     if [[ -n "$OPT_DUO_AUTOPUSH" ]]; then
         OPT_DUO_AUTOPUSH="${OPT_DUO_AUTOPUSH,,}"
