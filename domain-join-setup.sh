@@ -3624,9 +3624,11 @@ FORCE=0
 
 CACHE="/var/lib/winapps/iso"
 VIRTIO_ISO="$CACHE/virtio-win.iso"
+STAGED_WIN_ISO=""      # set if the Windows ISO has to be copied somewhere the hypervisor can read
+UNATTEND_ISO=""        # set once the answer disk is built
 VIRTIO_URL="https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso"
 MIDO_URL="https://raw.githubusercontent.com/ElliotKillick/Mido/main/Mido.sh"
-RDPAPPS_URL="https://raw.githubusercontent.com/winapps-org/winapps/main/install/RDPApps.reg"
+RDPAPPS_URL="https://raw.githubusercontent.com/winapps-org/winapps/main/oem/RDPApps.reg"
 LIBVIRT_URI="qemu:///system"
 POOL_DIR="/var/lib/libvirt/images"
 
@@ -3682,8 +3684,13 @@ if virsh -c "$LIBVIRT_URI" dominfo "$VM_NAME" >/dev/null 2>&1; then
     if [ "$FORCE" = "1" ]; then
         log "Removing the existing '$VM_NAME' guest (--force)."
         virsh -c "$LIBVIRT_URI" destroy "$VM_NAME" >/dev/null 2>&1 || true
-        virsh -c "$LIBVIRT_URI" undefine --nvram --remove-all-storage "$VM_NAME" >/dev/null 2>&1 \
-            || virsh -c "$LIBVIRT_URI" undefine --nvram "$VM_NAME" >/dev/null 2>&1 || true
+        # Not --remove-all-storage: that would also delete a Windows ISO passed
+        # by path. The system disk and the VM-named staged ISOs are removed by
+        # name below instead.
+        virsh -c "$LIBVIRT_URI" undefine --nvram "$VM_NAME" >/dev/null 2>&1 || true
+        rm -f "$POOL_DIR/${VM_NAME}.qcow2" \
+              "$POOL_DIR/${VM_NAME}-install.iso" \
+              "$POOL_DIR/${VM_NAME}-unattend.iso" 2>/dev/null || true
     else
         die "a libvirt guest named '$VM_NAME' already exists - re-run with --force to rebuild it."
     fi
@@ -3699,12 +3706,50 @@ else
 fi
 
 mkdir -p "$CACHE" "$POOL_DIR"
+# The QEMU process drops to an unprivileged user and cannot traverse a 0700
+# home directory or read a root-only file, so everything it opens has to live
+# somewhere world-traversable. /var/lib/winapps must therefore be 0755, not
+# whatever root's umask produced.
+chmod 0755 /var/lib/winapps "$CACHE" 2>/dev/null || true
+
+# Which user QEMU runs as - 'qemu' on Fedora/RHEL, 'libvirt-qemu' on Debian/
+# Ubuntu, or whatever qemu.conf overrides it to. Used to test whether a file is
+# actually reachable before handing its path to libvirt.
+QEMU_USER="$(sed -n 's/^[[:space:]]*user[[:space:]]*=[[:space:]]*"\?\([^"]*\)"\?.*/\1/p' \
+             /etc/libvirt/qemu.conf 2>/dev/null | tail -1)"
+[ -n "$QEMU_USER" ] || for u in qemu libvirt-qemu; do
+    id "$u" >/dev/null 2>&1 && { QEMU_USER="$u"; break; }
+done
+
+# hyp_can_read <path> - true if the QEMU user can open this file for reading,
+# path traversal included. Assumes yes if the user could not be determined.
+hyp_can_read() {
+    [ -n "$QEMU_USER" ] || return 0
+    if command -v runuser >/dev/null 2>&1; then
+        runuser -u "$QEMU_USER" -- test -r "$1" 2>/dev/null
+    elif command -v sudo >/dev/null 2>&1; then
+        sudo -n -u "$QEMU_USER" test -r "$1" 2>/dev/null
+    else
+        return 0
+    fi
+}
 
 # --- Windows ISO -----------------------------------------------------------
 if [ -n "$WIN_ISO" ]; then
     [ -d "$WIN_ISO" ] && die "the ISO path is a directory ($WIN_ISO) - give the full path to the .iso file, filename included."
     [ -f "$WIN_ISO" ] || die "Windows ISO not found: $WIN_ISO (pass the full path including the .iso filename)"
-    log "Using Windows ISO: $WIN_ISO"
+    if hyp_can_read "$WIN_ISO"; then
+        log "Using Windows ISO: $WIN_ISO"
+    else
+        STAGED_WIN_ISO="$POOL_DIR/${VM_NAME}-install.iso"
+        log "Windows ISO is not reachable by the '$QEMU_USER' user; copying it to $STAGED_WIN_ISO"
+        log "(this is a one-time copy of a multi-GB file and can take a few minutes)"
+        cp --reflink=auto -f "$WIN_ISO" "$STAGED_WIN_ISO" 2>/dev/null \
+            || cp -f "$WIN_ISO" "$STAGED_WIN_ISO" \
+            || die "could not copy the Windows ISO into $POOL_DIR."
+        chmod 0644 "$STAGED_WIN_ISO"
+        WIN_ISO="$STAGED_WIN_ISO"
+    fi
 else
     WIN_ISO="$CACHE/windows.iso"
     if [ -f "$WIN_ISO" ]; then
@@ -3916,8 +3961,12 @@ if ($vt) {
 shutdown /r /t 5 /c "WinApps deploy: first-boot configuration complete"
 PS1
 
+# Written into the libvirt pool, not the 0700 work directory: the QEMU user
+# has to be able to read it once it is attached as a CD.
+UNATTEND_ISO="$POOL_DIR/${VM_NAME}-unattend.iso"
 xorriso -as mkisofs -quiet -J -r -V WAUNATTEND \
-    -o "$WORK/unattend.iso" "$ISO_ROOT" || die "could not build the unattend ISO."
+    -o "$UNATTEND_ISO" "$ISO_ROOT" || die "could not build the unattend ISO."
+chmod 0644 "$UNATTEND_ISO"
 
 # --- create the guest ------------------------------------------------------
 DISK_PATH="$POOL_DIR/${VM_NAME}.qcow2"
@@ -3940,14 +3989,21 @@ virt-install \
     --disk "path=$DISK_PATH,bus=virtio,format=qcow2,boot.order=1" \
     --disk "path=$WIN_ISO,device=cdrom,boot.order=2" \
     --disk "path=$VIRTIO_ISO,device=cdrom" \
-    --disk "path=$WORK/unattend.iso,device=cdrom" \
+    --disk "path=$UNATTEND_ISO,device=cdrom" \
     --network network=default,model=virtio \
     --graphics spice \
     --video qxl \
     --sound default \
     --noautoconsole \
     --wait 0 \
-    || die "virt-install failed."
+    || {
+        # virt-install may have defined the domain before the start failed.
+        # Tear the half-built guest down so a plain re-run works without --force.
+        virsh -c "$LIBVIRT_URI" destroy "$VM_NAME" >/dev/null 2>&1 || true
+        virsh -c "$LIBVIRT_URI" undefine --nvram "$VM_NAME" >/dev/null 2>&1 || true
+        rm -f "$DISK_PATH"
+        die "virt-install failed."
+    }
 
 virsh -c "$LIBVIRT_URI" autostart "$VM_NAME" >/dev/null 2>&1 || true
 
@@ -4036,7 +4092,8 @@ winapps_deploy_vm() {
     WA_VM_PASS="$OPT_WINAPPS_VM_PASS" WA_ISO="$iso" \
         "$WINAPPS_VM_DEPLOYER" || {
         err "The Windows guest could not be deployed."
-        note "Fix the problem above, then re-run:  sudo $WINAPPS_VM_DEPLOYER"
+        note "Fix the problem above, then re-run:  sudo $WINAPPS_VM_DEPLOYER --force"
+        note "(--force clears the half-built '$vm' guest left behind by this attempt)"
         return 1
     }
     WINAPPS_VM_DEPLOYED=1
