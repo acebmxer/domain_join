@@ -1044,16 +1044,27 @@ check "--winapps-vm-remove sets both flags" "1" \
             parse_args --winapps-vm-remove >/dev/null 2>&1
             printf '%s' "$(( WINAPPS_VM_REMOVE & WINAPPS_REMOVE ))" ) )"
 
-# Non-libvirt backend + deploy must be refused, and a bad size must stop the run.
+# Non-libvirt backend + deploy must be refused, a bad size must stop the run,
+# and --winapps-iso must be a real .iso *file* - a directory or a missing path
+# is refused rather than carried into the builder.
 for bad in "--winapps-deploy --winapps-backend docker" \
            "--winapps-deploy --winapps-vm-ram plenty" \
-           "--winapps-iso /nonexistent/windows.iso"; do
+           "--winapps-iso /nonexistent/windows.iso" \
+           "--winapps-iso /tmp"; do
     if ( parse_args $bad ) >/dev/null 2>&1; then
         printf '  %s %s was accepted\n' "$(red FAIL)" "$bad"; ((FAIL++))
     else
         printf '  %s %s is rejected\n' "$(green PASS)" "$bad"; ((PASS++))
     fi
 done
+# A real .iso file is accepted.
+_fakeiso="$(mktemp --suffix=.iso)"
+if ( parse_args --winapps-iso "$_fakeiso" ) >/dev/null 2>&1; then
+    printf '  %s a real .iso file path is accepted\n' "$(green PASS)"; ((PASS++))
+else
+    printf '  %s a real .iso file path was rejected\n' "$(red FAIL)"; ((FAIL++))
+fi
+rm -f "$_fakeiso"
 
 section "WinApps: the config template"
 WA_TMP="$(mktemp -d)"

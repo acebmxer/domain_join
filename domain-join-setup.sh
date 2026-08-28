@@ -3608,7 +3608,8 @@ winapps_write_vm_deployer() {
 #     WA_VM_RAM    guest RAM in MiB              (default 4096)
 #     WA_VM_CPUS   guest vCPUs                   (default 4)
 #     WA_VM_DISK   guest disk in GiB            (default 64)
-#     WA_ISO       path to a Windows 10/11 ISO   (default: fetch with Mido)
+#     WA_ISO       full path to a Windows 10/11 .iso file, filename included,
+#                  not just its directory  (default: fetch with Mido)
 #
 set -u
 
@@ -3701,7 +3702,8 @@ mkdir -p "$CACHE" "$POOL_DIR"
 
 # --- Windows ISO -----------------------------------------------------------
 if [ -n "$WIN_ISO" ]; then
-    [ -f "$WIN_ISO" ] || die "Windows ISO not found: $WIN_ISO"
+    [ -d "$WIN_ISO" ] && die "the ISO path is a directory ($WIN_ISO) - give the full path to the .iso file, filename included."
+    [ -f "$WIN_ISO" ] || die "Windows ISO not found: $WIN_ISO (pass the full path including the .iso filename)"
     log "Using Windows ISO: $WIN_ISO"
 else
     WIN_ISO="$CACHE/windows.iso"
@@ -3989,13 +3991,33 @@ winapps_deploy_vm() {
 
     if [[ -z "$iso" && $ASSUME_YES -ne 1 ]]; then
         printf '\n'
-        note "A Windows 10/11 ISO is needed. Leave this blank to let Mido fetch"
-        note "Windows 11 from Microsoft - a local ISO is more reliable."
-        ask_value iso "Path to a Windows ISO" ""
+        note "A Windows 10/11 ISO is needed. Give the full path *including the"
+        note ".iso filename*, e.g. /srv/iso/Win11_24H2_English_x64.iso - not just"
+        note "the directory. Leave it blank to let Mido fetch Windows 11 from"
+        note "Microsoft (a local ISO is more reliable)."
+        while : ; do
+            ask_value iso "Path to the Windows ISO file" ""
+            [[ -z "$iso" ]] && break                       # blank = use Mido
+            if [[ -d "$iso" ]]; then
+                err "That is a directory. Add the .iso filename to the path."
+                iso=""; continue
+            fi
+            [[ -f "$iso" ]] && break
+            err "No such file: $iso"
+            iso=""
+        done
     fi
-    if [[ -n "$iso" && ! -f "$iso" ]]; then
-        err "No such file: $iso"
-        return 1
+    # Non-interactive, or a path supplied on the command line: no re-prompt.
+    if [[ -n "$iso" ]]; then
+        if [[ -d "$iso" ]]; then
+            err "--winapps-iso is a directory: $iso"
+            note "Point it at the .iso file itself, filename included."
+            return 1
+        fi
+        if [[ ! -f "$iso" ]]; then
+            err "No such file: $iso"
+            return 1
+        fi
     fi
     if [[ $ASSUME_YES -ne 1 ]]; then
         ask_value ram  "Guest RAM (MiB)"  "$ram"
@@ -5873,8 +5895,10 @@ Building the Windows guest (libvirt backend only):
                           install, virtio drivers, RDP and RemoteApp on. Nothing
                           domain-related - join it to AD yourself.
       --no-winapps-deploy Never build the VM; just install the builder script.
-      --winapps-iso PATH  Windows 10/11 ISO to install from. Without it, Mido
-                          fetches Windows 11 from Microsoft (less reliable).
+      --winapps-iso FILE  Full path to a Windows 10/11 .iso file - the filename
+                          must be part of the path, not just its directory.
+                          Without it, Mido fetches Windows 11 from Microsoft
+                          (less reliable).
       --winapps-vm-ram N   Guest RAM in MiB   (default 4096).
       --winapps-vm-cpus N  Guest vCPUs        (default 4).
       --winapps-vm-disk N  Guest disk in GiB  (default 64).
@@ -6005,8 +6029,12 @@ parse_args() {
     if [[ "$OPT_WINAPPS_DEPLOY" == "1" && -n "$OPT_WINAPPS_BACKEND" && "$OPT_WINAPPS_BACKEND" != "libvirt" ]]; then
         die "--winapps-deploy only applies to the libvirt backend (got '$OPT_WINAPPS_BACKEND')."
     fi
-    if [[ -n "$OPT_WINAPPS_ISO" && ! -f "$OPT_WINAPPS_ISO" ]]; then
-        die "--winapps-iso: no such file '$OPT_WINAPPS_ISO'."
+    if [[ -n "$OPT_WINAPPS_ISO" ]]; then
+        if [[ -d "$OPT_WINAPPS_ISO" ]]; then
+            die "--winapps-iso is a directory ('$OPT_WINAPPS_ISO'). Give the full path to the .iso file, filename included."
+        elif [[ ! -f "$OPT_WINAPPS_ISO" ]]; then
+            die "--winapps-iso: no such file '$OPT_WINAPPS_ISO'."
+        fi
     fi
     for _p in "ram:$OPT_WINAPPS_VM_RAM" "cpus:$OPT_WINAPPS_VM_CPUS" "disk:$OPT_WINAPPS_VM_DISK"; do
         [[ -z "${_p#*:}" ]] && continue

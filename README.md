@@ -202,7 +202,8 @@ Windows applications (WinApps):
       --winapps-vm-remove With --winapps-remove, also delete the libvirt guest
       --winapps-deploy    Build the Windows 11 VM (libvirt backend only)
       --no-winapps-deploy Never build the VM; just install the builder script
-      --winapps-iso PATH  Windows ISO to install from (else fetched with Mido)
+      --winapps-iso FILE  Full path to a Windows .iso file, filename and all
+                          (else fetched with Mido)
       --winapps-vm-ram N  Guest RAM in MiB  (default 4096)
       --winapps-vm-cpus N Guest vCPUs       (default 4)
       --winapps-vm-disk N Guest disk in GiB (default 64)
@@ -831,7 +832,11 @@ With the **libvirt** backend the script can stand up the Windows guest itself
   bypassed in the answer file so it installs regardless of host firmware
 - `virsh autostart` on, so WinApps can wake it
 
-Supply the install media with `--winapps-iso PATH`. Without it the helper calls
+Supply the install media with `--winapps-iso FILE`. This has to be the full
+path to the `.iso` file itself — filename included, e.g.
+`/srv/iso/Win11_24H2_English_x64.iso`, not the directory that holds it. A
+directory, or a path that does not point at a file, is rejected (and the
+interactive prompt just asks again). Without `--winapps-iso` the helper calls
 [Mido](https://github.com/ElliotKillick/Mido) to pull a Windows 11 ISO from
 Microsoft — convenient, but Mido scrapes Microsoft's download API and breaks
 from time to time, so a local ISO is more reliable. ISOs are cached under
