@@ -3764,6 +3764,11 @@ if [ -n "$WIN_ISO" ]; then
         chmod 0644 "$STAGED_WIN_ISO"
         WIN_ISO="$STAGED_WIN_ISO"
     fi
+elif [ -f "$POOL_DIR/${VM_NAME}-install.iso" ]; then
+    # A previous run staged the operator's ISO here. Reuse it rather than
+    # falling back to a fresh (and often broken) Mido download.
+    WIN_ISO="$POOL_DIR/${VM_NAME}-install.iso"
+    log "Reusing the staged Windows ISO: $WIN_ISO"
 else
     WIN_ISO="$CACHE/windows.iso"
     if [ -f "$WIN_ISO" ]; then
