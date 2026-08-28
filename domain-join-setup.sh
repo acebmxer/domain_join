@@ -3688,12 +3688,20 @@ if virsh -c "$LIBVIRT_URI" dominfo "$VM_NAME" >/dev/null 2>&1; then
         # by path. The system disk and the VM-named staged ISOs are removed by
         # name below instead.
         virsh -c "$LIBVIRT_URI" undefine --nvram "$VM_NAME" >/dev/null 2>&1 || true
+        # The staged '-install.iso' is kept: it is only a copy of the source ISO
+        # and the size check below refreshes it if the source changed.
         rm -f "$POOL_DIR/${VM_NAME}.qcow2" \
-              "$POOL_DIR/${VM_NAME}-install.iso" \
               "$POOL_DIR/${VM_NAME}-unattend.iso" 2>/dev/null || true
     else
         die "a libvirt guest named '$VM_NAME' already exists - re-run with --force to rebuild it."
     fi
+fi
+
+# Checked here, before the multi-GB ISO work, so a leftover disk fails fast.
+# (A guest is not always defined when a disk is left behind - e.g. an earlier
+# run that died between qemu-img and virt-install.)
+if [ "$FORCE" != "1" ] && [ -f "$POOL_DIR/${VM_NAME}.qcow2" ]; then
+    die "$POOL_DIR/${VM_NAME}.qcow2 already exists - re-run with --force to rebuild it."
 fi
 
 if virsh -c "$LIBVIRT_URI" net-info default >/dev/null 2>&1; then
@@ -3742,11 +3750,17 @@ if [ -n "$WIN_ISO" ]; then
         log "Using Windows ISO: $WIN_ISO"
     else
         STAGED_WIN_ISO="$POOL_DIR/${VM_NAME}-install.iso"
-        log "Windows ISO is not reachable by the '$QEMU_USER' user; copying it to $STAGED_WIN_ISO"
-        log "(this is a one-time copy of a multi-GB file and can take a few minutes)"
-        cp --reflink=auto -f "$WIN_ISO" "$STAGED_WIN_ISO" 2>/dev/null \
-            || cp -f "$WIN_ISO" "$STAGED_WIN_ISO" \
-            || die "could not copy the Windows ISO into $POOL_DIR."
+        _src_sz=$(stat -c %s "$WIN_ISO" 2>/dev/null || echo 0)
+        _dst_sz=$(stat -c %s "$STAGED_WIN_ISO" 2>/dev/null || echo 0)
+        if [ "$_src_sz" -gt 0 ] && [ "$_src_sz" = "$_dst_sz" ]; then
+            log "Reusing the staged Windows ISO at $STAGED_WIN_ISO"
+        else
+            log "Windows ISO is not reachable by the '$QEMU_USER' user; copying it to $STAGED_WIN_ISO"
+            log "(this is a one-time copy of a multi-GB file and can take a few minutes)"
+            cp --reflink=auto -f "$WIN_ISO" "$STAGED_WIN_ISO" 2>/dev/null \
+                || cp -f "$WIN_ISO" "$STAGED_WIN_ISO" \
+                || die "could not copy the Windows ISO into $POOL_DIR."
+        fi
         chmod 0644 "$STAGED_WIN_ISO"
         WIN_ISO="$STAGED_WIN_ISO"
     fi
