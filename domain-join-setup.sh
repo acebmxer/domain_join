@@ -3800,7 +3800,15 @@ iso_efi_noprompt() {
     cp --reflink=auto -f "$src" "$dst" 2>/dev/null || cp -f "$src" "$dst" \
         || { rm -rf "$d"; return 1; }
 
-    if dd if="$d/np.bin" of="$dst" bs=2048 seek="$start" conv=notrunc status=none 2>/dev/null; then
+    dd if="$d/np.bin" of="$dst" bs=2048 seek="$start" conv=notrunc status=none 2>/dev/null \
+        || { rm -rf "$d"; rm -f "$dst"; return 1; }
+
+    # Verify the write landed on efisys.bin and nothing else: read that file
+    # back out of the patched image and check it now equals the no-prompt one.
+    # If it does not, the LBA was wrong and we may have corrupted the ISO -
+    # throw the copy away so the caller falls back to a plain copy.
+    xorriso -osirrox on -indev "$dst" -extract "$ppath" "$d/check.bin" >/dev/null 2>&1
+    if cmp -s "$d/np.bin" "$d/check.bin"; then
         rm -rf "$d"; return 0
     fi
     rm -rf "$d"; rm -f "$dst"; return 1
