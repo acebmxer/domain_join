@@ -4111,8 +4111,9 @@ winapps_deploy_vm() {
     WA_VM_PASS="$OPT_WINAPPS_VM_PASS" WA_ISO="$iso" \
         "$WINAPPS_VM_DEPLOYER" || {
         err "The Windows guest could not be deployed."
-        note "Fix the problem above, then re-run:  sudo $WINAPPS_VM_DEPLOYER --force"
-        note "(--force clears the half-built '$vm' guest left behind by this attempt)"
+        note "Fix the problem above, then re-run (--force clears the half-built guest):"
+        printf '    %ssudo %s --force --name %s%s%s\n' "$C_CYAN" "$WINAPPS_VM_DEPLOYER" \
+            "$vm" "${iso:+ --iso $iso}" "$C_RESET"
         return 1
     }
     WINAPPS_VM_DEPLOYED=1
