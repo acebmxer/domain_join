@@ -57,6 +57,19 @@ changed — not that an artefact was published anywhere.
 
 ### Fixed
 
+- **The WinApps program scan tried to log into Windows as `root`.** When the
+  installer ran `setup.sh --system` under `sudo`, it seeded root's
+  `~/.config/winapps/winapps.conf` from the per-user template — which carries a
+  `RDP_USER` placeholder, `RDP_DOMAIN` set to the realm and (in Kerberos mode)
+  `/sec:nla` — and the password helper's dialog was labelled *"Active Directory
+  password for root"*. There is no `root` account in the directory, so the scan
+  could never authenticate, and a stale copy from an earlier run was never
+  refreshed. The scan now connects as the guest's **local** administrator (the
+  `admin` / `password` from `windows-vm.conf`), with no domain and no Kerberos
+  NLA — an account that exists whether or not Windows is domain-joined. The
+  password goes into a root-only askpass helper, never `RDP_PASS`, so it is
+  never a `/p:` argument in `ps` or the WinApps log; with no password in the
+  config the scan asks for one. Domain-user sign-in is unchanged.
 - The menu banner in the README was one column too wide: the title row's
   interior measured 82 characters against an 81-character `╔═╗` border, so the
   closing `║` sat one place past the corner. The README now uses the same

@@ -4902,13 +4902,65 @@ winapps_deploy_vm() {
     return 0
 }
 
+# 'setup.sh --system' reads its RDP settings from $HOME/.config/winapps, and
+# $HOME here is root's. Seed it so the program scan connects to Windows as the
+# guest's *local* administrator - the 'admin' / 'password' from windows-vm.conf.
+# That account exists whether or not the guest is domain-joined, which a domain
+# identity here would not: it cannot authenticate before the join and is not
+# needed after it. The per-user template and its Kerberos/askpass wiring are for
+# the domain users who log into this machine later, and are not used here.
+#
+# The password goes into a root-only askpass helper, never RDP_PASS, so it is
+# not a '/p:' argument visible in 'ps' or the WinApps log. With no password
+# available (a build-generated random one) it asks, or warns and moves on.
+winapps_seed_scan_config() {
+    local installer="${1:-$WINAPPS_ETC_DIR/setup.sh}"
+    [[ -n "${HOME:-}" && -r "$WINAPPS_TEMPLATE" ]] || return 0
+
+    local scan_user="${OPT_WINAPPS_VM_ADMIN:-Docker}"
+    local scan_pass="$OPT_WINAPPS_VM_PASS"
+    if [[ -z "$scan_pass" && -t 0 ]]; then
+        printf '\n'
+        note "The one-time program scan signs into Windows as its local"
+        note "administrator to list what is installed. windows-vm.conf did not"
+        note "carry a password (the build generated a random one), so:"
+        ask_value  scan_user "Windows account for the program scan" "$scan_user"
+        ask_secret scan_pass "Password for $scan_user"
+    fi
+
+    mkdir -p "$HOME/.config/winapps"
+    local askpass="$HOME/.config/winapps/scan-askpass"
+    if [[ -n "$scan_pass" ]]; then
+        local esc="${scan_pass//\'/\'\\\'\'}"
+        printf "#!/bin/sh\nprintf '%%s' '%s'\n" "$esc" >"$askpass"
+        chmod 700 "$askpass"
+    else
+        rm -f "$askpass"
+    fi
+
+    # Start from the template so libvirt IP discovery (VM_NAME) is preserved,
+    # then override: connect as a local account, no domain, no Kerberos NLA.
+    sed -e "s|^RDP_USER=.*|RDP_USER=\"$scan_user\"|" \
+        -e 's|^RDP_DOMAIN=.*|RDP_DOMAIN=""|' \
+        -e 's|^RDP_PASS=.*|RDP_PASS=""|' \
+        -e "s|^RDP_ASKPASS=.*|RDP_ASKPASS=\"$askpass\"|" \
+        -e 's| /sec:nla||' \
+        "$WINAPPS_TEMPLATE" >"$HOME/.config/winapps/winapps.conf"
+    chmod 600 "$HOME/.config/winapps/winapps.conf"
+
+    if [[ -z "$scan_pass" ]]; then
+        warn "No password available for the program scan; it will likely fail."
+        note "Add 'password' to windows-vm.conf, then:  sudo $installer --system"
+    fi
+    return 0
+}
+
 # Run the upstream installer with --system, which is what puts the launchers in
 # /usr/share/applications for every account.
 #
 # It cannot be run blind: the installer connects to Windows and enumerates the
-# installed programs, so Windows has to be up, reachable over RDP and - for this
-# to be worth anything - already joined to the domain. When it is not, the
-# groundwork is left in place and the command is printed for later.
+# installed programs, so Windows has to be up and reachable over RDP. When it is
+# not, the groundwork is left in place and the command is printed for later.
 winapps_install_upstream() {
     local installer="$WINAPPS_ETC_DIR/setup.sh" rc=0
 
@@ -4937,17 +4989,7 @@ winapps_install_upstream() {
     fi
     chmod 0755 "$installer"
 
-    # The installer reads its config from $HOME, and $HOME here is root's. Seed
-    # root from the same template so the app scan has something to connect with.
-    if [[ -n "${HOME:-}" && -r "$WINAPPS_TEMPLATE" ]]; then
-        "$WINAPPS_SEEDER" >/dev/null 2>&1 || true
-        if [[ ! -f "$HOME/.config/winapps/winapps.conf" ]]; then
-            mkdir -p "$HOME/.config/winapps"
-            sed "s/@WINAPPS_USER@/${OPT_WINAPPS_RDP_USER:-Administrator}/g" \
-                "$WINAPPS_TEMPLATE" >"$HOME/.config/winapps/winapps.conf"
-            chmod 600 "$HOME/.config/winapps/winapps.conf"
-        fi
-    fi
+    winapps_seed_scan_config "$installer"
 
     info "Running the WinApps installer (system-wide)"
     run "$installer" --system || rc=$?
@@ -4979,6 +5021,15 @@ winapps_remove() {
             fi
         fi
     done
+
+    # The program-scan password helper (root only), if a scan ever wrote one.
+    if [[ -n "${HOME:-}" && -e "$HOME/.config/winapps/scan-askpass" ]]; then
+        if [[ $DRY_RUN -eq 1 ]]; then
+            printf '%s  [dry-run]%s remove %s\n' "$C_CYAN" "$C_RESET" "$HOME/.config/winapps/scan-askpass"
+        else
+            rm -f "$HOME/.config/winapps/scan-askpass" && ok "Removed $HOME/.config/winapps/scan-askpass"
+        fi
+    fi
 
     # The Windows guest is only torn down when explicitly asked - its disk holds
     # a full Windows install and whatever was saved inside it.

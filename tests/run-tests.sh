@@ -1155,6 +1155,48 @@ seed_as jdoe >/dev/null
 check "a copy without the marker is left alone" 'RDP_USER="hand-edited"' \
       "$(grep '^RDP_USER=' "$OWN")"
 
+section "WinApps: the root program-scan config"
+# winapps_seed_scan_config writes root's ~/.config/winapps for 'setup.sh
+# --system'. It must connect as the guest's local admin, not a domain identity:
+# that account is all a fresh (or later domain-joined) guest has.
+SCAN_HOME="$WA_TMP/scanroot"; mkdir -p "$SCAN_HOME"
+WINAPPS_TEMPLATE="$WA_TMP/scan.template"
+winapps_write_template "CORP.EXAMPLE.COM" "libvirt" "kerberos" "" "" "IT-VM" >/dev/null 2>&1
+( HOME="$SCAN_HOME"; OPT_WINAPPS_VM_ADMIN="admin"; OPT_WINAPPS_VM_PASS="p'wd"
+  winapps_seed_scan_config /etc/winapps/setup.sh ) >/dev/null 2>&1
+SCAN_CONF="$SCAN_HOME/.config/winapps/winapps.conf"
+SCAN_PASS="$SCAN_HOME/.config/winapps/scan-askpass"
+check_line "it connects as the local admin from the config" 'RDP_USER="admin"' "$SCAN_CONF"
+check_line "it blanks the RDP domain"                       'RDP_DOMAIN=""'    "$SCAN_CONF"
+check_line "it keeps the libvirt VM name for IP discovery"  'VM_NAME="IT-VM"'  "$SCAN_CONF"
+check_line "it points RDP_ASKPASS at the scan helper"       'scan-askpass'     "$SCAN_CONF"
+if grep -qF '/sec:nla' "$SCAN_CONF"; then
+    printf '  %s it left Kerberos NLA on a local-account connection\n' "$(red FAIL)"; ((FAIL++))
+else
+    printf '  %s it drops Kerberos NLA for the local-account connection\n' "$(green PASS)"; ((PASS++))
+fi
+if grep -qE '^RDP_PASS=""' "$SCAN_CONF" && ! grep -qF "p'wd" "$SCAN_CONF"; then
+    printf '  %s the password is never written into winapps.conf\n' "$(green PASS)"; ((PASS++))
+else
+    printf '  %s the password leaked into winapps.conf\n' "$(red FAIL)"; ((FAIL++))
+fi
+if [ "$(stat -c '%a' "$SCAN_PASS" 2>/dev/null)" = "700" ] && [ "$("$SCAN_PASS")" = "p'wd" ]; then
+    printf '  %s the askpass helper is 0700 and emits the exact password\n' "$(green PASS)"; ((PASS++))
+else
+    printf '  %s the askpass helper has the wrong mode or output\n' "$(red FAIL)"; ((FAIL++))
+fi
+# No password in the config and no tty: warn, no helper, no crash.
+SCAN_HOME2="$WA_TMP/scanroot2"; mkdir -p "$SCAN_HOME2"
+( HOME="$SCAN_HOME2"; OPT_WINAPPS_VM_ADMIN=""; OPT_WINAPPS_VM_PASS=""
+  winapps_seed_scan_config /etc/winapps/setup.sh ) >/dev/null 2>&1 </dev/null
+check_line "with no password it still writes a config as Docker" 'RDP_USER="Docker"' \
+      "$SCAN_HOME2/.config/winapps/winapps.conf"
+if [ -e "$SCAN_HOME2/.config/winapps/scan-askpass" ]; then
+    printf '  %s it left an empty askpass helper behind\n' "$(red FAIL)"; ((FAIL++))
+else
+    printf '  %s it writes no askpass helper without a password\n' "$(green PASS)"; ((PASS++))
+fi
+
 section "WinApps: the VM builder script"
 WINAPPS_VM_DEPLOYER="$WA_TMP/winapps-vm-deploy"
 winapps_write_vm_deployer >/dev/null 2>&1

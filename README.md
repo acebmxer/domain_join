@@ -1028,7 +1028,11 @@ Windows has to exist first:
    VM it built.
 4. Scan Windows for installed programs to create the launchers:
    `sudo /etc/winapps/setup.sh --system` — and re-run that same command whenever
-   a program is added to or removed from Windows.
+   a program is added to or removed from Windows. This one scan signs into
+   Windows as the guest's **local** administrator (the `admin` / `password` in
+   `windows-vm.conf`), which works whether or not Windows is domain-joined; if
+   the build generated a random password it asks for one. The domain users who
+   log in later authenticate as themselves, per the credential mode above.
 
 Step 2 asks whether Windows is already up. If it is not, the groundwork is still
 written and it prints the command for step 4 — so the script is safe to run
