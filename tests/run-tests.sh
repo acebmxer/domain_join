@@ -1162,6 +1162,10 @@ else
     printf '  %s the generated VM builder has a syntax error\n' "$(red FAIL)"; ((FAIL++))
 fi
 check_line "it authors an unattended answer file"  'Autounattend.xml'        "$WINAPPS_VM_DEPLOYER"
+# Without publicKeyToken the offline SMI parser rejects the file in the
+# specialize/oobeSystem passes ("not a valid unattended Setup answer file",
+# 0x80220003) and the install dies with "computer restarted unexpectedly".
+check_line "its answer-file components are signed" 'publicKeyToken="31bf3856ad364e35"' "$WINAPPS_VM_DEPLOYER"
 check_line "it installs Windows 11 Pro"            '<Value>Windows 11 Pro</Value>' "$WINAPPS_VM_DEPLOYER"
 check_line "it bypasses the Win11 hardware checks" 'BypassTPMCheck'          "$WINAPPS_VM_DEPLOYER"
 check_line "it enables Remote Desktop"             'fDenyTSConnections'      "$WINAPPS_VM_DEPLOYER"
