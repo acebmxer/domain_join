@@ -110,8 +110,8 @@
 
 # The Windows time zone name - not an IANA one, so "Eastern Standard Time" and
 # not "America/New_York". 'tzutil /l' inside any Windows box lists them all.
-# Left unset, no <TimeZone> is written and Windows keeps whatever the install
-# media defaults to - usually Pacific for US media. Worth setting.
+# Left unset it defaults to UTC; set it to your own zone. An empty value
+# ('timezone =') is rejected - remove the line instead.
 #                                                      unattend: TimeZone
 #timezone = Eastern Standard Time
 

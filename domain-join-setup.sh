@@ -337,7 +337,8 @@ vm_conf_set() {
         computer_name) vm_conf_computer_name "$val" "$key" "$where" ;;
         owner)         OPT_VM_OWNER="$val" ;;
         organization)  OPT_VM_ORGANIZATION="$val" ;;
-        timezone)      OPT_VM_TIMEZONE="$val" ;;   # empty = leave it to Windows
+        timezone)      [[ -n "$val" ]] || die "$where: 'timezone' needs a value (e.g. 'Eastern Standard Time'). Remove the line to default to UTC."
+                       OPT_VM_TIMEZONE="$val" ;;
         ui_language)   vm_conf_langtag OPT_VM_UI_LANGUAGE   "$val" "$key" "$where" ;;
         system_locale) vm_conf_langtag OPT_VM_SYSTEM_LOCALE "$val" "$key" "$where" ;;
         user_locale)   vm_conf_langtag OPT_VM_USER_LOCALE   "$val" "$key" "$where" ;;
@@ -557,8 +558,8 @@ vm_conf_write_sample() {
 
 # The Windows time zone name - not an IANA one, so "Eastern Standard Time" and
 # not "America/New_York". 'tzutil /l' inside any Windows box lists them all.
-# Left unset, no <TimeZone> is written and Windows keeps whatever the install
-# media defaults to - usually Pacific for US media. Worth setting.
+# Left unset it defaults to UTC; set it to your own zone. An empty value
+# ('timezone =') is rejected - remove the line instead.
 #                                                      unattend: TimeZone
 #timezone = Eastern Standard Time
 
@@ -4007,7 +4008,7 @@ winapps_write_vm_deployer() {
 #     WA_COMPUTER_NAME the guest's Windows name   (default *, meaning random)
 #     WA_OWNER         RegisteredOwner            (default: unset)
 #     WA_ORGANIZATION  RegisteredOrganization     (default: unset)
-#     WA_TIMEZONE      Windows time zone name     (default: the media's own)
+#     WA_TIMEZONE      Windows time zone name     (default UTC)
 #     WA_UI_LANGUAGE   display language           (default en-US)
 #     WA_SYSTEM_LOCALE non-Unicode program locale (default: the UI language)
 #     WA_USER_LOCALE   date/number formats        (default: the UI language)
@@ -4096,6 +4097,7 @@ VM_DISK="${VM_DISK:-64}"
 # say so three times.
 VM_EDITION="${VM_EDITION:-Windows 11 Pro}"
 VM_HOSTNAME="${VM_HOSTNAME:-*}"
+VM_TZ="${VM_TZ:-UTC}"
 VM_UILANG="${VM_UILANG:-en-US}"
 VM_SYSLOCALE="${VM_SYSLOCALE:-$VM_UILANG}"
 VM_USRLOCALE="${VM_USRLOCALE:-$VM_UILANG}"
@@ -4503,11 +4505,10 @@ else
     echo "  the ISO supplies it. Set product_key in windows-vm.conf to avoid that."
 fi
 
-# TimeZone, RegisteredOwner and RegisteredOrganization are all omitted when
-# unset. No <TimeZone> means Windows keeps the installation media's own default,
-# which is what this built before any of these settings existed.
-X_SPECIALIZE=""
-[ -n "$VM_TZ" ] && X_SPECIALIZE="$X_SPECIALIZE
+# TimeZone is always written - it defaults to UTC when nothing set it, so an
+# unattended install never inherits an unpredictable zone from the media.
+# RegisteredOwner and RegisteredOrganization are still omitted when unset.
+X_SPECIALIZE="
       <TimeZone>$(xesc "$VM_TZ")</TimeZone>"
 [ -n "$VM_OWNER" ] && X_SPECIALIZE="$X_SPECIALIZE
       <RegisteredOwner>$(xesc "$VM_OWNER")</RegisteredOwner>"
@@ -4827,9 +4828,12 @@ winapps_deploy_vm() {
         fi
     fi
     if [[ $ASSUME_YES -ne 1 ]]; then
-        ask_value ram  "Guest RAM (MiB)"  "$ram"
-        ask_value cpus "Guest vCPUs"      "$cpus"
-        ask_value disk "Guest disk (GiB)" "$disk"
+        # A value already supplied by the config file or a flag is taken as the
+        # answer, the same way iso/admin/password are below. Only prompt for the
+        # ones left at their built-in default.
+        [[ -n "$OPT_WINAPPS_VM_RAM"  ]] || ask_value ram  "Guest RAM (MiB)"  "$ram"
+        [[ -n "$OPT_WINAPPS_VM_CPUS" ]] || ask_value cpus "Guest vCPUs"      "$cpus"
+        [[ -n "$OPT_WINAPPS_VM_DISK" ]] || ask_value disk "Guest disk (GiB)" "$disk"
 
         # The local administrator inside the guest. A Windows local account,
         # not a domain one - it is what you sign in to the new VM with.

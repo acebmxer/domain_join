@@ -273,9 +273,11 @@ overlong=0
 for size in "120 45" "100 40" "80 24" "70 30" "60 30" "45 24"; do
     set -- $size
     MENU_CURSOR=0
+    # Count display columns, not bytes: the menu box is drawn with multi-byte
+    # box-drawing characters, and mawk (Ubuntu's awk) would count each as 3.
     widest="$(COLUMNS="$1" LINES="$2" draw_menu \
         | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g' \
-        | awk '{ if (length($0) > m) m = length($0) } END { print m + 0 }')"
+        | python3 -c 'import sys; print(max((len(l.rstrip("\r\n")) for l in sys.stdin), default=0))')"
     (( widest > $1 )) && { overlong=1; printf '        %sx%s produced a %s-column line\n' "$1" "$2" "$widest"; }
 done
 check "every drawn line fits the terminal" "0" "$overlong"

@@ -41,12 +41,30 @@ changed — not that an artefact was published anywhere.
 - **Badges in the README** — license, version, last commit, open issues, shell,
   platform and the test count.
 
+### Changed
+
+- **The VM builder stops re-asking for RAM, vCPUs and disk when the answer is
+  already in `windows-vm.conf`.** A value set in the file (or by
+  `--winapps-vm-ram` / `-cpus` / `-disk`) is now taken as the answer, the way
+  `iso`, `admin` and `password` already were; only the settings left at their
+  built-in default still prompt.
+- **`timezone` defaults to UTC when nothing sets it.** The unattended install
+  previously wrote no `<TimeZone>` at all and inherited whatever the install
+  media defaulted to; it now always writes one, so a build without a `timezone`
+  line lands on UTC rather than an unpredictable zone. An empty `timezone =` in
+  `windows-vm.conf` is rejected with a message pointing at either a real value
+  or removing the line.
+
 ### Fixed
 
 - The menu banner in the README was one column too wide: the title row's
   interior measured 82 characters against an 81-character `╔═╗` border, so the
   closing `║` sat one place past the corner. The README now uses the same
   padding arithmetic the script does, which puts the odd column on the right.
+- The test suite's "every drawn line fits the terminal" check measured line
+  width with `awk`, which on systems where `awk` is `mawk` counts bytes rather
+  than characters and reported the menu's box-drawing borders as three times
+  their real width. It now counts display columns and passes on `mawk`.
 
 ## [1.4.0] — 2026-08-29
 
