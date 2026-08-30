@@ -1010,6 +1010,24 @@ check "--winapps-backend implies on" "1|libvirt||0"   "$(winapps_after --winapps
 check "--winapps-creds is stored"    "1||askpass|0"   "$(winapps_after --winapps-creds askpass)"
 check "--winapps-remove sets removal" "1|||1"         "$(winapps_after --winapps-remove)"
 
+# main() must short-circuit --winapps-remove straight to winapps_remove. Without
+# that it falls into action_guided_setup, which prompts for an AD backend and
+# installs packages before the removal ever runs.
+remove_dispatch() {
+    ( WINAPPS_REMOVE=0; CLI_DIRECTED=0
+      check_for_update() { :; }; detect_distro() { :; }; detect_de() { :; }
+      require_root() { :; }; print_system_header() { :; }
+      vm_conf_prescan() { :; }; vm_conf_load() { :; }
+      action_guided_setup() { printf 'GUIDED'; }
+      choose_backend()      { printf 'BACKEND'; }
+      winapps_remove()      { printf 'REMOVE'; }
+      main "$@" 2>/dev/null )
+}
+check "main sends --winapps-remove straight to removal" "REMOVE" \
+      "$(remove_dispatch --winapps-remove)"
+check "main sends --winapps-vm-remove straight to removal" "REMOVE" \
+      "$(remove_dispatch --winapps-vm-remove)"
+
 # An invalid enum must stop the run rather than be carried into a config file.
 for bad in "--winapps-backend vmware" "--winapps-creds telepathy"; do
     if ( parse_args $bad ) >/dev/null 2>&1; then

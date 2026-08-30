@@ -80,6 +80,13 @@ changed — not that an artefact was published anywhere.
 
 ### Fixed
 
+- **`--winapps-remove` and `--winapps-vm-remove` ran the whole installer first.**
+  Neither flag routed straight to the teardown: they only suppressed the menu, so
+  the script fell into the guided setup and prompted for an Active Directory
+  backend, previewed and installed packages, and offered to join a domain before
+  `winapps_remove` finally ran at the tail of `configure_winapps`. `main` now
+  short-circuits to `winapps_remove` as soon as either flag is seen and stops
+  there.
 - **The WinApps program scan tried to log into Windows as `root`.** When the
   installer ran `setup.sh --system` under `sudo`, it seeded root's
   `~/.config/winapps/winapps.conf` from the per-user template — which carries a

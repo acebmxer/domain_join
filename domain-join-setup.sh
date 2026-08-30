@@ -7277,6 +7277,16 @@ main() {
     detect_de          # before the sudo re-exec, while the session vars exist
     require_root "$@"
 
+    # --winapps-remove / --winapps-vm-remove are teardown-only: go straight to
+    # the removal and stop. Without this they fall through to action_guided_setup,
+    # which would prompt for an AD backend and install packages before ever
+    # reaching winapps_remove at the end of configure_winapps.
+    if (( WINAPPS_REMOVE )); then
+        print_system_header
+        winapps_remove
+        exit $?
+    fi
+
     if menu_wanted; then
         while true; do
             if ! run_menu; then
