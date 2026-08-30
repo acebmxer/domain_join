@@ -18,6 +18,15 @@ changed — not that an artefact was published anywhere.
 
 ### Added
 
+- **`libvirt_group` in `windows-vm.conf`.** The AD group given `virt-manager`
+  access to the Windows guest — previously only a prompt or the
+  `--winapps-libvirt-group` flag — can now be written in the answer file. It is
+  the one setting in that file that is not part of the VM build; the file's
+  header and `--write-vm-config` sample say so. A `--winapps-libvirt-group` flag
+  still overrides it. Setting it to an explicit blank (`libvirt_group =`) means
+  "grant nobody, don't ask"; leaving the line out keeps the interactive prompt.
+  The `winapps-vm-deploy` helper reads the same file and now skips the key
+  instead of aborting on an unknown setting.
 - **`windows-vm.conf` — answers for the unattended Windows install.** The
   edition, product key, computer name, locale settings and the local
   administrator account and password now come from a config file instead of

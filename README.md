@@ -909,7 +909,8 @@ The libvirt backend fixes this once, for a whole group:
 So the socket is *reachable* by anyone local, but *management* still goes
 through polkit. The step asks which group — defaulting to the realm's
 `permitted-groups` (the group named in the login-access question) — or takes it
-from `--winapps-libvirt-group 'Linux Admins@corp.example.com'`. Leave it blank
+from `--winapps-libvirt-group 'Linux Admins@corp.example.com'` or a
+`libvirt_group` line in [`windows-vm.conf`](#windows-vmconf). Leave it blank
 to skip: access then stays with the local `libvirt` group only. Group
 membership is read at login, so a user already signed in must log out and back
 in. Revoke by deleting the rule file. Needs polkit with JavaScript rules
@@ -955,9 +956,13 @@ ui_language   = en-GB
 system_locale = en-GB
 user_locale   = en-GB
 input_locale  = 0809:00000809
+
+# WinApps wiring — not a build answer
+libvirt_group = Domain Admins
 ```
 
-Everything below the sizing block goes straight into `Autounattend.xml`:
+Everything between the sizing block and `libvirt_group` goes straight into
+`Autounattend.xml`:
 
 | Setting | Unattend setting | Default |
 |---|---|---|
@@ -973,10 +978,17 @@ Everything below the sizing block goes straight into `Autounattend.xml`:
 | `user_locale` | `UserLocale` | follows `ui_language` |
 | `input_locale` | `InputLocale` | `0409:00000409` |
 
+One more setting, `libvirt_group`, is **not** a build answer — it is the AD
+group given `virt-manager` access to the finished guest
+([above](#opening-the-vm-in-virt-manager)), otherwise only a prompt or
+`--winapps-libvirt-group`. Setting it blank (`libvirt_group =`) grants nobody
+and skips the prompt; leaving the line out keeps the prompt. `winapps-vm-deploy`
+reads the same file and ignores this key.
+
 That is the whole vocabulary. Anything else is an error naming the file and
-line, not a setting quietly ignored. **This file covers the VM build and nothing
-else**; the domain join, Duo, sudo and package selection stay on the flags and
-the menu where they were.
+line, not a setting quietly ignored. Apart from `libvirt_group`, **this file
+covers the VM build and nothing else**; the domain join, Duo, sudo and package
+selection stay on the flags and the menu where they were.
 
 A few of these have sharp edges worth knowing:
 

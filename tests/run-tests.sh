@@ -1335,6 +1335,7 @@ vmc_read() {
       OPT_WINAPPS_ISO=""; OPT_WINAPPS_VM=""; OPT_WINAPPS_VM_ADMIN=""
       OPT_WINAPPS_VM_PASS=""; OPT_WINAPPS_VM_RAM=""; OPT_WINAPPS_VM_CPUS=""
       OPT_WINAPPS_VM_DISK=""
+      OPT_WINAPPS_LIBVIRT_GROUP=""; VM_CONF_HAS_LIBVIRT_GROUP=0
       vm_conf_load >/dev/null 2>&1 || exit 1
       local out="" v
       for v in "$@"; do out+="${!v}|"; done
@@ -1359,6 +1360,14 @@ check "quotes preserve a trailing space" "pass " \
       "$(vmc_read 'password = "pass "' OPT_WINAPPS_VM_PASS)"
 check "a CRLF line ending is tolerated" "Win11" \
       "$(vmc_read "$(printf 'vm_name = Win11\r')" OPT_WINAPPS_VM)"
+check "the libvirt group is read" "Domain Admins" \
+      "$(vmc_read 'libvirt_group = Domain Admins' OPT_WINAPPS_LIBVIRT_GROUP)"
+check "libvirt-group with a hyphen is the same key" "Domain Admins" \
+      "$(vmc_read 'libvirt-group = Domain Admins' OPT_WINAPPS_LIBVIRT_GROUP)"
+# A blank value is legal here (it means "grant nobody, don't prompt"), but the
+# key must still be recorded as seen so configure_winapps skips the prompt.
+check "a blank libvirt_group is still recorded" "|1" \
+      "$(vmc_read 'libvirt_group =' OPT_WINAPPS_LIBVIRT_GROUP VM_CONF_HAS_LIBVIRT_GROUP)"
 
 # Bad input must stop the run, naming the file and line.
 vmc_rejects() {
@@ -1449,6 +1458,17 @@ check "--no-vm-config ignores the file" "|" \
 check "--vm-config is picked out before the flags" "$VMC_TMP/p.conf" \
       "$( vm_conf_prescan --winapps --vm-config "$VMC_TMP/p.conf" --winapps-deploy
           printf '%s' "$VM_CONF_FILE" )"
+printf 'libvirt_group = From File\n' > "$VMC_TMP/lg.conf"
+chmod 600 "$VMC_TMP/lg.conf"
+check "--winapps-libvirt-group beats the file" "From Flag" \
+      "$( OPT_WINAPPS_LIBVIRT_GROUP=""; VM_CONF_FILE="$VMC_TMP/lg.conf"
+          vm_conf_load >/dev/null 2>&1
+          parse_args --winapps-libvirt-group "From Flag" >/dev/null 2>&1
+          printf '%s' "$OPT_WINAPPS_LIBVIRT_GROUP" )"
+check "the file supplies the libvirt group when no flag does" "From File" \
+      "$( OPT_WINAPPS_LIBVIRT_GROUP=""; VM_CONF_FILE="$VMC_TMP/lg.conf"
+          vm_conf_load >/dev/null 2>&1
+          printf '%s' "$OPT_WINAPPS_LIBVIRT_GROUP" )"
 
 section "windows-vm.conf: --write-vm-config and the sample"
 VMC_WROTE="$VMC_TMP/written.conf"
@@ -1611,6 +1631,17 @@ au_deploy_rejects "an all-digit computer name" 'computer_name = 12345'
 au_deploy_rejects "a bogus language tag"       'ui_language = english'
 au_deploy_rejects "an unknown setting"         'domain = corp.example.com'
 au_deploy_rejects "a bad account name"         'admin = Bad Name'
+
+# libvirt_group is not a build setting, but the deployer reads the same file and
+# must skip it rather than abort on an "unknown setting".
+if ( printf 'libvirt_group = Domain Admins\nvm_name = OK\n' > "$AU_TMP/vm.conf"
+     WINDOWS_VM_CONF="$AU_TMP/vm.conf"
+     eval "$(sed -n '/^VM_NAME=/,/^\[ "\${#VM_ADMIN}" -le 20 \]/p' "$AU_TMP/deploy.sh")"
+   ) >/dev/null 2>&1; then
+    printf '  %s the builder ignores libvirt_group\n' "$(green PASS)"; ((PASS++))
+else
+    printf '  %s the builder choked on libvirt_group\n' "$(red FAIL)"; ((FAIL++))
+fi
 
 rm -rf "$AU_TMP"
 

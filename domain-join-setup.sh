@@ -235,20 +235,24 @@ fetch_url() {
 # to call the guest, the local administrator account it creates, and how big to
 # make it. They can be written down once in a file instead.
 #
-# This file covers the Windows VM build and nothing else. Everything else the
-# installer does - the domain join, Duo, sudo, packages - stays on the flags
-# and the menu where it was.
+# This file covers the Windows VM build, plus the one WinApps wiring setting
+# that is otherwise only a prompt - 'libvirt_group', the AD group given
+# virt-manager access to the guest. Everything else the installer does - the
+# domain join, Duo, sudo, packages - stays on the flags and the menu where it
+# was.
 #
 # Precedence, highest first:
 #
 #   1. a command line flag, for that one run
-#   2. WINAPPS_VM_PASS in the environment
+#   2. WINAPPS_VM_PASS in the environment (the password only)
 #   3. this file
 #   4. the built-in default, or the interactive prompt
 VM_CONF_FILE=""         # --vm-config FILE, else the first of vm_conf_search
 VM_CONF_ENABLED=1       # --no-vm-config turns it off
 VM_CONF_LOADED_FROM=""  # the file actually read
 VM_CONF_HAS_SECRET=0    # set when the file carried the administrator password
+VM_CONF_HAS_LIBVIRT_GROUP=0  # set when the file carried 'libvirt_group' (any
+                             # value, blank included) - suppresses the prompt
 WRITE_VM_CONF=0         # --write-vm-config: emit a commented sample and exit
 WRITE_VM_CONF_PATH=""
 
@@ -333,6 +337,13 @@ vm_conf_set() {
         cpus)     vm_conf_int OPT_WINAPPS_VM_CPUS "$val" "$key" "$where" ;;
         disk)     vm_conf_int OPT_WINAPPS_VM_DISK "$val" "$key" "$where" ;;
 
+        # WinApps wiring, not a build answer: the AD group given virt-manager
+        # access to qemu:///system. Recording that the key was seen - even blank
+        # - is what tells configure_winapps not to prompt. A --winapps-libvirt-group
+        # flag still overrides, because parse_args runs after this.
+        libvirt_group) VM_CONF_HAS_LIBVIRT_GROUP=1
+                       OPT_WINAPPS_LIBVIRT_GROUP="$val" ;;
+
         edition)       OPT_VM_EDITION="$val" ;;
         product_key)   vm_conf_product_key "$val" "$key" "$where" ;;
         computer_name) vm_conf_computer_name "$val" "$key" "$where" ;;
@@ -349,9 +360,9 @@ vm_conf_set() {
 
         *) err "$where: unknown setting '$key'."
            note "This file takes the VM's own settings - iso, vm_name, ram, cpus, disk -"
-           note "and the Windows answers: edition, product_key, computer_name, admin,"
+           note "the Windows answers: edition, product_key, computer_name, admin,"
            note "password, owner, organization, timezone, ui_language, system_locale,"
-           note "user_locale, input_locale. Nothing else."
+           note "user_locale, input_locale - and libvirt_group. Nothing else."
            note "'--write-vm-config' writes a commented copy listing all of them."
            exit 2 ;;
     esac
@@ -423,7 +434,7 @@ vm_conf_load() {
     return 0
 }
 
-# vm_conf_write_sample [path] - a commented file with all seven settings in it,
+# vm_conf_write_sample [path] - a commented file with every setting in it,
 # switched off, so the names are discoverable without reading the script.
 vm_conf_write_sample() {
     local target="${1:-}" dir
@@ -451,11 +462,12 @@ vm_conf_write_sample() {
 # windows-vm.conf - answers for the unattended Windows install
 #
 # Read by domain-join-setup.sh when it builds the WinApps Windows VM, and by
-# the winapps-vm-deploy helper it installs. It covers the VM build and nothing
-# else: the domain join, Duo and everything else stay on the flags and the menu.
+# the winapps-vm-deploy helper it installs. It covers the VM build, plus one
+# WinApps wiring setting - 'libvirt_group' - that is otherwise only a prompt.
+# The domain join, Duo and everything else stay on the flags and the menu.
 #
-# The settings below the sizing block go straight into Autounattend.xml, and
-# each one names the Windows unattend setting it becomes.
+# The settings between the sizing block and 'libvirt_group' go straight into
+# Autounattend.xml, and each one names the Windows unattend setting it becomes.
 #
 # Uncomment what you want to set. Anything left commented out keeps the default
 # shown, or is asked for during the build.
@@ -588,6 +600,24 @@ vm_conf_write_sample() {
 # tag such as en-GB works too, and several can be given separated by ';'.
 #                                                      unattend: InputLocale
 #input_locale = 0409:00000409
+
+
+#=============================================================================
+# WinApps wiring (libvirt backend only)
+#=============================================================================
+
+# The Active Directory group whose members may open and control the Windows
+# guest in virt-manager. A domain account is in no local group, so it cannot
+# reach the system libvirt socket by default; naming a group here writes a
+# polkit rule granting it 'org.libvirt.*' with no password. This is the only
+# setting in this file that is not part of the VM build.
+#
+# Set but blank ('libvirt_group =') means "grant nobody, don't ask" - the same
+# as pressing Enter on a blank answer at the prompt. Leave the line commented
+# out entirely and the build asks, defaulting to the realm's permitted-groups.
+# Use the exact spelling 'realm list' shows (it may include an '@domain').
+#                                                flag: --winapps-libvirt-group
+#libvirt_group = Domain Admins
 VM_CONF_SAMPLE_EOF
 
     if [[ ! -s "$target" ]]; then
@@ -4081,6 +4111,7 @@ if [ -f "$VM_CONF" ] && [ -r "$VM_CONF" ]; then
             system_locale) [ -z "$VM_SYSLOCALE" ] && VM_SYSLOCALE="$_val" ;;
             user_locale)   [ -z "$VM_USRLOCALE" ] && VM_USRLOCALE="$_val" ;;
             input_locale)  [ -z "$VM_INPUT" ]     && VM_INPUT="$_val" ;;
+            libvirt_group) ;;   # read by domain-join-setup.sh, not a build setting
             *) echo "$VM_CONF: unknown setting '$_key'" >&2; exit 2 ;;
         esac
     done < "$VM_CONF"
@@ -5406,7 +5437,8 @@ configure_winapps() {
 
     # --- Domain-user access to qemu:///system (libvirt backend only) ------
     if [[ "$OPT_WINAPPS_BACKEND" == "libvirt" ]]; then
-        if [[ -z "$OPT_WINAPPS_LIBVIRT_GROUP" && $ASSUME_YES -ne 1 ]]; then
+        if [[ -z "$OPT_WINAPPS_LIBVIRT_GROUP" && $ASSUME_YES -ne 1 \
+              && $VM_CONF_HAS_LIBVIRT_GROUP -ne 1 ]]; then
             local dflt
             dflt="$(winapps_default_libvirt_group)"
             printf '\n'
@@ -7002,7 +7034,8 @@ ${C_BOLD}WINDOWS APPLICATIONS (WINAPPS)${C_RESET}
       --winapps-libvirt-group G
                           AD group whose members may open the local Windows VM
                           in virt-manager (qemu:///system). Defaults to the
-                          realm's permitted-logins group; blank skips it.
+                          realm's permitted-logins group; blank skips it. Also
+                          settable as 'libvirt_group' in windows-vm.conf.
       --winapps-domain D  RDP_DOMAIN (default: the realm this machine joined).
       --winapps-creds M   askpass  - prompt each user for their own AD password
                           kerberos - single sign-on from the user's ticket
@@ -7032,9 +7065,10 @@ Building the Windows guest (libvirt backend only):
 These answers can be written down once instead of typed each time:
 
       --write-vm-config [F]  Write a commented windows-vm.conf and exit. It
-                           holds the seven unattended-install settings - iso,
-                           vm_name, admin, password, ram, cpus, disk - and
-                           nothing else. Defaults to a file beside this script.
+                           holds the unattended-install settings - iso, vm_name,
+                           admin, password, ram, cpus, disk and the Windows
+                           answers - plus 'libvirt_group'. Defaults to a file
+                           beside this script.
       --vm-config FILE     Read those settings from FILE.
       --no-vm-config       Ignore any windows-vm.conf that would be found.
 

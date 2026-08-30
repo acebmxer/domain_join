@@ -2,11 +2,12 @@
 # windows-vm.conf - answers for the unattended Windows install
 #
 # Read by domain-join-setup.sh when it builds the WinApps Windows VM, and by
-# the winapps-vm-deploy helper it installs. It covers the VM build and nothing
-# else: the domain join, Duo and everything else stay on the flags and the menu.
+# the winapps-vm-deploy helper it installs. It covers the VM build, plus one
+# WinApps wiring setting - 'libvirt_group' - that is otherwise only a prompt.
+# The domain join, Duo and everything else stay on the flags and the menu.
 #
-# The settings below the sizing block go straight into Autounattend.xml, and
-# each one names the Windows unattend setting it becomes.
+# The settings between the sizing block and 'libvirt_group' go straight into
+# Autounattend.xml, and each one names the Windows unattend setting it becomes.
 #
 # Uncomment what you want to set. Anything left commented out keeps the default
 # shown, or is asked for during the build.
@@ -139,3 +140,21 @@
 # tag such as en-GB works too, and several can be given separated by ';'.
 #                                                      unattend: InputLocale
 #input_locale = 0409:00000409
+
+
+#=============================================================================
+# WinApps wiring (libvirt backend only)
+#=============================================================================
+
+# The Active Directory group whose members may open and control the Windows
+# guest in virt-manager. A domain account is in no local group, so it cannot
+# reach the system libvirt socket by default; naming a group here writes a
+# polkit rule granting it 'org.libvirt.*' with no password. This is the only
+# setting in this file that is not part of the VM build.
+#
+# Set but blank ('libvirt_group =') means "grant nobody, don't ask" - the same
+# as pressing Enter on a blank answer at the prompt. Leave the line commented
+# out entirely and the build asks, defaulting to the realm's permitted-groups.
+# Use the exact spelling 'realm list' shows (it may include an '@domain').
+#                                                flag: --winapps-libvirt-group
+#libvirt_group = Domain Admins
