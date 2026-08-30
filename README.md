@@ -1140,6 +1140,37 @@ emitting an empty one, which Setup treats differently; that a value containing
 The Windows account name is checked against every character Windows refuses,
 because an answer file it dislikes produces no account rather than an error.
 
+## Releases
+
+The version a checkout believes it is lives in `SCRIPT_VERSION` near the top of
+`domain-join-setup.sh`:
+
+```bash
+./domain-join-setup.sh --version
+# domain-join-setup 1.4.0
+```
+
+Versions follow [Semantic Versioning](https://semver.org/) — the major number
+for a change that breaks an existing flag or config file, the minor for a new
+menu entry or option, the patch for a fix that changes nothing about how the
+script is driven. Every version has an entry in [CHANGELOG.md](CHANGELOG.md) and
+an annotated git tag, so `git show v1.3.0:domain-join-setup.sh` prints a script
+whose own `--version` agrees with the tag it came from.
+
+There is no packaging step and nothing is published anywhere: cutting a release
+means bumping `SCRIPT_VERSION`, moving the **Unreleased** section of the
+changelog under the new number with today's date, committing, and tagging that
+commit.
+
+```bash
+git tag -a v1.5.0 -m "domain-join-setup 1.5.0"
+git push origin v1.5.0
+```
+
+Machines stay current through the script's own update check rather than through
+tags — see `--update` and `--no-update-check` — which fast-forwards the checkout
+from its remote. A tag is for reading history, not for delivery.
+
 ## License
 
 MIT
