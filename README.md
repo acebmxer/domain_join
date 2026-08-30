@@ -207,6 +207,10 @@ Windows applications (WinApps):
       --winapps-vm-ram N  Guest RAM in MiB  (default 4096)
       --winapps-vm-cpus N Guest vCPUs       (default 4)
       --winapps-vm-disk N Guest disk in GiB (default 64)
+      --winapps-vm-user U Local administrator account created inside the guest
+      --write-vm-config   Write a commented windows-vm.conf and exit
+      --vm-config FILE    Read the VM's unattended-install answers from FILE
+      --no-vm-config      Ignore any windows-vm.conf that would be found
 ```
 
 The secret key is also read from the `DUO_SKEY` environment variable, which
@@ -832,9 +836,9 @@ With the **libvirt** backend the script can stand up the Windows guest itself
   QEMU agent installed on first boot
 - **Remote Desktop and RemoteApp** switched on, idle sleep disabled, the LAN set
   to a private profile
-- a local administrator account (`WINAPPS_VM_PASS`, or a random password printed
-  once), `q35` + UEFI + an emulated TPM 2.0, and the Windows 11 hardware checks
-  bypassed in the answer file so it installs regardless of host firmware
+- a **local administrator account** inside the guest — see below — `q35` + UEFI
+  + an emulated TPM 2.0, and the Windows 11 hardware checks bypassed in the
+  answer file so it installs regardless of host firmware
 - `virsh autostart` on, so WinApps can wake it
 
 Supply the install media with `--winapps-iso FILE`. This has to be the full
@@ -849,6 +853,140 @@ from time to time, so a local ISO is more reliable. ISOs are cached under
 
 Size it with `--winapps-vm-ram` (MiB, default 4096), `--winapps-vm-cpus`
 (default 4) and `--winapps-vm-disk` (GiB, default 64).
+
+#### The account inside the guest
+
+The unattended install creates one **local Windows account** and makes it an
+administrator. This is a Windows account on that VM, not a domain one: it is
+what you sign in with to finish setting the machine up, and — until you join the
+guest to the domain — the only account on it.
+
+The name is checked before it goes anywhere near the answer file: 20 characters
+or fewer, no spaces, no trailing dot, and none of `" / \ [ ] : ; | = , + * ? <
+> @`. Windows does not fail loudly on a name it dislikes — Setup simply creates
+no account, and the first sign of trouble is a VM nobody can log into.
+
+The password has **no flag**, deliberately: a flag is readable in `ps` by every
+user on the machine for as long as the build runs. Set it in `windows-vm.conf`
+below, or in `WINAPPS_VM_PASS`, or let the build generate one — that one is
+printed once, at the end, and stored nowhere.
+
+This account is **not** what WinApps connects as by default. In the recommended
+`askpass` mode each user connects as themselves with their own AD credentials,
+which is what lands them in their own Windows profile. Only
+`--winapps-creds shared` connects everyone as one fixed account, and that
+account can be this one.
+
+#### `windows-vm.conf`
+
+The answers the unattended install needs can be written down once instead of
+retyped every build:
+
+```bash
+./domain-join-setup.sh --write-vm-config
+```
+
+writes a commented `windows-vm.conf` next to the script, **mode `0600`** because
+it can hold the administrator password. A blank copy is committed here as
+[`windows-vm.conf.example`](windows-vm.conf.example) — `cp` it if you prefer,
+but `cp` does not give you `0600`:
+
+```bash
+cp windows-vm.conf.example windows-vm.conf
+chmod 600 windows-vm.conf
+```
+
+```ini
+# The VM itself
+iso           = /srv/iso/Win11_24H2_English_x64.iso
+vm_name       = RDPWindows
+ram           = 8192
+cpus          = 6
+disk          = 120
+
+# The answers Windows Setup asks for
+edition       = Windows 11 Pro
+product_key   = XXXXX-XXXXX-XXXXX-XXXXX-XXXXX
+computer_name = WIN11-LAB
+admin         = winadmin
+password      = choose something long
+owner         = Example User
+organization  = Example Ltd
+timezone      = Eastern Standard Time
+ui_language   = en-GB
+system_locale = en-GB
+user_locale   = en-GB
+input_locale  = 0809:00000809
+```
+
+Everything below the sizing block goes straight into `Autounattend.xml`:
+
+| Setting | Unattend setting | Default |
+|---|---|---|
+| `edition` | `/IMAGE/NAME` | Windows 11 Pro |
+| `product_key` | `ProductKey` | the generic Pro key |
+| `computer_name` | `ComputerName` | `*` — Setup generates one |
+| `admin`, `password` | `LocalAccount`, `AutoLogon` | `Docker`, random |
+| `owner` | `RegisteredOwner` | omitted |
+| `organization` | `RegisteredOrganization` | omitted |
+| `timezone` | `TimeZone` | `UTC` |
+| `ui_language` | `SetupUILanguage`, `UILanguage` | `en-US` |
+| `system_locale` | `SystemLocale` | follows `ui_language` |
+| `user_locale` | `UserLocale` | follows `ui_language` |
+| `input_locale` | `InputLocale` | `0409:00000409` |
+
+That is the whole vocabulary. Anything else is an error naming the file and
+line, not a setting quietly ignored. **This file covers the VM build and nothing
+else**; the domain join, Duo, sudo and package selection stay on the flags and
+the menu where they were.
+
+A few of these have sharp edges worth knowing:
+
+- **`product_key`** is not about activation. Setup needs a key of the right
+  edition to get past its own prompt without a human, so the build supplies
+  Microsoft's published generic Windows Pro key by default — it selects the
+  edition and nothing more. Change `edition` away from Pro and no key is
+  guessed for you: set `product_key`, or Setup will stop and ask. The build
+  says so when that happens rather than letting you find out 20 minutes in.
+- **`edition`** must be spelled the way the ISO spells it, since Setup matches
+  it against `/IMAGE/NAME`. `dism /Get-WimInfo /WimFile:…/sources/install.wim`
+  lists what a given ISO actually carries.
+- **`timezone`** is a *Windows* time zone name, not an IANA one — `Eastern
+  Standard Time`, not `America/New_York`. `tzutil /l` inside any Windows box
+  lists them. The default is `UTC`, which is predictable but probably not what
+  you want on a desktop you will look at.
+- **`ui_language`** only works if the ISO carries that language; a Windows ISO
+  is normally single-language. `system_locale` and `user_locale` work
+  regardless, which is why they are separate — an `en-GB` ISO is rare, but
+  British date formats on a US ISO are one line.
+- **`computer_name`** follows NetBIOS rules: 15 characters or fewer, letters
+  digits and hyphens, never all digits.
+
+Every one of these is validated before it reaches the answer file, and values
+are XML-escaped, so an organization named `Smith & Sons` does not produce a
+malformed `Autounattend.xml` that Setup ignores in silence.
+
+A `#` starts a comment only at the **start** of a line, so a password containing
+one needs no quoting. The file is read as data, never `source`d — it is parsed
+as root, and an answer file has no business running commands.
+
+Without `--vm-config`, the first of these that exists is read, and the run says
+which one it used:
+
+| Looked for | Why |
+|---|---|
+| `$WINDOWS_VM_CONF` | An explicit override for one run |
+| the directory holding the script | Travels with a copied checkout |
+| `/etc/winapps/windows-vm.conf` | Where the installer's other WinApps files live |
+
+A flag beats the file; `WINAPPS_VM_PASS` in the environment beats it too.
+`--no-vm-config` ignores any file that would have been found. `windows-vm.conf`
+is in `.gitignore`, so your filled-in copy will not follow the checkout to
+GitHub.
+
+`winapps-vm-deploy` reads the same file, so a later
+`sudo winapps-vm-deploy --force` rebuilds the guest with the settings that built
+it the first time.
 
 **What it does not do:** anything domain-related. The guest comes up in a
 workgroup; join it to Active Directory yourself (`sysdm.cpl`, or `Add-Computer`
@@ -977,6 +1115,30 @@ before the stack when it is not; that a second run adds no second copy; that a
 PAM file's mode survives the rewrite and `--dry-run` never touches the disk; that
 removal refuses to empty a PAM file; and that the secret key stays out of the
 `--dry-run` transcript while the config file is created mode `0600`.
+
+`windows-vm.conf` is covered the same way, since a build driven from a file is
+only as good as the parser reading it: that whitespace, quotes, comments, CRLF
+line endings and a `#` inside a password are handled the way the file's own
+header claims; that an unknown name, a name belonging to some other part of the
+installer, a missing `=` and a non-numeric size each stop the run naming the
+file and line; that a flag beats the file and `WINAPPS_VM_PASS` beats it too;
+that `--no-vm-config` really ignores it; and that the committed
+`windows-vm.conf.example` is byte-identical to what `--write-vm-config`
+produces, carries no uncommented setting, and mentions no name the parser would
+reject. Malformed product keys, over-long and all-digit computer names and
+bogus language tags are each rejected — by the installer *and* by the standalone
+builder, which has its own copy of the parser.
+
+`Autounattend.xml` is then rendered for real and read back, because that is
+where a wrong value costs 45 minutes rather than a second: that an empty
+settings file produces exactly the answer file the script produced before any of
+this existed; that each setting reaches the unattend element it claims to;
+that `system_locale` and `user_locale` follow `ui_language` when unset; that an
+edition with no key of its own leaves `ProductKey` out altogether rather than
+emitting an empty one, which Setup treats differently; that a value containing
+`&` or `<` comes out escaped; and that the result parses as XML in every case.
+The Windows account name is checked against every character Windows refuses,
+because an answer file it dislikes produces no account rather than an error.
 
 ## License
 

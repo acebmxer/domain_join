@@ -1166,7 +1166,11 @@ check_line "it authors an unattended answer file"  'Autounattend.xml'        "$W
 # specialize/oobeSystem passes ("not a valid unattended Setup answer file",
 # 0x80220003) and the install dies with "computer restarted unexpectedly".
 check_line "its answer-file components are signed" 'publicKeyToken="31bf3856ad364e35"' "$WINAPPS_VM_DEPLOYER"
-check_line "it installs Windows 11 Pro"            '<Value>Windows 11 Pro</Value>' "$WINAPPS_VM_DEPLOYER"
+# The edition is a variable now, defaulted rather than hardcoded; that the
+# default really is Windows 11 Pro is checked against the rendered answer file
+# in "Autounattend.xml carries the answers" below.
+check_line "it installs the configured edition"   '<Value>$X_EDITION</Value>' "$WINAPPS_VM_DEPLOYER"
+check_line "the edition defaults to Windows 11 Pro" 'VM_EDITION="${VM_EDITION:-Windows 11 Pro}"' "$WINAPPS_VM_DEPLOYER"
 check_line "it bypasses the Win11 hardware checks" 'BypassTPMCheck'          "$WINAPPS_VM_DEPLOYER"
 check_line "it enables Remote Desktop"             'fDenyTSConnections'      "$WINAPPS_VM_DEPLOYER"
 check_line "it imports the RemoteApp registry"     'RDPApps.reg'             "$WINAPPS_VM_DEPLOYER"
@@ -1199,6 +1203,327 @@ else
 fi
 
 rm -rf "$WA_TMP"
+
+section "windows-vm.conf: parsing"
+VMC_TMP="$(mktemp -d)"
+vmc_read() {
+    local body="$1"; shift
+    printf '%s\n' "$body" > "$VMC_TMP/t.conf"
+    chmod 600 "$VMC_TMP/t.conf"
+    ( VM_CONF_FILE="$VMC_TMP/t.conf"; VM_CONF_HAS_SECRET=0
+      OPT_WINAPPS_ISO=""; OPT_WINAPPS_VM=""; OPT_WINAPPS_VM_ADMIN=""
+      OPT_WINAPPS_VM_PASS=""; OPT_WINAPPS_VM_RAM=""; OPT_WINAPPS_VM_CPUS=""
+      OPT_WINAPPS_VM_DISK=""
+      vm_conf_load >/dev/null 2>&1 || exit 1
+      local out="" v
+      for v in "$@"; do out+="${!v}|"; done
+      printf '%s' "${out%|}" )
+}
+check "the ISO path is read"      "/srv/w.iso" "$(vmc_read 'iso = /srv/w.iso' OPT_WINAPPS_ISO)"
+check "the guest name is read"    "Win11"      "$(vmc_read 'vm_name = Win11' OPT_WINAPPS_VM)"
+check "the admin account is read" "winadmin"   "$(vmc_read 'admin = winadmin' OPT_WINAPPS_VM_ADMIN)"
+check "the password is read"      "hunter2!"   "$(vmc_read 'password = hunter2!' OPT_WINAPPS_VM_PASS)"
+check "the sizes are read"        "8192|6|120" \
+      "$(vmc_read 'ram = 8192
+cpus = 6
+disk = 120' OPT_WINAPPS_VM_RAM OPT_WINAPPS_VM_CPUS OPT_WINAPPS_VM_DISK)"
+check "whitespace around = is ignored" "Win11" "$(vmc_read '   vm_name=Win11   ' OPT_WINAPPS_VM)"
+check "comments and blank lines are skipped" "Win11" \
+      "$(vmc_read '# a comment
+
+vm_name = Win11' OPT_WINAPPS_VM)"
+check "a '#' inside a password is not a comment" 'P@ss#word' \
+      "$(vmc_read 'password = P@ss#word' OPT_WINAPPS_VM_PASS)"
+check "quotes preserve a trailing space" "pass " \
+      "$(vmc_read 'password = "pass "' OPT_WINAPPS_VM_PASS)"
+check "a CRLF line ending is tolerated" "Win11" \
+      "$(vmc_read "$(printf 'vm_name = Win11\r')" OPT_WINAPPS_VM)"
+
+# Bad input must stop the run, naming the file and line.
+vmc_rejects() {
+    local desc="$1" body="$2"
+    printf '%s\n' "$body" > "$VMC_TMP/t.conf"
+    if ( VM_CONF_FILE="$VMC_TMP/t.conf"; vm_conf_load ) >/dev/null 2>&1; then
+        printf '  %s %s was accepted\n' "$(red FAIL)" "$desc"; ((FAIL++))
+    else
+        printf '  %s %s is rejected\n' "$(green PASS)" "$desc"; ((PASS++))
+    fi
+}
+vmc_rejects "an unknown setting"        'isoo = /x.iso'
+vmc_rejects "a setting from elsewhere"  'domain = corp.example.com'
+vmc_rejects "a line with no '='"        'iso'
+vmc_rejects "a non-numeric size"        'ram = lots'
+if ( VM_CONF_FILE="$VMC_TMP/nope.conf"; vm_conf_load ) >/dev/null 2>&1; then
+    printf '  %s a missing --vm-config file was accepted\n' "$(red FAIL)"; ((FAIL++))
+else
+    printf '  %s a missing --vm-config file is an error\n' "$(green PASS)"; ((PASS++))
+fi
+
+section "windows-vm.conf: the Windows answers"
+vmc_read2() {
+    local body="$1"; shift
+    printf '%s\n' "$body" > "$VMC_TMP/t.conf"
+    chmod 600 "$VMC_TMP/t.conf"
+    ( VM_CONF_FILE="$VMC_TMP/t.conf"
+      OPT_VM_EDITION=""; OPT_VM_PRODUCT_KEY=""; OPT_VM_COMPUTER_NAME=""
+      OPT_VM_OWNER=""; OPT_VM_ORGANIZATION=""; OPT_VM_TIMEZONE=""
+      OPT_VM_UI_LANGUAGE=""; OPT_VM_SYSTEM_LOCALE=""; OPT_VM_USER_LOCALE=""
+      OPT_VM_INPUT_LOCALE=""
+      vm_conf_load >/dev/null 2>&1 || exit 1
+      local out="" v
+      for v in "$@"; do out+="${!v}|"; done
+      printf '%s' "${out%|}" )
+}
+check "the edition is read"       "Windows 11 Enterprise" \
+      "$(vmc_read2 'edition = Windows 11 Enterprise' OPT_VM_EDITION)"
+check "the product key is read"   "ABCDE-12345-FGHIJ-67890-KLMNO" \
+      "$(vmc_read2 'product_key = ABCDE-12345-FGHIJ-67890-KLMNO' OPT_VM_PRODUCT_KEY)"
+check "the computer name is read" "WIN11-LAB" \
+      "$(vmc_read2 'computer_name = WIN11-LAB' OPT_VM_COMPUTER_NAME)"
+check "'*' is an allowed computer name" "*" \
+      "$(vmc_read2 'computer_name = *' OPT_VM_COMPUTER_NAME)"
+check "owner and organization are read" "Example User|Example Ltd" \
+      "$(vmc_read2 'owner = Example User
+organization = Example Ltd' OPT_VM_OWNER OPT_VM_ORGANIZATION)"
+check "the time zone is read"     "Eastern Standard Time" \
+      "$(vmc_read2 'timezone = Eastern Standard Time' OPT_VM_TIMEZONE)"
+check "the locales are read"      "en-GB|de-DE|fr-FR|0809:00000809" \
+      "$(vmc_read2 'ui_language   = en-GB
+system_locale = de-DE
+user_locale   = fr-FR
+input_locale  = 0809:00000809' OPT_VM_UI_LANGUAGE OPT_VM_SYSTEM_LOCALE \
+        OPT_VM_USER_LOCALE OPT_VM_INPUT_LOCALE)"
+check "a bare language tag is an input locale" "en-GB" \
+      "$(vmc_read2 'input_locale = en-GB' OPT_VM_INPUT_LOCALE)"
+
+vmc_rejects "a malformed product key"      'product_key = ABCDE-12345'
+vmc_rejects "a computer name over 15"      'computer_name = WAY-TOO-LONG-A-NAME'
+vmc_rejects "an all-digit computer name"   'computer_name = 12345'
+vmc_rejects "a computer name with a space" 'computer_name = WIN 11'
+vmc_rejects "a bogus language tag"         'ui_language = english'
+vmc_rejects "a bogus user locale"          'user_locale = 12345'
+vmc_rejects "an empty time zone"           'timezone ='
+vmc_rejects "a bogus input locale"         'input_locale = ?!'
+
+section "windows-vm.conf: precedence"
+printf 'ram = 8192\npassword = fromfile\n' > "$VMC_TMP/p.conf"
+chmod 600 "$VMC_TMP/p.conf"
+check "a flag beats the file" "2048" \
+      "$( OPT_WINAPPS_VM_RAM=""; VM_CONF_FILE="$VMC_TMP/p.conf"
+          vm_conf_load >/dev/null 2>&1
+          parse_args --winapps-vm-ram 2048 >/dev/null 2>&1
+          printf '%s' "$OPT_WINAPPS_VM_RAM" )"
+check "WINAPPS_VM_PASS beats the file" "fromenv" \
+      "$( OPT_WINAPPS_VM_PASS="fromenv"     # as the WINAPPS_VM_PASS default would
+          VM_CONF_FILE="$VMC_TMP/p.conf"; vm_conf_load >/dev/null 2>&1
+          printf '%s' "$OPT_WINAPPS_VM_PASS" )"
+check "the file is used when nothing else supplies it" "fromfile" \
+      "$( OPT_WINAPPS_VM_PASS=""
+          VM_CONF_FILE="$VMC_TMP/p.conf"; vm_conf_load >/dev/null 2>&1
+          printf '%s' "$OPT_WINAPPS_VM_PASS" )"
+check "--no-vm-config ignores the file" "|" \
+      "$( OPT_WINAPPS_VM_RAM=""; vm_conf_prescan --no-vm-config
+          VM_CONF_FILE="$VMC_TMP/p.conf"; vm_conf_load >/dev/null 2>&1
+          printf '%s|%s' "$OPT_WINAPPS_VM_RAM" "$VM_CONF_LOADED_FROM" )"
+check "--vm-config is picked out before the flags" "$VMC_TMP/p.conf" \
+      "$( vm_conf_prescan --winapps --vm-config "$VMC_TMP/p.conf" --winapps-deploy
+          printf '%s' "$VM_CONF_FILE" )"
+
+section "windows-vm.conf: --write-vm-config and the sample"
+VMC_WROTE="$VMC_TMP/written.conf"
+if ( vm_conf_write_sample "$VMC_WROTE" ) >/dev/null 2>&1; then
+    printf '  %s --write-vm-config writes a file\n' "$(green PASS)"; ((PASS++))
+else
+    printf '  %s --write-vm-config failed\n' "$(red FAIL)"; ((FAIL++))
+fi
+check "it is created mode 0600" "600" "$(stat -c '%a' "$VMC_WROTE" 2>/dev/null)"
+if ( vm_conf_write_sample "$VMC_WROTE" ) >/dev/null 2>&1; then
+    printf '  %s --write-vm-config overwrote an existing file\n' "$(red FAIL)"; ((FAIL++))
+else
+    printf '  %s --write-vm-config refuses to overwrite\n' "$(green PASS)"; ((PASS++))
+fi
+# The sample committed to the repo is generated from the same heredoc, so it
+# cannot be allowed to drift away from what the script actually writes.
+VMC_SAMPLE="$SCRIPT_DIR/windows-vm.conf.example"
+if [[ -f "$VMC_SAMPLE" ]]; then
+    printf '  %s windows-vm.conf.example is committed\n' "$(green PASS)"; ((PASS++))
+    if diff -q "$VMC_SAMPLE" "$VMC_WROTE" >/dev/null 2>&1; then
+        printf '  %s the sample matches --write-vm-config\n' "$(green PASS)"; ((PASS++))
+    else
+        printf '  %s the sample has drifted from --write-vm-config\n' "$(red FAIL)"; ((FAIL++))
+        diff "$VMC_SAMPLE" "$VMC_WROTE" | head -10 | sed 's/^/        /'
+    fi
+    if grep -qE '^[a-z_]+[[:space:]]*=' "$VMC_SAMPLE"; then
+        printf '  %s the sample has an uncommented setting in it\n' "$(red FAIL)"; ((FAIL++))
+    else
+        printf '  %s every setting in the sample is commented out\n' "$(green PASS)"; ((PASS++))
+    fi
+    if grep -qE '/home/|/Users/' "$VMC_SAMPLE"; then
+        printf '  %s the sample contains a real home directory path\n' "$(red FAIL)"; ((FAIL++))
+    else
+        printf '  %s the sample carries no personal path\n' "$(green PASS)"; ((PASS++))
+    fi
+    # Every name it mentions must be one vm_conf_set accepts, and uncommenting
+    # the whole thing must parse.
+    VMC_BAD=""
+    while read -r n; do
+        grep -qE "^        $n\)" "$TARGET" || VMC_BAD+="$n "
+    done < <(sed -n 's/^#\([a-z_][a-z_0-9]*\)[[:space:]]*=.*/\1/p' "$VMC_SAMPLE" | sort -u)
+    check "every name in the sample is a real setting" "" "${VMC_BAD% }"
+    sed 's/^#\([a-z_][a-z_0-9]*[[:space:]]*=\)/\1/' "$VMC_SAMPLE" \
+        | grep -v '^#' | grep -v '^$' > "$VMC_TMP/all.conf"
+    chmod 600 "$VMC_TMP/all.conf"
+    if ( VM_CONF_FILE="$VMC_TMP/all.conf"; vm_conf_load ) >/dev/null 2>&1; then
+        printf '  %s every example value in the sample is valid\n' "$(green PASS)"; ((PASS++))
+    else
+        printf '  %s the sample holds a value it would reject\n' "$(red FAIL)"; ((FAIL++))
+        ( VM_CONF_FILE="$VMC_TMP/all.conf"; vm_conf_load ) 2>&1 | tail -2 | sed 's/^/        /'
+    fi
+else
+    printf '  %s windows-vm.conf.example is missing from the repo\n' "$(red FAIL)"; ((FAIL++))
+fi
+if have git && [[ -d "$SCRIPT_DIR/.git" ]]; then
+    git -C "$SCRIPT_DIR" check-ignore -q windows-vm.conf 2>/dev/null \
+        && { printf '  %s windows-vm.conf is gitignored\n' "$(green PASS)"; ((PASS++)); } \
+        || { printf '  %s windows-vm.conf is NOT gitignored\n' "$(red FAIL)"; ((FAIL++)); }
+    git -C "$SCRIPT_DIR" check-ignore -q windows-vm.conf.example 2>/dev/null \
+        && { printf '  %s the sample is gitignored and would never ship\n' "$(red FAIL)"; ((FAIL++)); } \
+        || { printf '  %s the sample is not gitignored\n' "$(green PASS)"; ((PASS++)); }
+fi
+
+section "Autounattend.xml carries the answers"
+# The answer file is where a wrong value costs 45 minutes, so it is rendered
+# for real and read back rather than checked by inspection.
+AU_TMP="$(mktemp -d)"
+mkdir -p "$AU_TMP/iso/oem"
+( DRY_RUN=0; WINAPPS_VM_DEPLOYER="$AU_TMP/deploy.sh"
+  winapps_install_file() { local d="$1"; shift; cat > "$d"; chmod 755 "$d"; }
+  winapps_write_vm_deployer ) >/dev/null 2>&1
+au_render() {
+    printf '%s\n' "$1" > "$AU_TMP/vm.conf"
+    chmod 600 "$AU_TMP/vm.conf"
+    rm -f "$AU_TMP/iso/Autounattend.xml"
+    ( WINDOWS_VM_CONF="$AU_TMP/vm.conf" ISO_ROOT="$AU_TMP/iso"
+      eval "$(sed -n '/^VM_NAME=/,/^\[ "\${#VM_ADMIN}" -le 20 \]/p' "$AU_TMP/deploy.sh")"
+      eval "$(sed -n '/^xesc()/,/^XML$/p' "$AU_TMP/deploy.sh")" ) >/dev/null 2>&1
+}
+au_has() {
+    local desc="$1" needle="$2"
+    if grep -qF -- "$needle" "$AU_TMP/iso/Autounattend.xml" 2>/dev/null; then
+        printf '  %s %s\n' "$(green PASS)" "$desc"; ((PASS++))
+    else
+        printf '  %s %s\n' "$(red FAIL)" "$desc"
+        printf '        %s not in the rendered answer file\n' "$needle"; ((FAIL++))
+    fi
+}
+au_wellformed() {
+    if python3 -c "import xml.dom.minidom,sys; xml.dom.minidom.parse(sys.argv[1])" \
+         "$AU_TMP/iso/Autounattend.xml" >/dev/null 2>&1; then
+        printf '  %s %s\n' "$(green PASS)" "$1"; ((PASS++))
+    else
+        printf '  %s %s\n' "$(red FAIL)" "$1"; ((FAIL++))
+    fi
+}
+
+# Defaults must render exactly what the script produced before any of this
+# existed - a settings file nobody has written must change nothing.
+au_render ''
+au_has "default edition is Windows 11 Pro" '<Value>Windows 11 Pro</Value>'
+au_has "default key is the generic Pro key" '<Key>W269N-WFGWX-YVC9B-4J6C9-T83GX</Key>'
+au_has "default computer name is generated" '<ComputerName>*</ComputerName>'
+au_has "default UI language is en-US"       '<UILanguage>en-US</UILanguage>'
+au_has "default input locale is US"         '<InputLocale>0409:00000409</InputLocale>'
+au_has "a time zone is always set"          '<TimeZone>UTC</TimeZone>'
+au_wellformed "the default answer file is well-formed XML"
+
+au_render 'edition       = Windows 11 Enterprise
+product_key   = ABCDE-12345-FGHIJ-67890-KLMNO
+computer_name = WIN11-LAB
+admin         = winadmin
+owner         = Example User
+organization  = Example Ltd
+timezone      = Eastern Standard Time
+ui_language   = en-GB
+input_locale  = 0809:00000809'
+au_has "the edition reaches /IMAGE/NAME"   '<Value>Windows 11 Enterprise</Value>'
+au_has "the product key reaches ProductKey" '<Key>ABCDE-12345-FGHIJ-67890-KLMNO</Key>'
+au_has "the computer name reaches the XML"  '<ComputerName>WIN11-LAB</ComputerName>'
+au_has "the time zone reaches the XML"      '<TimeZone>Eastern Standard Time</TimeZone>'
+au_has "the owner reaches the XML"          '<RegisteredOwner>Example User</RegisteredOwner>'
+au_has "the organization reaches the XML"   '<RegisteredOrganization>Example Ltd</RegisteredOrganization>'
+au_has "the keyboard reaches InputLocale"   '<InputLocale>0809:00000809</InputLocale>'
+au_has "the account reaches the XML"        '<Name>winadmin</Name>'
+# system_locale and user_locale were not set, so they follow ui_language.
+au_has "system_locale follows ui_language"  '<SystemLocale>en-GB</SystemLocale>'
+au_has "user_locale follows ui_language"    '<UserLocale>en-GB</UserLocale>'
+au_wellformed "a fully populated answer file is well-formed XML"
+
+# An edition with no key of its own must leave ProductKey out entirely rather
+# than emit an empty one, which Setup treats differently.
+au_render 'edition = Windows 11 Enterprise'
+if grep -q 'ProductKey' "$AU_TMP/iso/Autounattend.xml"; then
+    printf '  %s an empty ProductKey was emitted\n' "$(red FAIL)"; ((FAIL++))
+else
+    printf '  %s no key for that edition leaves ProductKey out\n' "$(green PASS)"; ((PASS++))
+fi
+au_wellformed "omitting ProductKey leaves well-formed XML"
+
+# A value with XML metacharacters must be escaped, not injected.
+au_render 'organization = Ampersand & <Sons>'
+au_has "XML metacharacters are escaped" '&amp; &lt;Sons&gt;'
+au_wellformed "an organization holding markup leaves well-formed XML"
+
+# The deployer must reject the same bad values the installer does.
+au_deploy_rejects() {
+    local desc="$1" body="$2"
+    printf '%s\n' "$body" > "$AU_TMP/vm.conf"
+    if ( WINDOWS_VM_CONF="$AU_TMP/vm.conf"
+         eval "$(sed -n '/^VM_NAME=/,/^\[ "\${#VM_ADMIN}" -le 20 \]/p' "$AU_TMP/deploy.sh")"
+       ) >/dev/null 2>&1; then
+        printf '  %s the builder accepted %s\n' "$(red FAIL)" "$desc"; ((FAIL++))
+    else
+        printf '  %s the builder rejects %s\n' "$(green PASS)" "$desc"; ((PASS++))
+    fi
+}
+au_deploy_rejects "a malformed product key"    'product_key = NOPE'
+au_deploy_rejects "an all-digit computer name" 'computer_name = 12345'
+au_deploy_rejects "a bogus language tag"       'ui_language = english'
+au_deploy_rejects "an unknown setting"         'domain = corp.example.com'
+au_deploy_rejects "a bad account name"         'admin = Bad Name'
+
+rm -rf "$AU_TMP"
+
+section "The VM's local administrator account"
+for good in Docker win-admin user_1 A; do
+    winapps_vm_admin_ok "$good" \
+        && { printf '  %s %s is accepted\n' "$(green PASS)" "$good"; ((PASS++)); } \
+        || { printf '  %s %s was rejected\n' "$(red FAIL)" "$good"; ((FAIL++)); }
+done
+for bad in "Win Admin" 'a\b' 'a"b' 'a:b' 'a;b' 'a|b' 'a=b' 'a,b' 'a+b' 'a*b' 'a?b' \
+           'a<b' 'a>b' 'a@b' 'a[b' 'a]b' 'a/b' 'trailingdot.' \
+           'ThisNameIsWayTooLongForWindows' ''; do
+    winapps_vm_admin_ok "$bad" \
+        && { printf '  %s "%s" was accepted\n' "$(red FAIL)" "$bad"; ((FAIL++)); } \
+        || { printf '  %s "%s" is rejected\n' "$(green PASS)" "$bad"; ((PASS++)); }
+done
+if ( parse_args --winapps-vm-user "Bad Name" ) >/dev/null 2>&1; then
+    printf '  %s --winapps-vm-user accepted a name with a space\n' "$(red FAIL)"; ((FAIL++))
+else
+    printf '  %s --winapps-vm-user rejects a name with a space\n' "$(green PASS)"; ((PASS++))
+fi
+check "--winapps-vm-user is stored" "win-admin" \
+      "$( OPT_WINAPPS_VM_ADMIN=""; parse_args --winapps-vm-user win-admin >/dev/null 2>&1
+          printf '%s' "$OPT_WINAPPS_VM_ADMIN" )"
+# A name the config file supplies has to be checked too, not just a flag.
+if ( printf 'admin = Bad Name\n' > "$VMC_TMP/t.conf"
+     VM_CONF_FILE="$VMC_TMP/t.conf"; vm_conf_load >/dev/null 2>&1
+     parse_args ) >/dev/null 2>&1; then
+    printf '  %s a bad name in windows-vm.conf was accepted\n' "$(red FAIL)"; ((FAIL++))
+else
+    printf '  %s a bad name in windows-vm.conf is rejected\n' "$(green PASS)"; ((PASS++))
+fi
+
+rm -rf "$VMC_TMP"
 
 section "CLI smoke tests"
 for args in "--help" "--version"; do
