@@ -29,6 +29,24 @@ changed — not that an artefact was published anywhere.
   filled-in `windows-vm.conf` is gitignored, so a real password never reaches
   GitHub. Tests cover the parser, the precedence rules and the rendered answer
   file. (`98d015a`)
+- **This changelog, and versioning for the project.** `CHANGELOG.md` records
+  every release back to the first commit, and annotated git tags `v1.0.0`,
+  `v1.2.0`, `v1.3.0` and `v1.4.0` were backfilled onto the commit where each
+  version stamp stopped being edited, so a tag and the `SCRIPT_VERSION` in the
+  script it points at always agree. A `Releases` section in the README explains
+  what the version numbers mean and how a release is cut.
+- **`LICENSE`.** The README had said MIT since the first commit without a
+  license file to back it, so the repository showed no license at all. Full MIT
+  text, Copyright (c) 2026 acebmxer.
+- **Badges in the README** — license, version, last commit, open issues, shell,
+  platform and the test count.
+
+### Fixed
+
+- The menu banner in the README was one column too wide: the title row's
+  interior measured 82 characters against an 81-character `╔═╗` border, so the
+  closing `║` sat one place past the corner. The README now uses the same
+  padding arithmetic the script does, which puts the odd column on the right.
 
 ## [1.4.0] — 2026-08-29
 

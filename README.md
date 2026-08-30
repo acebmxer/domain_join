@@ -1,5 +1,13 @@
 # domain-join-setup
 
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Version](https://img.shields.io/github/v/tag/acebmxer/domain_join?label=version&sort=semver&color=brightgreen)](CHANGELOG.md)
+[![Last commit](https://img.shields.io/github/last-commit/acebmxer/domain_join)](https://github.com/acebmxer/domain_join/commits)
+[![Issues](https://img.shields.io/github/issues/acebmxer/domain_join)](https://github.com/acebmxer/domain_join/issues)
+[![Shell: Bash](https://img.shields.io/badge/shell-bash-4EAA25?logo=gnubash&logoColor=white)](domain-join-setup.sh)
+[![Platform: Linux](https://img.shields.io/badge/platform-linux-333333?logo=linux&logoColor=white)](#supported-systems)
+[![Tests](https://img.shields.io/badge/tests-456-informational)](tests/run-tests.sh)
+
 An interactive installer that sets up everything a Linux workstation needs to
 join and live on an **Active Directory** domain — on multiple distributions and
 under any desktop environment.
@@ -23,7 +31,7 @@ step is still available as a flag for unattended runs.
 
 ```
  ╔═════════════════════════════════════════════════════════════════════════════════╗
- ║              Active Directory Domain Join - Setup and Configuration              ║
+ ║             Active Directory Domain Join - Setup and Configuration              ║
  ╚═════════════════════════════════════════════════════════════════════════════════╝
              Distribution    : Fedora Linux 44 (KDE Plasma Desktop Edition)
              Package manager : dnf5 (rhel family)
@@ -1173,4 +1181,4 @@ from its remote. A tag is for reading history, not for delivery.
 
 ## License
 
-MIT
+Released under the [MIT License](LICENSE) — Copyright (c) 2026 acebmxer.
