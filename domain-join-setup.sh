@@ -3592,6 +3592,8 @@ WINAPPS_AUTOSTART="/etc/xdg/autostart/winapps-user-config.desktop"
 WINAPPS_SKEL_DIR="/etc/skel/.config/winapps"
 WINAPPS_UPSTREAM_URL="https://raw.githubusercontent.com/winapps-org/winapps/main/setup.sh"
 WINAPPS_CONFIGURED=0
+WINAPPS_CDROMS_PENDING=0   # spare CD drives detached --config but still on the
+                          # running guest; cleared by a full power cycle
 
 # --winapps-deploy: building the Windows guest.
 WINAPPS_VM_DEPLOYER="/usr/local/bin/winapps-vm-deploy"
@@ -5051,6 +5053,16 @@ winapps_strip_vm_cdroms() {
             continue
         fi
 
+        # Eject the medium first, live, so the ISO drops off the running guest
+        # straight away even though the drive letter lingers.
+        local -a xflags=(--config); (( running )) && xflags+=(--live)
+        if [[ $DRY_RUN -eq 1 ]]; then
+            printf '%s  [dry-run]%s virsh change-media %s %s --eject %s\n' \
+                "$C_CYAN" "$C_RESET" "$vm" "$t" "${xflags[*]}"
+        elif virsh -c "$uri" change-media "$vm" "$t" --eject "${xflags[@]}" >/dev/null 2>&1; then
+            ok "Ejected the media in $t on '$vm'"
+        fi
+
         # libvirt will not hot-unplug a CD-ROM ('--live' is rejected), so the
         # drive comes out of the persistent definition only and is gone at the
         # next full power cycle - a reboot from inside Windows is not enough.
@@ -5067,9 +5079,52 @@ winapps_strip_vm_cdroms() {
         fi
     done
 
-    (( detached && running )) && \
-        note "The spare drives go at the next full shutdown of '$vm', not a reboot."
+    (( detached && running )) && WINAPPS_CDROMS_PENDING=1
     return 0
+}
+
+# The spare CD drives detach from the persistent definition only - libvirt will
+# not hot-unplug a CD-ROM - so they stay on the running guest until it is fully
+# powered off. Offer to do that now; a Windows-side reboot is not enough.
+winapps_offer_cdrom_powercycle() {
+    (( WINAPPS_CDROMS_PENDING )) || return 0
+    WINAPPS_CDROMS_PENDING=0
+
+    local vm="${OPT_WINAPPS_VM:-RDPWindows}" uri="qemu:///system"
+    have virsh || return 0
+    virsh -c "$uri" domstate "$vm" 2>/dev/null | grep -q running || return 0
+
+    printf '\n'
+    if [[ $DRY_RUN -eq 1 ]]; then
+        note "[dry-run] would offer to power-cycle '$vm' to drop the spare CD drives."
+        return 0
+    fi
+    if [[ $ASSUME_YES -eq 1 ]]; then
+        note "The spare CD drives clear at the next full shutdown of '$vm'."
+        note "Power-cycle by hand:  virsh -c $uri shutdown $vm  (wait) then  start $vm"
+        return 0
+    fi
+    if ! confirm "Power-cycle '$vm' now to finish removing the spare CD drives?" "n"; then
+        note "Left running. The spare drives clear at its next full shutdown"
+        note "(a reboot from inside Windows is not enough)."
+        return 0
+    fi
+
+    info "Shutting '$vm' down"
+    virsh -c "$uri" shutdown "$vm" >/dev/null 2>&1
+    local waited=0
+    while (( waited < 120 )); do
+        virsh -c "$uri" domstate "$vm" 2>/dev/null | grep -q 'shut off' && break
+        sleep 3; waited=$(( waited + 3 ))
+    done
+    if virsh -c "$uri" domstate "$vm" 2>/dev/null | grep -q 'shut off'; then
+        virsh -c "$uri" start "$vm" >/dev/null 2>&1 \
+            && ok "'$vm' power-cycled; it is booting with only the kept CD drive." \
+            || warn "'$vm' is shut off but did not start again; start it with 'virsh start $vm'."
+    else
+        warn "'$vm' did not shut down within two minutes - left it running."
+        note "Finish it by hand when convenient:  virsh -c $uri shutdown $vm  then  start $vm"
+    fi
 }
 
 # Run the upstream installer with --system, which is what puts the launchers in
@@ -5493,6 +5548,7 @@ configure_winapps() {
     # --- Launchers ----------------------------------------------------------
     printf '\n'
     winapps_install_upstream || true
+    winapps_offer_cdrom_powercycle
 
     WINAPPS_CONFIGURED=1
     printf '\n'
@@ -5935,6 +5991,31 @@ action_winapps() {
     configure_winapps
 }
 
+# The WinApps program scan on its own. 'setup.sh --system' signs into Windows,
+# lists what is installed and rewrites the shared launchers - the same command
+# for the first scan and every re-scan after a program is added or removed. The
+# 'Windows apps for every user' step runs this at its end, so a batch that ran
+# that too has nothing left to do here.
+action_winapps_scan() {
+    heading "WinApps - scan Windows for installed programs"
+
+    if (( WINAPPS_CONFIGURED )); then
+        note "The WinApps step already scanned Windows in this run; nothing to do."
+        return 0
+    fi
+    if [[ ! -r "$WINAPPS_TEMPLATE" ]]; then
+        warn "WinApps is not set up on this machine yet ($WINAPPS_TEMPLATE is missing)."
+        note "Run 'Windows apps for every user' first - it writes the configuration"
+        note "and does the initial scan. This entry is for re-scanning afterwards."
+        return 1
+    fi
+
+    local rc=0
+    winapps_install_upstream || rc=$?
+    winapps_offer_cdrom_powercycle
+    return $rc
+}
+
 action_sddm_greeter() {
     local dm
     dm="$(active_display_manager)"
@@ -6023,10 +6104,10 @@ fi
 MENU_TITLE="Active Directory Domain Join - Setup and Configuration"
 
 # The entries fill a two-column grid, left column first. An even number of
-# entries splits evenly (here 6 and 6); an odd number leaves one over, drawn as
-# a full-width row centred underneath both columns. MENU_LEFT_COUNT and
-# MENU_RIGHT_COUNT below say where the split falls - keep their sum equal to the
-# entry count for an even list, or one short of it for an odd list.
+# entries splits evenly; an odd number puts the extra row in the left column
+# (MENU_LEFT_COUNT one more than MENU_RIGHT_COUNT). MENU_LEFT_COUNT and
+# MENU_RIGHT_COUNT below say where the split falls - their sum is the entry
+# count, and the two differ by no more than one.
 MENU_NAMES=(
     "Guided setup"
     "Install packages only"
@@ -6039,6 +6120,7 @@ MENU_NAMES=(
     "Grant sudo to a user or group"
     "Duo two-factor authentication"
     "Windows apps for every user"
+    "Scan Windows for installed apps"
     "Preflight checks and domain status"
 )
 # One line of explanation per entry, shown for whichever entry the cursor is
@@ -6056,22 +6138,24 @@ MENU_HINTS=(
     "Give an account or a group sudo through its own /etc/sudoers.d file"
     "Second factor for local and domain logins via Duo Unix, or remove it"
     "Windows programs in the app menu, configured per domain user via WinApps"
+    "Re-run the WinApps program scan - after the first install and any app change"
     "Read-only: hostname, clock, DNS, membership and service state"
 )
 
-MENU_LEFT_COUNT=6
+MENU_LEFT_COUNT=7
 MENU_RIGHT_COUNT=6
-MENU_TOTAL=12
+MENU_TOTAL=13
 MENU_CURSOR=0
-MENU_SELECTED=(0 0 0 0 0 0 0 0 0 0 0 0)
+MENU_SELECTED=(0 0 0 0 0 0 0 0 0 0 0 0 0)
 
 # The order selections run in: install first, then configure, then join, then
 # the settings that only make sense once the machine is a domain member - and
 # Duo last of all, since it is the only entry that can stop a login working.
 #
 # WinApps sits after the join (index 10, run late) because it reads the joined
-# realm to fill in RDP_DOMAIN, but still ahead of Duo.
-MENU_RUN_ORDER=(0 1 2 4 5 11 3 7 6 8 10 9)
+# realm to fill in RDP_DOMAIN, but still ahead of Duo. The WinApps scan (index
+# 11) runs straight after it; the read-only status check is index 12.
+MENU_RUN_ORDER=(0 1 2 4 5 12 3 7 6 8 10 11 9)
 
 MCOL=0
 MROW=0
@@ -6764,7 +6848,8 @@ menu_run_action() {
         8) action_sudo_access ;;
         9) action_duo ;;
         10) action_winapps ;;
-        11) action_status ;;
+        11) action_winapps_scan ;;
+        12) action_status ;;
         *) return 1 ;;
     esac
 }
@@ -6780,6 +6865,7 @@ reset_step_guards() {
     DUO_DONE=0
     POST_JOIN_TUNING_DONE=0
     SUDO_ACCESS_DONE=0
+    WINAPPS_CONFIGURED=0    # so a batch's scan entry can tell it already ran
 }
 
 # Run everything that was ticked, in MENU_RUN_ORDER.

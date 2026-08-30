@@ -261,12 +261,12 @@ check "60x30 is not too small"       "0" "$ML_TOO_SMALL"
 layout_at 30 12
 check "30x12 reports too small"      "1" "$ML_TOO_SMALL"
 # The floor the README quotes. Adding a menu entry moves it, so it is pinned.
-layout_at 40 22
-check "40x22 is the smallest usable size" "0" "$ML_TOO_SMALL"
-layout_at 39 22
+layout_at 40 23
+check "40x23 is the smallest usable size" "0" "$ML_TOO_SMALL"
+layout_at 39 23
 check "39 columns is too narrow"          "1" "$ML_TOO_SMALL"
-layout_at 40 21
-check "21 rows is too short"              "1" "$ML_TOO_SMALL"
+layout_at 40 22
+check "22 rows is too short"              "1" "$ML_TOO_SMALL"
 
 # No drawn line may be wider than the terminal, or the redraw leaves debris.
 overlong=0
@@ -1273,6 +1273,66 @@ check "declining leaves every drive in place"   "0" "$(grep -cE 'change-media|de
 
 : >"$EJECT_LOG"; STRIP_CONFIRM=0 run_strip docker
 check "a non-libvirt backend is skipped"        "0" "$(grep -cE 'change-media|detach-disk' "$EJECT_LOG")"
+
+# The spare drives' media is ejected live too, so the ISO drops off the running
+# guest at once even though the drive letter lingers until a full power cycle.
+: >"$EJECT_LOG"; STRIP_CONFIRM=0 run_strip
+check "the spare drives' media is ejected live" "2" \
+      "$(grep -cE 'change-media IT-VM sd[bc] --eject.*--live' "$EJECT_LOG")"
+check "the strip flags a pending power cycle"    "1" \
+      "$( OPT_WINAPPS_BACKEND=libvirt; OPT_WINAPPS_VM="IT-VM"; DRY_RUN=0
+          WINAPPS_CDROMS_PENDING=0
+          source "$WA_TMP/virsh_stub"; have() { [[ "$1" == virsh ]]; }
+          confirm() { return 0; }; ok() { :; }; warn() { :; }; note() { :; }; info() { :; }
+          winapps_strip_vm_cdroms >/dev/null 2>&1
+          printf '%s' "$WINAPPS_CDROMS_PENDING" )"
+
+section "WinApps: offering the post-strip power cycle"
+# winapps_offer_cdrom_powercycle only acts when the strip left drives pending,
+# and a declined prompt must not touch the guest.
+: >"$WA_TMP/pc.log"
+check "nothing pending: the guest is left alone" "0" \
+      "$( WINAPPS_CDROMS_PENDING=0; OPT_WINAPPS_VM="IT-VM"; DRY_RUN=0; ASSUME_YES=0
+          virsh() { echo "$*" >>"$WA_TMP/pc.log"; case "$*" in *domstate*) echo running ;; esac; }
+          have() { [[ "$1" == virsh ]]; }
+          confirm() { return 0; }; ok() { :; }; warn() { :; }; note() { :; }; info() { :; }
+          winapps_offer_cdrom_powercycle >/dev/null 2>&1
+          grep -c 'shutdown' "$WA_TMP/pc.log" )"
+: >"$WA_TMP/pc.log"
+check "declining the power cycle does not shut down" "0|0" \
+      "$( WINAPPS_CDROMS_PENDING=1; OPT_WINAPPS_VM="IT-VM"; DRY_RUN=0; ASSUME_YES=0
+          virsh() { echo "$*" >>"$WA_TMP/pc.log"; case "$*" in *domstate*) echo running ;; esac; }
+          have() { [[ "$1" == virsh ]]; }
+          confirm() { return 1; }; ok() { :; }; warn() { :; }; note() { :; }; info() { :; }
+          winapps_offer_cdrom_powercycle >/dev/null 2>&1
+          printf '%s|%s' "$(grep -c 'shutdown' "$WA_TMP/pc.log")" "$WINAPPS_CDROMS_PENDING" )"
+: >"$WA_TMP/pc.log"; rm -f "$WA_TMP/pc.down"
+check "accepting the power cycle shuts down then starts" "1|1" \
+      "$( WINAPPS_CDROMS_PENDING=1; OPT_WINAPPS_VM="IT-VM"; DRY_RUN=0; ASSUME_YES=0
+          virsh() { echo "$*" >>"$WA_TMP/pc.log"
+                    case "$*" in
+                        *shutdown*) : > "$WA_TMP/pc.down" ;;
+                        *domstate*) [[ -f "$WA_TMP/pc.down" ]] && echo 'shut off' || echo running ;;
+                    esac; }
+          have() { [[ "$1" == virsh ]]; }
+          confirm() { return 0; }; ok() { :; }; warn() { :; }; note() { :; }; info() { :; }
+          winapps_offer_cdrom_powercycle >/dev/null 2>&1
+          printf '%s|%s' "$(grep -c 'shutdown IT-VM' "$WA_TMP/pc.log")" \
+                         "$(grep -c 'start IT-VM' "$WA_TMP/pc.log")" )"
+
+section "WinApps: the standalone scan entry"
+check "a scan with no template set up bails" "1" \
+      "$( WINAPPS_TEMPLATE="$WA_TMP/nonexistent.template"; WINAPPS_CONFIGURED=0
+          heading() { :; }; warn() { :; }; note() { :; }
+          action_winapps_scan >/dev/null 2>&1; printf '%s' "$?" )"
+check "a scan is skipped when the install step already ran it" "0|0" \
+      "$( printf 'x\n' > "$WA_TMP/t.template"; WINAPPS_TEMPLATE="$WA_TMP/t.template"
+          WINAPPS_CONFIGURED=1
+          heading() { :; }; note() { :; }
+          winapps_install_upstream() { echo SCANNED >>"$WA_TMP/scan.log"; }
+          : > "$WA_TMP/scan.log"
+          action_winapps_scan >/dev/null 2>&1; rc=$?
+          printf '%s|%s' "$rc" "$(grep -c SCANNED "$WA_TMP/scan.log")" )"
 
 section "WinApps: the VM builder script"
 WINAPPS_VM_DEPLOYER="$WA_TMP/winapps-vm-deploy"

@@ -18,6 +18,15 @@ changed — not that an artefact was published anywhere.
 
 ### Added
 
+- **"Scan Windows for installed apps" on the menu.** The WinApps program scan
+  (`setup.sh --system`, which enumerates what is installed in Windows and
+  rewrites the shared launchers) is now a menu entry of its own, next to
+  "Windows apps for every user". It is the same command for the first scan and
+  every re-scan, so run it whenever a program is added to or removed from
+  Windows. The install entry still does the scan at the end of its own run; the
+  new entry no-ops if that already happened in the same batch, and tells you to
+  run the install step first if WinApps was never set up. The menu's minimum
+  terminal height moves from 40x22 to 40x23.
 - **`libvirt_group` in `windows-vm.conf`.** The AD group given `virt-manager`
   access to the Windows guest — previously only a prompt or the
   `--winapps-libvirt-group` flag — can now be written in the answer file. It is
@@ -67,11 +76,14 @@ changed — not that an artefact was published anywhere.
 - **The WinApps step tidies up the guest's install CD drives.** The build
   attaches three CD-ROMs — the install ISO, the virtio drivers and the unattend
   answer disk. After you confirm Windows is installed and reachable, the step
-  ejects the medium from the first drive (live) and removes the other two from
-  the domain definition (`virsh detach-disk --config` — libvirt refuses to
-  hot-unplug a CD-ROM, so they clear at the guest's next full shutdown), leaving
-  one empty CD-ROM for mounting an ISO by hand later. libvirt backend only;
-  declines cleanly.
+  ejects the medium from every drive (live, so the ISOs drop off the running
+  guest at once) and removes two of the three drives from the domain definition
+  (`virsh detach-disk --config` — libvirt refuses to hot-unplug a CD-ROM, so the
+  empty drive letters linger until the guest is fully powered off), leaving one
+  CD-ROM for mounting an ISO by hand later. It then offers to power-cycle the
+  guest there and then to finish the removal (`virsh shutdown`, wait, `start`);
+  decline and it clears at the next full shutdown as before. libvirt backend
+  only; `-y` skips the power-cycle prompt and prints the manual commands.
 
 ### Changed
 

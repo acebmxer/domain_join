@@ -39,12 +39,13 @@ step is still available as a flag for unattended runs.
              Domain          : not joined
              Mode            : changes will be applied
  ───────────────────────────────────────────────────────────────────────────────────
- ▸ [✓] Guided setup                        [ ] SDDM login screen
-   [ ] Install packages only               [ ] Post-join login settings
-   [ ] Graphical management tools          [ ] Grant sudo to a user or group
-   [ ] Join an Active Directory domain     [ ] Duo two-factor authentication
-   [ ] Home directories on first login     [ ] Windows apps for every user
+ ▸ [✓] Guided setup                        [ ] Post-join login settings
+   [ ] Install packages only               [ ] Grant sudo to a user or group
+   [ ] Graphical management tools          [ ] Duo two-factor authentication
+   [ ] Join an Active Directory domain     [ ] Windows apps for every user
+   [ ] Home directories on first login     [ ] Scan Windows for installed apps
    [✓] Network time synchronisation        [ ] Preflight checks and domain status
+   [ ] SDDM login screen
       Install, configure, then offer to join - the whole setup in one pass
  ───────────────────────────────────────────────────────────────────────────────────
  Selected: 2
@@ -72,9 +73,11 @@ whether the machine is already joined.
 | **Grant sudo to a user or group** | Asks for an account, a group, or one of each, and writes a `/etc/sudoers.d` drop-in for each. See [sudo rights](#sudo-rights). |
 | **Duo two-factor authentication** | Installs Duo Unix, writes `/etc/duo/pam_duo.conf`, and adds `pam_duo.so` to the services you pick — or takes it back out again. See [Duo](#duo-security-two-factor-authentication). |
 | **Windows apps for every user** | Installs WinApps system-wide and generates each domain user's configuration at login, so Windows programs in the app menu open under their own account. Can also build the Windows 11 VM (libvirt). See [WinApps](#windows-applications-for-every-domain-user). |
+| **Scan Windows for installed apps** | Re-runs the WinApps program scan (`setup.sh --system`) on its own — the same command as the first scan, for use whenever a program is added to or removed from Windows. The entry above already does this at the end of its run. |
 | **Preflight checks and domain status** | Read-only: hostname, clock, DNS SRV records, membership and service state. |
 
-The entries fill two even columns. The terminal only has to be 40x22; below that
+The entries fill two columns, the left one taking the odd row when the count is
+odd. The terminal only has to be 40x23; below that
 the menu says so rather than drawing something broken. It reflows live as the
 window is resized, first tightening the spacing between the columns, then
 dropping detail — the hint line, then the banner box — before it finally gives
@@ -1087,9 +1090,13 @@ installing in the background; wait for it to reach the desktop before step 4.
 
 Answering yes at that prompt also offers to strip the install CD drives from a
 libvirt guest — the install, virtio and unattend media are only needed through
-first boot. It ejects one and removes the other two from the domain definition
-(libvirt cannot hot-unplug a CD-ROM, so those clear at the guest's next full
-shutdown), leaving a single empty CD-ROM.
+first boot. It ejects the media from all three drives live, so the ISOs drop off
+the running guest immediately, and removes two of the three drives from the
+domain definition, leaving a single CD-ROM. libvirt cannot hot-unplug a CD-ROM,
+so the two empty drive letters stay until the guest is fully powered off — the
+step then offers to `virsh shutdown` and `start` it there and then to finish the
+job. Decline and they clear at the next full shutdown; `-y` skips the prompt and
+prints the manual commands.
 
 ### Day-to-day
 
