@@ -87,6 +87,10 @@ changed — not that an artefact was published anywhere.
   `winapps_remove` finally ran at the tail of `configure_winapps`. `main` now
   short-circuits to `winapps_remove` as soon as either flag is seen and stops
   there.
+- **The removal hint printed the wrong uninstall command.** It suggested
+  `sudo /etc/winapps/setup.sh --uninstall`, but upstream `setup.sh` refuses
+  `--uninstall` without `--user` or `--system`; since the installer only ever
+  runs `--system`, the hint now reads `setup.sh --system --uninstall`.
 - **The WinApps program scan tried to log into Windows as `root`.** When the
   installer ran `setup.sh --system` under `sudo`, it seeded root's
   `~/.config/winapps/winapps.conf` from the per-user template — which carries a

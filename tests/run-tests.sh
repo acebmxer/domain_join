@@ -1028,6 +1028,11 @@ check "main sends --winapps-remove straight to removal" "REMOVE" \
 check "main sends --winapps-vm-remove straight to removal" "REMOVE" \
       "$(remove_dispatch --winapps-vm-remove)"
 
+# Upstream setup.sh refuses --uninstall without --user/--system, and the
+# installer only ever installs --system.
+check_contains "the uninstall hint passes --system" "--system" \
+      "$( ( DRY_RUN=1; winapps_remove 2>/dev/null | grep -F 'setup.sh' ) )"
+
 # An invalid enum must stop the run rather than be carried into a config file.
 for bad in "--winapps-backend vmware" "--winapps-creds telepathy"; do
     if ( parse_args $bad ) >/dev/null 2>&1; then

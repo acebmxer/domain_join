@@ -5148,7 +5148,7 @@ winapps_remove() {
     note "  - each user's ~/.config/winapps/winapps.conf"
     note "  - the launchers in /usr/share/applications"
     note "  - the cached ISOs in $WINAPPS_ISO_CACHE"
-    note "To remove those too:  sudo $WINAPPS_ETC_DIR/setup.sh --uninstall"
+    note "To remove those too:  sudo $WINAPPS_ETC_DIR/setup.sh --system --uninstall"
     return 0
 }
 
