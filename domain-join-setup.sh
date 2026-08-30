@@ -3913,8 +3913,17 @@ hyp_can_read "$WIN_ISO" || warn "the prepared ISO ($WIN_ISO) may not be readable
 # Stage the boot-critical virtio drivers where Windows Setup auto-loads them
 # (a folder named $WinPEDriver$ at the root of the attached media). Pulled
 # straight out of the virtio ISO with xorriso, so no loop mount is needed.
+#
+# Keep this list MINIMAL. Windows 11 24H2/25H2 Setup aborts early with
+# "0xD000A000 - 0x40031" (or "0x80070103 - 0x40031") when a $WinPEDriver$
+# INF matches a driver WinPE already has loaded - the extra QEMU/virtio
+# INFs (Balloon, vioserial, qemufwcfg, qemupciserial, pvpanic, smbus,
+# vioscsi when there is no SCSI controller) each trip that. Only what is
+# needed to see the virtio-blk system disk (viostor) and the NIC during
+# OOBE (NetKVM) goes in here; virtio-win-guest-tools.exe installs the full
+# set on first boot (see setup.ps1).
 _staged=0
-for d in viostor vioscsi NetKVM Balloon vioserial qemufwcfg qemupciserial pvpanic smbus; do
+for d in viostor NetKVM; do
     for a in w11 w10; do
         if xorriso -osirrox on -indev "$VIRTIO_ISO" \
              -extract "/$d/$a/amd64" "$DRV/$d" >/dev/null 2>&1; then

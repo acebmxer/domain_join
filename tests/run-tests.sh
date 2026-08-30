@@ -1171,6 +1171,13 @@ check_line "it checks the hypervisor can read the ISO" 'hyp_can_read'        "$W
 check_line "it stages an unreachable ISO into the pool" '${VM_NAME}-install.iso' "$WINAPPS_VM_DEPLOYER"
 check_line "it builds the answer disk in the pool"  'UNATTEND_ISO="$POOL_DIR' "$WINAPPS_VM_DEPLOYER"
 check_line "it stages the virtio boot driver"      'viostor'                "$WINAPPS_VM_DEPLOYER"
+check_line "it keeps the WinPE driver set minimal"  'for d in viostor NetKVM' "$WINAPPS_VM_DEPLOYER"
+if grep -q 'for d in viostor NetKVM; do' "$WINAPPS_VM_DEPLOYER" && \
+   ! grep -qE '^for d in .*(qemufwcfg|vioserial|pvpanic|smbus)' "$WINAPPS_VM_DEPLOYER"; then
+    printf '  %s it does not inject redundant virtio INFs into WinPE (0xD000A000-0x40031)\n' "$(green PASS)"; ((PASS++))
+else
+    printf '  %s redundant virtio INFs still staged into WinPE\n' "$(red FAIL)"; ((FAIL++))
+fi
 check_line "it creates the guest with an emulated TPM" 'backend.type=emulator' "$WINAPPS_VM_DEPLOYER"
 check_line "it patches the ISO past the CD boot prompt" 'efisys_noprompt.bin' "$WINAPPS_VM_DEPLOYER"
 check_line "it overwrites the boot image extent"   'conv=notrunc'           "$WINAPPS_VM_DEPLOYER"
