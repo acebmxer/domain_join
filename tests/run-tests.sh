@@ -1197,6 +1197,55 @@ else
     printf '  %s it writes no askpass helper without a password\n' "$(green PASS)"; ((PASS++))
 fi
 
+section "WinApps: stripping the install CD drives"
+# After the operator says Windows is up, the three install CDs have done their
+# job: winapps_strip_vm_cdroms ejects the media in the first drive and detaches
+# the other two, leaving one empty CD-ROM.
+EJECT_LOG="$WA_TMP/eject.log"
+cat >"$WA_TMP/virsh_stub" <<STUB
+virsh() {
+    case "\$*" in
+        *"dominfo"*)   return 0 ;;
+        *"domblklist --details"*)
+            printf ' Type Device Target Source\\n'
+            printf ' file disk  vda /var/lib/libvirt/images/vm.qcow2\\n'
+            printf ' file cdrom sda /var/lib/libvirt/images/vm-install.iso\\n'
+            printf ' file cdrom sdb /var/lib/winapps/iso/virtio-win.iso\\n'
+            printf ' file cdrom sdc /var/lib/libvirt/images/vm-unattend.iso\\n' ;;
+        *"domstate"*)     echo running ;;
+        *"change-media"*|*"detach-disk"*) echo "\$*" >>"$EJECT_LOG" ;;
+    esac
+}
+STUB
+run_strip() { (
+    OPT_WINAPPS_BACKEND="${1:-libvirt}"; OPT_WINAPPS_VM="IT-VM"; DRY_RUN=0
+    source "$WA_TMP/virsh_stub"
+    have() { [[ "$1" == virsh ]]; }
+    confirm() { return "${STRIP_CONFIRM:-0}"; }
+    ok() { :; }; warn() { :; }; note() { :; }; info() { :; }
+    winapps_strip_vm_cdroms
+) >/dev/null 2>&1; }
+
+: >"$EJECT_LOG"; STRIP_CONFIRM=0 run_strip
+check "it ejects the media in the kept drive"  "1" "$(grep -c 'change-media IT-VM sda --eject' "$EJECT_LOG")"
+check "it detaches the two spare drives"        "2" "$(grep -c 'detach-disk IT-VM' "$EJECT_LOG")"
+check "it does not detach the kept drive"       "0" "$(grep -c 'detach-disk IT-VM sda' "$EJECT_LOG")"
+check "it detaches the virtio drive"            "yes" \
+      "$(grep -q 'detach-disk IT-VM sdb' "$EJECT_LOG" && echo yes || echo no)"
+# libvirt rejects a live CD-ROM unplug, so the detach is --config only.
+check "the detach is persistent-only (no --live)" "0" \
+      "$(grep 'detach-disk' "$EJECT_LOG" | grep -c -- '--live')"
+check "the detach persists to the definition"  "2" \
+      "$(grep 'detach-disk' "$EJECT_LOG" | grep -c -- '--config')"
+check "the medium eject is live on a running guest" "yes" \
+      "$(grep 'change-media' "$EJECT_LOG" | grep -q -- '--live' && echo yes || echo no)"
+
+: >"$EJECT_LOG"; STRIP_CONFIRM=1 run_strip
+check "declining leaves every drive in place"   "0" "$(grep -cE 'change-media|detach-disk' "$EJECT_LOG")"
+
+: >"$EJECT_LOG"; STRIP_CONFIRM=0 run_strip docker
+check "a non-libvirt backend is skipped"        "0" "$(grep -cE 'change-media|detach-disk' "$EJECT_LOG")"
+
 section "WinApps: the VM builder script"
 WINAPPS_VM_DEPLOYER="$WA_TMP/winapps-vm-deploy"
 winapps_write_vm_deployer >/dev/null 2>&1

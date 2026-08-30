@@ -1039,6 +1039,12 @@ written and it prints the command for step 4 — so the script is safe to run
 before Windows exists. A VM built in step 2 takes 20–45 minutes to finish
 installing in the background; wait for it to reach the desktop before step 4.
 
+Answering yes at that prompt also offers to strip the install CD drives from a
+libvirt guest — the install, virtio and unattend media are only needed through
+first boot. It ejects one and removes the other two from the domain definition
+(libvirt cannot hot-unplug a CD-ROM, so those clear at the guest's next full
+shutdown), leaving a single empty CD-ROM.
+
 ### Day-to-day
 
 ```bash

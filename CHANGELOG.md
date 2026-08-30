@@ -41,6 +41,17 @@ changed — not that an artefact was published anywhere.
 - **Badges in the README** — license, version, last commit, open issues, shell,
   platform and the test count.
 
+### Added
+
+- **The WinApps step tidies up the guest's install CD drives.** The build
+  attaches three CD-ROMs — the install ISO, the virtio drivers and the unattend
+  answer disk. After you confirm Windows is installed and reachable, the step
+  ejects the medium from the first drive (live) and removes the other two from
+  the domain definition (`virsh detach-disk --config` — libvirt refuses to
+  hot-unplug a CD-ROM, so they clear at the guest's next full shutdown), leaving
+  one empty CD-ROM for mounting an ISO by hand later. libvirt backend only;
+  declines cleanly.
+
 ### Changed
 
 - **The VM builder stops re-asking for RAM, vCPUs and disk when the answer is

@@ -4955,6 +4955,77 @@ winapps_seed_scan_config() {
     return 0
 }
 
+# Once the operator confirms Windows is installed and up, the three install CDs
+# (the '-install.iso', virtio and unattend media) have done their job - they are
+# only read during Setup and first boot. Eject any media still loaded so a later
+# reboot cannot drop back into Setup, and detach the spare drives, leaving one
+# empty CD-ROM for mounting an ISO by hand later. libvirt backend only.
+winapps_strip_vm_cdroms() {
+    [[ "$OPT_WINAPPS_BACKEND" == "libvirt" ]] || return 0
+    have virsh || return 0
+
+    local vm="${OPT_WINAPPS_VM:-RDPWindows}" uri="qemu:///system"
+    virsh -c "$uri" dominfo "$vm" >/dev/null 2>&1 || return 0
+
+    local -a cdroms=()
+    mapfile -t cdroms < <(
+        virsh -c "$uri" domblklist --details "$vm" 2>/dev/null \
+            | awk '$2 == "cdrom" { print $3 }'
+    )
+    (( ${#cdroms[@]} )) || return 0
+
+    local keep="${cdroms[0]}" spare=$(( ${#cdroms[@]} - 1 ))
+    local msg="Eject the install media from guest '$vm'"
+    if (( spare > 0 )); then
+        msg+=" and remove $spare spare CD drive"
+        (( spare > 1 )) && msg+="s"
+        msg+=" (keeps one)"
+    fi
+    if ! confirm "$msg?" "y"; then
+        note "Left the CD drives on '$vm' as they are."
+        return 0
+    fi
+
+    local state t running=0 detached=0
+    state="$(virsh -c "$uri" domstate "$vm" 2>/dev/null)"
+    [[ "$state" == "running" ]] && running=1
+
+    for t in "${cdroms[@]}"; do
+        if [[ "$t" == "$keep" ]]; then
+            # Ejecting a medium is a live operation; keep the drive itself.
+            local -a eflags=(--config); (( running )) && eflags+=(--live)
+            if [[ $DRY_RUN -eq 1 ]]; then
+                printf '%s  [dry-run]%s virsh change-media %s %s --eject %s\n' \
+                    "$C_CYAN" "$C_RESET" "$vm" "$t" "${eflags[*]}"
+            elif virsh -c "$uri" change-media "$vm" "$t" --eject "${eflags[@]}" >/dev/null 2>&1; then
+                ok "Ejected the media in $t on '$vm'"
+            else
+                note "$t on '$vm' is already empty."
+            fi
+            continue
+        fi
+
+        # libvirt will not hot-unplug a CD-ROM ('--live' is rejected), so the
+        # drive comes out of the persistent definition only and is gone at the
+        # next full power cycle - a reboot from inside Windows is not enough.
+        if [[ $DRY_RUN -eq 1 ]]; then
+            printf '%s  [dry-run]%s virsh detach-disk %s %s --config\n' \
+                "$C_CYAN" "$C_RESET" "$vm" "$t"
+            detached=1
+        elif virsh -c "$uri" detach-disk "$vm" "$t" --config >/dev/null 2>&1; then
+            ok "Removed CD drive $t from the definition of '$vm'"
+            detached=1
+        else
+            warn "Could not remove CD drive $t from '$vm'."
+            note "By hand:  virsh -c $uri detach-disk $vm $t --config"
+        fi
+    done
+
+    (( detached && running )) && \
+        note "The spare drives go at the next full shutdown of '$vm', not a reboot."
+    return 0
+}
+
 # Run the upstream installer with --system, which is what puts the launchers in
 # /usr/share/applications for every account.
 #
@@ -4971,6 +5042,8 @@ winapps_install_upstream() {
         printf '    %ssudo %s --system%s\n' "$C_CYAN" "$installer" "$C_RESET"
         return 0
     fi
+
+    winapps_strip_vm_cdroms
 
     info "Fetching the WinApps installer"
     if [[ $DRY_RUN -eq 1 ]]; then
