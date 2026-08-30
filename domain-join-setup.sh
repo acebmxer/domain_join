@@ -27,7 +27,7 @@
 set -uo pipefail
 
 readonly PROGRAM_NAME="domain-join-setup"
-readonly SCRIPT_VERSION="1.4.0"
+readonly SCRIPT_VERSION="1.5.0"
 
 # ---------------------------------------------------------------------------
 # Runtime options (overridable by flags)
@@ -81,6 +81,7 @@ OPT_WINAPPS_DOMAIN=""    # RDP_DOMAIN (empty = derive from the joined realm)
 OPT_WINAPPS_CREDS=""     # askpass | kerberos | shared (empty = ask)
 OPT_WINAPPS_RDP_USER=""  # shared-credential mode only: the service account
 OPT_WINAPPS_RDP_PASS="${WINAPPS_RDP_PASS:-}"  # shared-credential mode only
+OPT_WINAPPS_LIBVIRT_GROUP=""  # AD group granted qemu:///system access (libvirt backend; empty = ask/derive)
 WINAPPS_REMOVE=0         # --winapps-remove: take the multi-user wiring back out
 
 # Building the Windows guest. libvirt backend only: the script can stand up a
@@ -92,7 +93,22 @@ OPT_WINAPPS_ISO=""       # path to a Windows 10/11 ISO; empty = fetch with Mido
 OPT_WINAPPS_VM_RAM=""    # guest RAM in MiB   (empty = 4096)
 OPT_WINAPPS_VM_CPUS=""   # guest vCPUs        (empty = 4)
 OPT_WINAPPS_VM_DISK=""   # guest disk in GiB  (empty = 64)
+OPT_WINAPPS_VM_ADMIN=""  # local admin account for the built VM (empty = Docker)
 OPT_WINAPPS_VM_PASS="${WINAPPS_VM_PASS:-}"  # local admin password for the built VM
+
+# The rest of the Autounattend.xml answers. These come from windows-vm.conf
+# rather than from flags - they are set once for a machine and never typed
+# again, and a dozen more flags would drown the ones people actually use.
+OPT_VM_EDITION=""        # /IMAGE/NAME          (empty = Windows 11 Pro)
+OPT_VM_PRODUCT_KEY=""    # ProductKey           (empty = the generic Pro key)
+OPT_VM_COMPUTER_NAME=""  # ComputerName         (empty = *, meaning random)
+OPT_VM_OWNER=""          # RegisteredOwner      (empty = omitted)
+OPT_VM_ORGANIZATION=""   # RegisteredOrganization
+OPT_VM_TIMEZONE=""       # TimeZone             (empty = UTC)
+OPT_VM_UI_LANGUAGE=""    # UILanguage           (empty = en-US)
+OPT_VM_SYSTEM_LOCALE=""  # SystemLocale         (empty = the UI language)
+OPT_VM_USER_LOCALE=""    # UserLocale           (empty = the UI language)
+OPT_VM_INPUT_LOCALE=""   # InputLocale          (empty = 0409:00000409)
 WINAPPS_VM_REMOVE=0      # --winapps-vm-remove: also undefine the libvirt guest
 
 # What to install. Filled in by the choice builders, or by the matching flags.
@@ -210,6 +226,412 @@ fetch_url() {
     (( rc == 0 )) || warn "Download failed ($url)"
     return $rc
 }
+# ---------------------------------------------------------------------------
+# Windows VM answer file settings
+# ---------------------------------------------------------------------------
+# The unattended Windows install needs a handful of facts that are tedious to
+# retype and, in the case of the administrator password, have no business being
+# on a command line where 'ps' can read them: which ISO to install from, what
+# to call the guest, the local administrator account it creates, and how big to
+# make it. They can be written down once in a file instead.
+#
+# This file covers the Windows VM build, plus the one WinApps wiring setting
+# that is otherwise only a prompt - 'libvirt_group', the AD group given
+# virt-manager access to the guest. Everything else the installer does - the
+# domain join, Duo, sudo, packages - stays on the flags and the menu where it
+# was.
+#
+# Precedence, highest first:
+#
+#   1. a command line flag, for that one run
+#   2. WINAPPS_VM_PASS in the environment (the password only)
+#   3. this file
+#   4. the built-in default, or the interactive prompt
+VM_CONF_FILE=""         # --vm-config FILE, else the first of vm_conf_search
+VM_CONF_ENABLED=1       # --no-vm-config turns it off
+VM_CONF_LOADED_FROM=""  # the file actually read
+VM_CONF_HAS_SECRET=0    # set when the file carried the administrator password
+VM_CONF_HAS_LIBVIRT_GROUP=0  # set when the file carried 'libvirt_group' (any
+                             # value, blank included) - suppresses the prompt
+WRITE_VM_CONF=0         # --write-vm-config: emit a commented sample and exit
+WRITE_VM_CONF_PATH=""
+
+VM_CONF_BASENAME="windows-vm.conf"
+
+# vm_conf_search - where the file is looked for when --vm-config was not given.
+# The script's own directory comes first so a checkout carried to another
+# machine brings the answers with it; /etc/winapps is where everything else
+# this installer writes for WinApps already lives.
+vm_conf_search() {
+    local dir
+    [[ -n "${WINDOWS_VM_CONF:-}" ]] && printf '%s\n' "$WINDOWS_VM_CONF"
+    dir="$(cd -- "$(dirname -- "$(script_path)")" 2>/dev/null && pwd)" \
+        && printf '%s\n' "$dir/$VM_CONF_BASENAME"
+    printf '%s\n' "$WINAPPS_ETC_DIR/$VM_CONF_BASENAME"
+}
+
+# vm_conf_prescan <args...> - find --vm-config/--no-vm-config before parse_args
+# runs, so the file can be read first and the flags can then overwrite it.
+vm_conf_prescan() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --vm-config)
+                VM_CONF_FILE="${2:-}"
+                [[ -n "$VM_CONF_FILE" ]] || die "--vm-config needs the path to a settings file."
+                shift 2 || shift $# ;;
+            --no-vm-config) VM_CONF_ENABLED=0; shift ;;
+            *) shift ;;
+        esac
+    done
+}
+
+# vm_conf_int <outvar> <value> <key> <where> - writes through a named variable
+# because die() inside $(...) would only kill the subshell and the caller would
+# carry on with an empty value.
+vm_conf_int() {
+    [[ "$2" =~ ^[1-9][0-9]*$ ]] || die "$4: '$3' must be a positive integer (got '$2')."
+    printf -v "$1" '%s' "$2"
+}
+
+# vm_conf_product_key <value> <key> <where> - five groups of five.
+vm_conf_product_key() {
+    [[ "$1" =~ ^[A-Za-z0-9]{5}(-[A-Za-z0-9]{5}){4}$ ]] \
+        || die "$3: '$1' is not a product key - five groups of five, e.g. XXXXX-XXXXX-XXXXX-XXXXX-XXXXX."
+    OPT_VM_PRODUCT_KEY="$1"
+}
+
+# vm_conf_computer_name <value> <key> <where> - NetBIOS rules: at most 15
+# characters, letters digits and hyphens, never all digits. '*' is Setup's own
+# token for "generate one", so it is allowed through untouched.
+vm_conf_computer_name() {
+    if [[ "$1" != "*" ]]; then
+        [[ "$1" =~ ^[A-Za-z0-9-]{1,15}$ ]] \
+            || die "$3: '$1' is not a computer name - 15 characters or fewer, letters, digits and hyphens."
+        [[ "$1" =~ [^0-9] ]] \
+            || die "$3: a computer name cannot be all digits ('$1')."
+    fi
+    OPT_VM_COMPUTER_NAME="$1"
+}
+
+# vm_conf_langtag <outvar> <value> <key> <where> - en-US, en, pt-BR and so on.
+vm_conf_langtag() {
+    [[ "$2" =~ ^[A-Za-z]{2,3}(-[A-Za-z0-9]+)*$ ]] \
+        || die "$4: '$2' is not a language tag for '$3' (expected something like en-US)."
+    printf -v "$1" '%s' "$2"
+}
+
+# vm_conf_set <key> <value> <where> - one setting from the file.
+#
+# The password is applied only if nothing has supplied one already, which is
+# what puts WINAPPS_VM_PASS above the file: it was read into this variable when
+# the script started.
+vm_conf_set() {
+    local key="$1" val="$2" where="$3"
+    case "$key" in
+        iso)      OPT_WINAPPS_ISO="$val" ;;
+        vm_name)  OPT_WINAPPS_VM="$val" ;;
+        admin)    OPT_WINAPPS_VM_ADMIN="$val" ;;
+        password) VM_CONF_HAS_SECRET=1
+                  [[ -z "$OPT_WINAPPS_VM_PASS" ]] && OPT_WINAPPS_VM_PASS="$val" ;;
+        ram)      vm_conf_int OPT_WINAPPS_VM_RAM  "$val" "$key" "$where" ;;
+        cpus)     vm_conf_int OPT_WINAPPS_VM_CPUS "$val" "$key" "$where" ;;
+        disk)     vm_conf_int OPT_WINAPPS_VM_DISK "$val" "$key" "$where" ;;
+
+        # WinApps wiring, not a build answer: the AD group given virt-manager
+        # access to qemu:///system. Recording that the key was seen - even blank
+        # - is what tells configure_winapps not to prompt. A --winapps-libvirt-group
+        # flag still overrides, because parse_args runs after this.
+        libvirt_group) VM_CONF_HAS_LIBVIRT_GROUP=1
+                       OPT_WINAPPS_LIBVIRT_GROUP="$val" ;;
+
+        edition)       OPT_VM_EDITION="$val" ;;
+        product_key)   vm_conf_product_key "$val" "$key" "$where" ;;
+        computer_name) vm_conf_computer_name "$val" "$key" "$where" ;;
+        owner)         OPT_VM_OWNER="$val" ;;
+        organization)  OPT_VM_ORGANIZATION="$val" ;;
+        timezone)      [[ -n "$val" ]] || die "$where: 'timezone' needs a value (e.g. 'Eastern Standard Time'). Remove the line to default to UTC."
+                       OPT_VM_TIMEZONE="$val" ;;
+        ui_language)   vm_conf_langtag OPT_VM_UI_LANGUAGE   "$val" "$key" "$where" ;;
+        system_locale) vm_conf_langtag OPT_VM_SYSTEM_LOCALE "$val" "$key" "$where" ;;
+        user_locale)   vm_conf_langtag OPT_VM_USER_LOCALE   "$val" "$key" "$where" ;;
+        input_locale)  [[ "$val" =~ ^[A-Za-z0-9]+(:[A-Za-z0-9]+)?(-[A-Za-z0-9]+)*(\;[A-Za-z0-9:-]+)*$ ]] \
+                           || die "$where: '$val' is not an input locale (e.g. 0409:00000409, or en-US)."
+                       OPT_VM_INPUT_LOCALE="$val" ;;
+
+        *) err "$where: unknown setting '$key'."
+           note "This file takes the VM's own settings - iso, vm_name, ram, cpus, disk -"
+           note "the Windows answers: edition, product_key, computer_name, admin,"
+           note "password, owner, organization, timezone, ui_language, system_locale,"
+           note "user_locale, input_locale - and libvirt_group. Nothing else."
+           note "'--write-vm-config' writes a commented copy listing all of them."
+           exit 2 ;;
+    esac
+    return 0
+}
+
+# vm_conf_read <file> - parse and apply.
+#
+# Deliberately not 'source': an answer file is data, and sourcing it would run
+# whatever is in it as root. Comments are whole-line only ('#' in the first
+# non-blank column), so a password containing one needs no quoting.
+vm_conf_read() {
+    local file="$1" line key val lineno=0 where mode
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        lineno=$(( lineno + 1 ))
+        line="${line%$'\r'}"                          # files edited on Windows
+        line="${line#"${line%%[![:space:]]*}"}"       # leading whitespace
+        [[ -z "$line" || "$line" == '#'* ]] && continue
+        where="$file:$lineno"
+        [[ "$line" == *=* ]] || die "$where: expected 'name = value', got '$line'."
+
+        key="${line%%=*}"
+        val="${line#*=}"
+        key="${key%"${key##*[![:space:]]}"}"          # trailing whitespace
+        key="${key,,}"
+        key="${key//-/_}"
+        val="${val#"${val%%[![:space:]]*}"}"
+        val="${val%"${val##*[![:space:]]}"}"
+        # One pair of surrounding quotes, for a value whose spaces matter.
+        if (( ${#val} >= 2 )) && [[ "$val" == \"*\" || "$val" == \'*\' ]]; then
+            val="${val:1:${#val}-2}"
+        fi
+
+        vm_conf_set "$key" "$val" "$where"
+    done < "$file"
+
+    VM_CONF_LOADED_FROM="$file"
+
+    # A file holding the administrator password should not be readable by
+    # everyone on the machine. Say so rather than quietly use it.
+    if (( VM_CONF_HAS_SECRET )); then
+        mode="$(stat -c '%a' "$file" 2>/dev/null)" || mode=""
+        if [[ "$mode" =~ ^[0-7]+$ ]] && (( 8#$mode & 8#077 )); then
+            warn "$file holds the Windows password and is mode $mode - other local users can read it."
+            note "chmod 600 $file"
+        fi
+    fi
+}
+
+# vm_conf_load - locate and read the file, unless --no-vm-config said not to.
+vm_conf_load() {
+    local candidate
+    (( VM_CONF_ENABLED )) || return 0
+
+    if [[ -n "$VM_CONF_FILE" ]]; then
+        [[ -e "$VM_CONF_FILE" ]] || die "--vm-config: no such file '$VM_CONF_FILE'."
+        [[ -f "$VM_CONF_FILE" && -r "$VM_CONF_FILE" ]] || die "--vm-config: cannot read '$VM_CONF_FILE'."
+        info "Reading Windows VM settings from $VM_CONF_FILE"
+        vm_conf_read "$VM_CONF_FILE"
+        return 0
+    fi
+
+    while IFS= read -r candidate; do
+        [[ -f "$candidate" && -r "$candidate" ]] || continue
+        info "Reading Windows VM settings from $candidate"
+        vm_conf_read "$candidate"
+        return 0
+    done < <(vm_conf_search)
+    return 0
+}
+
+# vm_conf_write_sample [path] - a commented file with every setting in it,
+# switched off, so the names are discoverable without reading the script.
+vm_conf_write_sample() {
+    local target="${1:-}" dir
+    if [[ -z "$target" ]]; then
+        dir="$(cd -- "$(dirname -- "$(script_path)")" 2>/dev/null && pwd)" || dir="$PWD"
+        target="$dir/$VM_CONF_BASENAME"
+    fi
+    [[ -d "$target" ]] && target="${target%/}/$VM_CONF_BASENAME"
+
+    if [[ -e "$target" ]]; then
+        err "$target already exists - not overwriting it."
+        note "Rename it, or name a different file:"
+        note "  domain-join-setup.sh --write-vm-config /path/to/$VM_CONF_BASENAME"
+        return 1
+    fi
+    if [[ $DRY_RUN -eq 1 ]]; then
+        printf '%s  [dry-run]%s would write %s\n' "$C_CYAN" "$C_RESET" "$target"
+        return 0
+    fi
+
+    # umask, not a chmod afterwards: the file must never exist, even for an
+    # instant, in a mode that lets another user read the password put in it.
+    ( umask 077; cat >"$target" ) <<'VM_CONF_SAMPLE_EOF'
+##############################################################################
+# windows-vm.conf - answers for the unattended Windows install
+#
+# Read by domain-join-setup.sh when it builds the WinApps Windows VM, and by
+# the winapps-vm-deploy helper it installs. It covers the VM build, plus one
+# WinApps wiring setting - 'libvirt_group' - that is otherwise only a prompt.
+# The domain join, Duo and everything else stay on the flags and the menu.
+#
+# The settings between the sizing block and 'libvirt_group' go straight into
+# Autounattend.xml, and each one names the Windows unattend setting it becomes.
+#
+# Uncomment what you want to set. Anything left commented out keeps the default
+# shown, or is asked for during the build.
+#
+# Syntax: name = value, one per line. A '#' starts a comment only at the start
+# of a line, so a password containing one needs no quoting. Wrap a value in
+# quotes if its leading or trailing spaces matter.
+#
+# THIS FILE CAN HOLD THE WINDOWS ADMINISTRATOR PASSWORD. Keep it mode 0600 -
+# '--write-vm-config' creates it that way, a copy of the .example does not:
+#
+#   chmod 600 windows-vm.conf
+#
+# Where it is looked for, in order, when --vm-config does not name one:
+#   $WINDOWS_VM_CONF
+#   the directory holding domain-join-setup.sh
+#   /etc/winapps/windows-vm.conf
+#
+# A flag beats this file. WINAPPS_VM_PASS in the environment beats it too.
+##############################################################################
+
+
+# The Windows 10/11 installation media. The full path to the .iso file,
+# filename included - not the directory holding it. Left unset, the build
+# fetches Windows 11 from Microsoft with Mido, which is slower and less
+# reliable than an ISO you already have.
+#                                                      flag: --winapps-iso
+#iso = /srv/iso/Win11_24H2_English_x64.iso
+
+
+# What libvirt calls the guest.
+#                                                      flag: --winapps-vm
+#vm_name = RDPWindows
+
+
+# The local administrator account the unattended install creates, and its
+# password. This is a Windows *local* account, not a domain one: it is what you
+# sign in to the new VM with to finish setting it up, and until you join the
+# guest to the domain it is the only account on it.
+#
+# The name must be one Windows accepts: 20 characters or fewer, no spaces, no
+# trailing dot, and none of  " / \ [ ] : ; | = , + * ? < > @
+#
+# Leave the password unset and a random one is generated and printed once, at
+# the end of the build. That is fine, but it is printed only that once.
+#                                                      flag: --winapps-vm-user
+#admin    = winadmin
+#password = choose something long
+#
+# There is deliberately no flag for the password: a flag is visible in 'ps' to
+# every user on the machine for as long as the build runs. Put it here, or in
+# WINAPPS_VM_PASS, or let the build generate one.
+
+
+# Guest sizing. Windows 11 needs at least 4096 MiB and 64 GiB to install.
+#                                              flags: --winapps-vm-ram, -cpus,
+#                                                     -disk
+#ram  = 4096
+#cpus = 4
+#disk = 64
+
+
+#=============================================================================
+# The rest of the answer file
+#=============================================================================
+# These have no flags - they are set once for a machine and never typed again.
+# They land in Autounattend.xml, and the names below are the Windows unattend
+# settings they map to.
+
+
+# Which image on the ISO to install. This is the exact /IMAGE/NAME value Setup
+# matches against, so it has to be spelled the way the ISO spells it - "Windows
+# 11 Pro", "Windows 11 Enterprise", "Windows 10 Pro". 'dism /Get-WimInfo
+# /WimFile:<mounted iso>/sources/install.wim' lists what a given ISO carries.
+#                                                      unattend: /IMAGE/NAME
+#edition = Windows 11 Pro
+
+
+# Product key. Five groups of five. Setup needs a key of the right edition to
+# get past its own prompt unattended, so unless you have one, leave this alone
+# and the build uses Microsoft's published generic key for Windows Pro - which
+# selects the edition and nothing more. It does not activate Windows. If you
+# change 'edition' away from Pro you almost certainly need to set a key here.
+#                                                      unattend: ProductKey
+#product_key = XXXXX-XXXXX-XXXXX-XXXXX-XXXXX
+
+
+# The guest's Windows computer name. '*' lets Setup generate one. A real name
+# is 15 characters or fewer, letters digits and hyphens, and never all digits.
+#                                                      unattend: ComputerName
+#computer_name = *
+
+
+# Shown in Windows under 'Registered to'. Cosmetic; both are left out of the
+# answer file entirely if unset.
+#                                                      unattend: RegisteredOwner
+#                                                                RegisteredOrganization
+#owner        = Example User
+#organization = Example Ltd
+
+
+# The Windows time zone name - not an IANA one, so "Eastern Standard Time" and
+# not "America/New_York". 'tzutil /l' inside any Windows box lists them all.
+# Left unset it defaults to UTC; set it to your own zone. An empty value
+# ('timezone =') is rejected - remove the line instead.
+#                                                      unattend: TimeZone
+#timezone = Eastern Standard Time
+
+
+# Language and regional settings. ui_language is the Windows display language,
+# and unless you say otherwise the other two follow it - so an en-GB install
+# formats dates the British way without repeating yourself.
+#
+#   ui_language    the display language of Windows itself, and of Setup
+#   system_locale  the language non-Unicode programs assume  (defaults to above)
+#   user_locale    date, time, number and currency formats   (defaults to above)
+#
+# A display language only works if the ISO actually carries it; a Windows ISO
+# is normally single-language. system_locale and user_locale work regardless.
+#                                                      unattend: UILanguage
+#                                                                SystemLocale
+#                                                                UserLocale
+#ui_language   = en-US
+#system_locale = en-US
+#user_locale   = en-US
+
+
+# Keyboard layout, as Windows' own 'language:layout' hex pair - 0409:00000409
+# is US English, 0809:00000809 British, 040c:0000040c French. A plain language
+# tag such as en-GB works too, and several can be given separated by ';'.
+#                                                      unattend: InputLocale
+#input_locale = 0409:00000409
+
+
+#=============================================================================
+# WinApps wiring (libvirt backend only)
+#=============================================================================
+
+# The Active Directory group whose members may open and control the Windows
+# guest in virt-manager. A domain account is in no local group, so it cannot
+# reach the system libvirt socket by default; naming a group here writes a
+# polkit rule granting it 'org.libvirt.*' with no password. This is the only
+# setting in this file that is not part of the VM build.
+#
+# Set but blank ('libvirt_group =') means "grant nobody, don't ask" - the same
+# as pressing Enter on a blank answer at the prompt. Leave the line commented
+# out entirely and the build asks, defaulting to the realm's permitted-groups.
+# Use the exact spelling 'realm list' shows (it may include an '@domain').
+#                                                flag: --winapps-libvirt-group
+#libvirt_group = Domain Admins
+VM_CONF_SAMPLE_EOF
+
+    if [[ ! -s "$target" ]]; then
+        err "Could not write $target"
+        return 1
+    fi
+    chmod 600 "$target" 2>/dev/null
+
+    ok "Wrote $target"
+    note "Mode 0600, because it can hold the Windows administrator password."
+    note "Uncomment what applies, then build the VM as usual."
+    return 0
+}
+
 
 # ---------------------------------------------------------------------------
 # Interactive prompts
@@ -3170,6 +3592,8 @@ WINAPPS_AUTOSTART="/etc/xdg/autostart/winapps-user-config.desktop"
 WINAPPS_SKEL_DIR="/etc/skel/.config/winapps"
 WINAPPS_UPSTREAM_URL="https://raw.githubusercontent.com/winapps-org/winapps/main/setup.sh"
 WINAPPS_CONFIGURED=0
+WINAPPS_CDROMS_PENDING=0   # spare CD drives detached --config but still on the
+                          # running guest; cleared by a full power cycle
 
 # --winapps-deploy: building the Windows guest.
 WINAPPS_VM_DEPLOYER="/usr/local/bin/winapps-vm-deploy"
@@ -3611,16 +4035,163 @@ winapps_write_vm_deployer() {
 #     WA_ISO       full path to a Windows 10/11 .iso file, filename included,
 #                  not just its directory  (default: fetch with Mido)
 #
+#   The answers written into Autounattend.xml:
+#     WA_EDITION       which image to install     (default Windows 11 Pro)
+#     WA_PRODUCT_KEY   product key                (default: the generic Pro key)
+#     WA_COMPUTER_NAME the guest's Windows name   (default *, meaning random)
+#     WA_OWNER         RegisteredOwner            (default: unset)
+#     WA_ORGANIZATION  RegisteredOrganization     (default: unset)
+#     WA_TIMEZONE      Windows time zone name     (default UTC)
+#     WA_UI_LANGUAGE   display language           (default en-US)
+#     WA_SYSTEM_LOCALE non-Unicode program locale (default: the UI language)
+#     WA_USER_LOCALE   date/number formats        (default: the UI language)
+#     WA_INPUT_LOCALE  keyboard layout            (default 0409:00000409)
+#
+#   Or write them down once in /etc/winapps/windows-vm.conf (WINDOWS_VM_CONF
+#   points somewhere else). The environment wins over that file; the file only
+#   fills in what the environment did not set. See 'domain-join-setup.sh
+#   --write-vm-config' for a commented copy.
+#
 set -u
 
 VM_NAME="${WA_VM_NAME:-RDPWindows}"
-VM_ADMIN="${WA_VM_ADMIN:-Docker}"
+VM_ADMIN="${WA_VM_ADMIN:-}"
 VM_PASS="${WA_VM_PASS:-}"
-VM_RAM="${WA_VM_RAM:-4096}"
-VM_CPUS="${WA_VM_CPUS:-4}"
-VM_DISK="${WA_VM_DISK:-64}"
+VM_RAM="${WA_VM_RAM:-}"
+VM_CPUS="${WA_VM_CPUS:-}"
+VM_DISK="${WA_VM_DISK:-}"
 WIN_ISO="${WA_ISO:-}"
+
+# The Autounattend.xml answers. All optional; defaults are applied after
+# windows-vm.conf has had its say, so the file can change any of them.
+VM_EDITION="${WA_EDITION:-}"
+VM_KEY="${WA_PRODUCT_KEY:-}"
+VM_HOSTNAME="${WA_COMPUTER_NAME:-}"
+VM_OWNER="${WA_OWNER:-}"
+VM_ORG="${WA_ORGANIZATION:-}"
+VM_TZ="${WA_TIMEZONE:-}"
+VM_UILANG="${WA_UI_LANGUAGE:-}"
+VM_SYSLOCALE="${WA_SYSTEM_LOCALE:-}"
+VM_USRLOCALE="${WA_USER_LOCALE:-}"
+VM_INPUT="${WA_INPUT_LOCALE:-}"
+KEY_WAS_SET=0
+[ -n "$VM_KEY" ] && KEY_WAS_SET=1
+
 FORCE=0
+
+# windows-vm.conf - the same answer file domain-join-setup.sh reads, so a
+# rebuild here uses the settings that built the guest the first time. Anything
+# already set in the environment wins; the file only fills in the blanks. It is
+# read, not sourced: this runs as root, and an answer file is data.
+VM_CONF="${WINDOWS_VM_CONF:-/etc/winapps/windows-vm.conf}"
+if [ -f "$VM_CONF" ] && [ -r "$VM_CONF" ]; then
+    while IFS= read -r _line || [ -n "$_line" ]; do
+        _line="${_line%$(printf '\r')}"
+        _line="$(printf '%s' "$_line" | sed 's/^[[:space:]]*//')"
+        case "$_line" in ''|'#'*) continue ;; *=*) ;; *) continue ;; esac
+        _key="$(printf '%s' "${_line%%=*}" | sed 's/[[:space:]]*$//' | tr 'A-Z-' 'a-z_')"
+        _val="$(printf '%s' "${_line#*=}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+        case "$_val" in
+            \"*\") _val="${_val#\"}"; _val="${_val%\"}" ;;
+            \'*\') _val="${_val#\'}"; _val="${_val%\'}" ;;
+        esac
+        case "$_key" in
+            iso)           [ -z "$WIN_ISO" ]      && WIN_ISO="$_val" ;;
+            vm_name)       [ -z "${WA_VM_NAME:-}" ] && VM_NAME="$_val" ;;
+            admin)         [ -z "$VM_ADMIN" ]     && VM_ADMIN="$_val" ;;
+            password)      [ -z "$VM_PASS" ]      && VM_PASS="$_val" ;;
+            ram)           [ -z "$VM_RAM" ]       && VM_RAM="$_val" ;;
+            cpus)          [ -z "$VM_CPUS" ]      && VM_CPUS="$_val" ;;
+            disk)          [ -z "$VM_DISK" ]      && VM_DISK="$_val" ;;
+            edition)       [ -z "$VM_EDITION" ]   && VM_EDITION="$_val" ;;
+            product_key)   [ -z "$VM_KEY" ]       && { VM_KEY="$_val"; KEY_WAS_SET=1; } ;;
+            computer_name) [ -z "$VM_HOSTNAME" ]  && VM_HOSTNAME="$_val" ;;
+            owner)         [ -z "$VM_OWNER" ]     && VM_OWNER="$_val" ;;
+            organization)  [ -z "$VM_ORG" ]       && VM_ORG="$_val" ;;
+            timezone)      [ -z "$VM_TZ" ]        && VM_TZ="$_val" ;;
+            ui_language)   [ -z "$VM_UILANG" ]    && VM_UILANG="$_val" ;;
+            system_locale) [ -z "$VM_SYSLOCALE" ] && VM_SYSLOCALE="$_val" ;;
+            user_locale)   [ -z "$VM_USRLOCALE" ] && VM_USRLOCALE="$_val" ;;
+            input_locale)  [ -z "$VM_INPUT" ]     && VM_INPUT="$_val" ;;
+            libvirt_group) ;;   # read by domain-join-setup.sh, not a build setting
+            *) echo "$VM_CONF: unknown setting '$_key'" >&2; exit 2 ;;
+        esac
+    done < "$VM_CONF"
+    unset _line _key _val
+fi
+
+VM_ADMIN="${VM_ADMIN:-Docker}"
+VM_RAM="${VM_RAM:-4096}"
+VM_CPUS="${VM_CPUS:-4}"
+VM_DISK="${VM_DISK:-64}"
+
+# Defaults for the answer file. SystemLocale and UserLocale follow the display
+# language unless they were set on their own, which is what almost everyone
+# wants: an en-GB install should format dates the British way without having to
+# say so three times.
+VM_EDITION="${VM_EDITION:-Windows 11 Pro}"
+VM_HOSTNAME="${VM_HOSTNAME:-*}"
+VM_TZ="${VM_TZ:-UTC}"
+VM_UILANG="${VM_UILANG:-en-US}"
+VM_SYSLOCALE="${VM_SYSLOCALE:-$VM_UILANG}"
+VM_USRLOCALE="${VM_USRLOCALE:-$VM_UILANG}"
+VM_INPUT="${VM_INPUT:-0409:00000409}"
+
+# The generic ("KMS client setup") key Microsoft publishes for Windows Pro. It
+# selects the edition and gets Setup past the key prompt; it does not activate
+# anything. Only applied to the edition it belongs to - guessing a key for some
+# other edition would break the install in a way that is hard to read.
+if [ -z "$VM_KEY" ]; then
+    case "$VM_EDITION" in
+        "Windows 11 Pro"|"Windows 10 Pro") VM_KEY="W269N-WFGWX-YVC9B-4J6C9-T83GX" ;;
+    esac
+fi
+
+if [ -n "$VM_KEY" ]; then
+    case "$VM_KEY" in
+        [A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]-[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]-[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]-[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]-[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]) ;;
+        *) echo "'$VM_KEY' is not a product key: five groups of five, e.g. XXXXX-XXXXX-XXXXX-XXXXX-XXXXX." >&2; exit 1 ;;
+    esac
+fi
+
+# NetBIOS rules: 15 characters, letters digits and hyphen, never all digits.
+# '*' is Setup's own token for "generate one".
+if [ "$VM_HOSTNAME" != "*" ]; then
+    case "$VM_HOSTNAME" in
+        ""|*[!A-Za-z0-9-]*)
+            echo "'$VM_HOSTNAME' is not a valid computer name: letters, digits and hyphens only." >&2; exit 1 ;;
+        *[!0-9]*) ;;
+        *) echo "'$VM_HOSTNAME' is not a valid computer name: it cannot be all digits." >&2; exit 1 ;;
+    esac
+    [ "${#VM_HOSTNAME}" -le 15 ] \
+        || { echo "The computer name '$VM_HOSTNAME' is over 15 characters." >&2; exit 1; }
+fi
+
+for _lv in "ui_language:$VM_UILANG" "system_locale:$VM_SYSLOCALE" "user_locale:$VM_USRLOCALE"; do
+    case "${_lv#*:}" in
+        [A-Za-z][A-Za-z]|[A-Za-z][A-Za-z][A-Za-z]) ;;
+        [A-Za-z][A-Za-z]-*|[A-Za-z][A-Za-z][A-Za-z]-*) ;;
+        *) echo "'${_lv#*:}' is not a language tag for ${_lv%%:*} (expected something like en-US)." >&2; exit 1 ;;
+    esac
+done
+unset _lv
+
+# Either the hex 'language:layout' pair Windows uses internally, or a plain
+# language tag, or a ';' separated list of either.
+case "$VM_INPUT" in
+    ""|*[!A-Za-z0-9:\;-]*)
+        echo "'$VM_INPUT' is not an input locale (e.g. 0409:00000409, or en-US)." >&2; exit 1 ;;
+esac
+
+
+case "$VM_ADMIN" in
+    *[!A-Za-z0-9._-]*|*.|"")
+        echo "'$VM_ADMIN' is not a name Windows accepts for a local account." >&2
+        echo "20 characters or fewer, letters, digits, dot, dash, underscore;" >&2
+        echo "no spaces and no trailing dot." >&2
+        exit 1 ;;
+esac
+[ "${#VM_ADMIN}" -le 20 ] || { echo "The account name '$VM_ADMIN' is over 20 characters." >&2; exit 1; }
 
 CACHE="/var/lib/winapps/iso"
 VIRTIO_ISO="$CACHE/virtio-win.iso"
@@ -3947,17 +4518,47 @@ fi
 xesc() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'; }
 X_ADMIN="$(xesc "$VM_ADMIN")"
 X_PASS="$(xesc "$VM_PASS")"
+X_EDITION="$(xesc "$VM_EDITION")"
+X_HOSTNAME="$(xesc "$VM_HOSTNAME")"
+X_UILANG="$(xesc "$VM_UILANG")"
+X_SYSLOCALE="$(xesc "$VM_SYSLOCALE")"
+X_USRLOCALE="$(xesc "$VM_USRLOCALE")"
+X_INPUT="$(xesc "$VM_INPUT")"
+
+# Optional elements are appended to a line rather than given lines of their
+# own, so that leaving one unset removes it completely instead of leaving a
+# blank line behind. An empty <ProductKey/> is not the same as no key at all,
+# and an empty <RegisteredOwner/> shows in Windows as a blank owner rather than
+# as the default.
+X_PRODUCTKEY=""
+if [ -n "$VM_KEY" ]; then
+    X_PRODUCTKEY="
+        <ProductKey><Key>$(xesc "$VM_KEY")</Key><WillShowUI>OnError</WillShowUI></ProductKey>"
+else
+    echo "  No product key for edition '$VM_EDITION'. Setup will ask for one unless"
+    echo "  the ISO supplies it. Set product_key in windows-vm.conf to avoid that."
+fi
+
+# TimeZone is always written - it defaults to UTC when nothing set it, so an
+# unattended install never inherits an unpredictable zone from the media.
+# RegisteredOwner and RegisteredOrganization are still omitted when unset.
+X_SPECIALIZE="
+      <TimeZone>$(xesc "$VM_TZ")</TimeZone>"
+[ -n "$VM_OWNER" ] && X_SPECIALIZE="$X_SPECIALIZE
+      <RegisteredOwner>$(xesc "$VM_OWNER")</RegisteredOwner>"
+[ -n "$VM_ORG" ] && X_SPECIALIZE="$X_SPECIALIZE
+      <RegisteredOrganization>$(xesc "$VM_ORG")</RegisteredOrganization>"
 
 cat > "$ISO_ROOT/Autounattend.xml" <<XML
 <?xml version="1.0" encoding="utf-8"?>
 <unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
   <settings pass="windowsPE">
     <component name="Microsoft-Windows-International-Core-WinPE" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
-      <SetupUILanguage><UILanguage>en-US</UILanguage></SetupUILanguage>
-      <InputLocale>0409:00000409</InputLocale>
-      <SystemLocale>en-US</SystemLocale>
-      <UILanguage>en-US</UILanguage>
-      <UserLocale>en-US</UserLocale>
+      <SetupUILanguage><UILanguage>$X_UILANG</UILanguage></SetupUILanguage>
+      <InputLocale>$X_INPUT</InputLocale>
+      <SystemLocale>$X_SYSLOCALE</SystemLocale>
+      <UILanguage>$X_UILANG</UILanguage>
+      <UserLocale>$X_USRLOCALE</UserLocale>
     </component>
     <component name="Microsoft-Windows-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
       <RunSynchronous>
@@ -3986,20 +4587,19 @@ cat > "$ISO_ROOT/Autounattend.xml" <<XML
       <ImageInstall>
         <OSImage>
           <InstallFrom>
-            <MetaData wcm:action="add"><Key>/IMAGE/NAME</Key><Value>Windows 11 Pro</Value></MetaData>
+            <MetaData wcm:action="add"><Key>/IMAGE/NAME</Key><Value>$X_EDITION</Value></MetaData>
           </InstallFrom>
           <InstallTo><DiskID>0</DiskID><PartitionID>3</PartitionID></InstallTo>
         </OSImage>
       </ImageInstall>
-      <UserData>
-        <ProductKey><Key>W269N-WFGWX-YVC9B-4J6C9-T83GX</Key><WillShowUI>OnError</WillShowUI></ProductKey>
+      <UserData>$X_PRODUCTKEY
         <AcceptEula>true</AcceptEula>
       </UserData>
     </component>
   </settings>
   <settings pass="specialize">
     <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
-      <ComputerName>*</ComputerName>
+      <ComputerName>$X_HOSTNAME</ComputerName>$X_SPECIALIZE
     </component>
     <component name="Microsoft-Windows-Deployment" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
       <RunSynchronous>
@@ -4009,10 +4609,10 @@ cat > "$ISO_ROOT/Autounattend.xml" <<XML
   </settings>
   <settings pass="oobeSystem">
     <component name="Microsoft-Windows-International-Core" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
-      <InputLocale>0409:00000409</InputLocale>
-      <SystemLocale>en-US</SystemLocale>
-      <UILanguage>en-US</UILanguage>
-      <UserLocale>en-US</UserLocale>
+      <InputLocale>$X_INPUT</InputLocale>
+      <SystemLocale>$X_SYSLOCALE</SystemLocale>
+      <UILanguage>$X_UILANG</UILanguage>
+      <UserLocale>$X_USRLOCALE</UserLocale>
     </component>
     <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
       <OOBE>
@@ -4209,11 +4809,27 @@ echo ""
 WINAPPS_VMDEPLOY_EOF
 }
 
+# winapps_vm_admin_ok <name> - is this usable as a Windows local account name?
+#
+# Windows rejects these characters outright, caps the name at 20 characters and
+# will not take a trailing dot. The name is written into Autounattend.xml, where
+# a bad one does not fail loudly - Setup simply creates no account, and the
+# first sign that anything is wrong is a VM nobody can log into.
+winapps_vm_admin_ok() {
+    local name="$1"
+    [[ -n "$name" ]] || return 1
+    (( ${#name} <= 20 )) || return 1
+    [[ "$name" != *. ]] || return 1
+    [[ "$name" != *[\"/\\\[\]:\;\|=,+*?\<\>@\ ]* ]] || return 1
+    return 0
+}
+
 # Collect the guest parameters and run the deployer. libvirt backend only.
 winapps_deploy_vm() {
     local ram="${OPT_WINAPPS_VM_RAM:-4096}" cpus="${OPT_WINAPPS_VM_CPUS:-4}"
     local disk="${OPT_WINAPPS_VM_DISK:-64}" iso="$OPT_WINAPPS_ISO"
     local vm="${OPT_WINAPPS_VM:-RDPWindows}"
+    local admin="$OPT_WINAPPS_VM_ADMIN" pass="$OPT_WINAPPS_VM_PASS" pass2
 
     if [[ -z "$iso" && $ASSUME_YES -ne 1 ]]; then
         printf '\n'
@@ -4246,12 +4862,55 @@ winapps_deploy_vm() {
         fi
     fi
     if [[ $ASSUME_YES -ne 1 ]]; then
-        ask_value ram  "Guest RAM (MiB)"  "$ram"
-        ask_value cpus "Guest vCPUs"      "$cpus"
-        ask_value disk "Guest disk (GiB)" "$disk"
+        # A value already supplied by the config file or a flag is taken as the
+        # answer, the same way iso/admin/password are below. Only prompt for the
+        # ones left at their built-in default.
+        [[ -n "$OPT_WINAPPS_VM_RAM"  ]] || ask_value ram  "Guest RAM (MiB)"  "$ram"
+        [[ -n "$OPT_WINAPPS_VM_CPUS" ]] || ask_value cpus "Guest vCPUs"      "$cpus"
+        [[ -n "$OPT_WINAPPS_VM_DISK" ]] || ask_value disk "Guest disk (GiB)" "$disk"
+
+        # The local administrator inside the guest. A Windows local account,
+        # not a domain one - it is what you sign in to the new VM with.
+        if [[ -z "$admin" ]]; then
+            printf '\n'
+            note "The unattended install creates one local administrator account inside"
+            note "Windows. It is a Windows account, not a domain one - it is what you"
+            note "sign in to the new VM with to finish setting it up."
+            while : ; do
+                ask_value admin "Windows local administrator account" "Docker"
+                winapps_vm_admin_ok "$admin" && break
+                err "Windows will not accept that name: 20 characters or fewer, no"
+                note "spaces and none of  \" / \\ [ ] : ; | = , + * ? < > @  and no trailing dot."
+                admin=""
+            done
+        fi
+        if [[ -z "$pass" ]]; then
+            note "Leave the password blank to have a random one generated - it is"
+            note "printed once, at the end of the build, and not stored anywhere."
+            while : ; do
+                ask_secret pass  "Password for $admin"
+                [[ -z "$pass" ]] && break                  # blank = generate one
+                ask_secret pass2 "Repeat it"
+                [[ "$pass" == "$pass2" ]] && break
+                err "Those did not match."
+                pass=""
+            done
+            pass2=""
+        fi
+    fi
+    admin="${admin:-Docker}"
+    if ! winapps_vm_admin_ok "$admin"; then
+        err "'$admin' is not a name Windows will accept for a local account."
+        note "20 characters or fewer, no spaces, no trailing dot, and none of"
+        note "  \" / \\ [ ] : ; | = , + * ? < > @"
+        return 1
+    fi
+    if [[ -n "$pass" ]] && (( ${#pass} < 8 )); then
+        warn "That password is under 8 characters; Windows may refuse to set it."
     fi
 
     info "Deploying the Windows guest '$vm'"
+    [[ -n "$VM_CONF_LOADED_FROM" ]] && note "answers from $VM_CONF_LOADED_FROM"
     if [[ $DRY_RUN -eq 1 ]]; then
         printf '%s  [dry-run]%s %s %s\n' "$C_CYAN" "$C_RESET" "$WINAPPS_VM_DEPLOYER" \
             "${iso:+--iso $iso}"
@@ -4259,7 +4918,13 @@ winapps_deploy_vm() {
     fi
 
     WA_VM_NAME="$vm" WA_VM_RAM="$ram" WA_VM_CPUS="$cpus" WA_VM_DISK="$disk" \
-    WA_VM_PASS="$OPT_WINAPPS_VM_PASS" WA_ISO="$iso" \
+    WA_VM_ADMIN="$admin" WA_VM_PASS="$pass" WA_ISO="$iso" \
+    WA_EDITION="$OPT_VM_EDITION" WA_PRODUCT_KEY="$OPT_VM_PRODUCT_KEY" \
+    WA_COMPUTER_NAME="$OPT_VM_COMPUTER_NAME" \
+    WA_OWNER="$OPT_VM_OWNER" WA_ORGANIZATION="$OPT_VM_ORGANIZATION" \
+    WA_TIMEZONE="$OPT_VM_TIMEZONE" WA_UI_LANGUAGE="$OPT_VM_UI_LANGUAGE" \
+    WA_SYSTEM_LOCALE="$OPT_VM_SYSTEM_LOCALE" WA_USER_LOCALE="$OPT_VM_USER_LOCALE" \
+    WA_INPUT_LOCALE="$OPT_VM_INPUT_LOCALE" \
         "$WINAPPS_VM_DEPLOYER" || {
         err "The Windows guest could not be deployed."
         note "Fix the problem above, then re-run (--force clears the half-built guest):"
@@ -4271,13 +4936,203 @@ winapps_deploy_vm() {
     return 0
 }
 
+# 'setup.sh --system' reads its RDP settings from $HOME/.config/winapps, and
+# $HOME here is root's. Seed it so the program scan connects to Windows as the
+# guest's *local* administrator - the 'admin' / 'password' from windows-vm.conf.
+# That account exists whether or not the guest is domain-joined, which a domain
+# identity here would not: it cannot authenticate before the join and is not
+# needed after it. The per-user template and its Kerberos/askpass wiring are for
+# the domain users who log into this machine later, and are not used here.
+#
+# The password goes into a root-only askpass helper, never RDP_PASS, so it is
+# not a '/p:' argument visible in 'ps' or the WinApps log. With no password
+# available (a build-generated random one) it asks, or warns and moves on.
+winapps_seed_scan_config() {
+    local installer="${1:-$WINAPPS_ETC_DIR/setup.sh}"
+    [[ -n "${HOME:-}" && -r "$WINAPPS_TEMPLATE" ]] || return 0
+
+    local scan_user="${OPT_WINAPPS_VM_ADMIN:-Docker}"
+    local scan_pass="$OPT_WINAPPS_VM_PASS"
+    if [[ -z "$scan_pass" && -t 0 ]]; then
+        printf '\n'
+        note "The one-time program scan signs into Windows as its local"
+        note "administrator to list what is installed. windows-vm.conf did not"
+        note "carry a password (the build generated a random one), so:"
+        ask_value  scan_user "Windows account for the program scan" "$scan_user"
+        ask_secret scan_pass "Password for $scan_user"
+    fi
+
+    mkdir -p "$HOME/.config/winapps"
+    local askpass="$HOME/.config/winapps/scan-askpass"
+    if [[ -n "$scan_pass" ]]; then
+        local esc="${scan_pass//\'/\'\\\'\'}"
+        printf "#!/bin/sh\nprintf '%%s' '%s'\n" "$esc" >"$askpass"
+        chmod 700 "$askpass"
+    else
+        rm -f "$askpass"
+    fi
+
+    # Start from the template so libvirt IP discovery (VM_NAME) is preserved,
+    # then override: connect as a local account, no domain, no Kerberos NLA.
+    #
+    # '/cert:tofu' becomes '/cert:ignore' for this one connection. The guest's
+    # self-signed RDP certificate is regenerated whenever its hostname changes -
+    # which it does the moment the guest is joined to the domain (CN goes from
+    # 'HOST' to 'HOST.realm'). TOFU then sees a *changed* key, refuses it, and
+    # prompts - but the scan runs with no terminal, so it aborts at the TLS
+    # handshake before authentication (ERRCONNECT_TLS_CONNECT_FAILED). The
+    # per-user template keeps '/cert:tofu'; this is the scan's copy only.
+    sed -e "s|^RDP_USER=.*|RDP_USER=\"$scan_user\"|" \
+        -e 's|^RDP_DOMAIN=.*|RDP_DOMAIN=""|' \
+        -e 's|^RDP_PASS=.*|RDP_PASS=""|' \
+        -e "s|^RDP_ASKPASS=.*|RDP_ASKPASS=\"$askpass\"|" \
+        -e 's| /sec:nla||' \
+        -e 's|/cert:tofu|/cert:ignore|' \
+        "$WINAPPS_TEMPLATE" >"$HOME/.config/winapps/winapps.conf"
+    chmod 600 "$HOME/.config/winapps/winapps.conf"
+
+    # Drop any host key this root account pinned on an earlier scan attempt -
+    # with '/cert:ignore' FreeRDP no longer consults the store, but a stale pin
+    # left here is confusing to anyone who looks.
+    rm -f "$HOME/.config/freerdp/server/"*.pem 2>/dev/null
+
+    if [[ -z "$scan_pass" ]]; then
+        warn "No password available for the program scan; it will likely fail."
+        note "Add 'password' to windows-vm.conf, then:  sudo $installer --system"
+    fi
+    return 0
+}
+
+# Once the operator confirms Windows is installed and up, the three install CDs
+# (the '-install.iso', virtio and unattend media) have done their job - they are
+# only read during Setup and first boot. Eject any media still loaded so a later
+# reboot cannot drop back into Setup, and detach the spare drives, leaving one
+# empty CD-ROM for mounting an ISO by hand later. libvirt backend only.
+winapps_strip_vm_cdroms() {
+    [[ "$OPT_WINAPPS_BACKEND" == "libvirt" ]] || return 0
+    have virsh || return 0
+
+    local vm="${OPT_WINAPPS_VM:-RDPWindows}" uri="qemu:///system"
+    virsh -c "$uri" dominfo "$vm" >/dev/null 2>&1 || return 0
+
+    local -a cdroms=()
+    mapfile -t cdroms < <(
+        virsh -c "$uri" domblklist --details "$vm" 2>/dev/null \
+            | awk '$2 == "cdrom" { print $3 }'
+    )
+    (( ${#cdroms[@]} )) || return 0
+
+    local keep="${cdroms[0]}" spare=$(( ${#cdroms[@]} - 1 ))
+    local msg="Eject the install media from guest '$vm'"
+    if (( spare > 0 )); then
+        msg+=" and remove $spare spare CD drive"
+        (( spare > 1 )) && msg+="s"
+        msg+=" (keeps one)"
+    fi
+    if ! confirm "$msg?" "y"; then
+        note "Left the CD drives on '$vm' as they are."
+        return 0
+    fi
+
+    local state t running=0 detached=0
+    state="$(virsh -c "$uri" domstate "$vm" 2>/dev/null)"
+    [[ "$state" == "running" ]] && running=1
+
+    for t in "${cdroms[@]}"; do
+        if [[ "$t" == "$keep" ]]; then
+            # Ejecting a medium is a live operation; keep the drive itself.
+            local -a eflags=(--config); (( running )) && eflags+=(--live)
+            if [[ $DRY_RUN -eq 1 ]]; then
+                printf '%s  [dry-run]%s virsh change-media %s %s --eject %s\n' \
+                    "$C_CYAN" "$C_RESET" "$vm" "$t" "${eflags[*]}"
+            elif virsh -c "$uri" change-media "$vm" "$t" --eject "${eflags[@]}" >/dev/null 2>&1; then
+                ok "Ejected the media in $t on '$vm'"
+            else
+                note "$t on '$vm' is already empty."
+            fi
+            continue
+        fi
+
+        # Eject the medium first, live, so the ISO drops off the running guest
+        # straight away even though the drive letter lingers.
+        local -a xflags=(--config); (( running )) && xflags+=(--live)
+        if [[ $DRY_RUN -eq 1 ]]; then
+            printf '%s  [dry-run]%s virsh change-media %s %s --eject %s\n' \
+                "$C_CYAN" "$C_RESET" "$vm" "$t" "${xflags[*]}"
+        elif virsh -c "$uri" change-media "$vm" "$t" --eject "${xflags[@]}" >/dev/null 2>&1; then
+            ok "Ejected the media in $t on '$vm'"
+        fi
+
+        # libvirt will not hot-unplug a CD-ROM ('--live' is rejected), so the
+        # drive comes out of the persistent definition only and is gone at the
+        # next full power cycle - a reboot from inside Windows is not enough.
+        if [[ $DRY_RUN -eq 1 ]]; then
+            printf '%s  [dry-run]%s virsh detach-disk %s %s --config\n' \
+                "$C_CYAN" "$C_RESET" "$vm" "$t"
+            detached=1
+        elif virsh -c "$uri" detach-disk "$vm" "$t" --config >/dev/null 2>&1; then
+            ok "Removed CD drive $t from the definition of '$vm'"
+            detached=1
+        else
+            warn "Could not remove CD drive $t from '$vm'."
+            note "By hand:  virsh -c $uri detach-disk $vm $t --config"
+        fi
+    done
+
+    (( detached && running )) && WINAPPS_CDROMS_PENDING=1
+    return 0
+}
+
+# The spare CD drives detach from the persistent definition only - libvirt will
+# not hot-unplug a CD-ROM - so they stay on the running guest until it is fully
+# powered off. Offer to do that now; a Windows-side reboot is not enough.
+winapps_offer_cdrom_powercycle() {
+    (( WINAPPS_CDROMS_PENDING )) || return 0
+    WINAPPS_CDROMS_PENDING=0
+
+    local vm="${OPT_WINAPPS_VM:-RDPWindows}" uri="qemu:///system"
+    have virsh || return 0
+    virsh -c "$uri" domstate "$vm" 2>/dev/null | grep -q running || return 0
+
+    printf '\n'
+    if [[ $DRY_RUN -eq 1 ]]; then
+        note "[dry-run] would offer to power-cycle '$vm' to drop the spare CD drives."
+        return 0
+    fi
+    if [[ $ASSUME_YES -eq 1 ]]; then
+        note "The spare CD drives clear at the next full shutdown of '$vm'."
+        note "Power-cycle by hand:  virsh -c $uri shutdown $vm  (wait) then  start $vm"
+        return 0
+    fi
+    if ! confirm "Power-cycle '$vm' now to finish removing the spare CD drives?" "n"; then
+        note "Left running. The spare drives clear at its next full shutdown"
+        note "(a reboot from inside Windows is not enough)."
+        return 0
+    fi
+
+    info "Shutting '$vm' down"
+    virsh -c "$uri" shutdown "$vm" >/dev/null 2>&1
+    local waited=0
+    while (( waited < 120 )); do
+        virsh -c "$uri" domstate "$vm" 2>/dev/null | grep -q 'shut off' && break
+        sleep 3; waited=$(( waited + 3 ))
+    done
+    if virsh -c "$uri" domstate "$vm" 2>/dev/null | grep -q 'shut off'; then
+        virsh -c "$uri" start "$vm" >/dev/null 2>&1 \
+            && ok "'$vm' power-cycled; it is booting with only the kept CD drive." \
+            || warn "'$vm' is shut off but did not start again; start it with 'virsh start $vm'."
+    else
+        warn "'$vm' did not shut down within two minutes - left it running."
+        note "Finish it by hand when convenient:  virsh -c $uri shutdown $vm  then  start $vm"
+    fi
+}
+
 # Run the upstream installer with --system, which is what puts the launchers in
 # /usr/share/applications for every account.
 #
 # It cannot be run blind: the installer connects to Windows and enumerates the
-# installed programs, so Windows has to be up, reachable over RDP and - for this
-# to be worth anything - already joined to the domain. When it is not, the
-# groundwork is left in place and the command is printed for later.
+# installed programs, so Windows has to be up and reachable over RDP. When it is
+# not, the groundwork is left in place and the command is printed for later.
 winapps_install_upstream() {
     local installer="$WINAPPS_ETC_DIR/setup.sh" rc=0
 
@@ -4288,6 +5143,8 @@ winapps_install_upstream() {
         printf '    %ssudo %s --system%s\n' "$C_CYAN" "$installer" "$C_RESET"
         return 0
     fi
+
+    winapps_strip_vm_cdroms
 
     info "Fetching the WinApps installer"
     if [[ $DRY_RUN -eq 1 ]]; then
@@ -4306,17 +5163,7 @@ winapps_install_upstream() {
     fi
     chmod 0755 "$installer"
 
-    # The installer reads its config from $HOME, and $HOME here is root's. Seed
-    # root from the same template so the app scan has something to connect with.
-    if [[ -n "${HOME:-}" && -r "$WINAPPS_TEMPLATE" ]]; then
-        "$WINAPPS_SEEDER" >/dev/null 2>&1 || true
-        if [[ ! -f "$HOME/.config/winapps/winapps.conf" ]]; then
-            mkdir -p "$HOME/.config/winapps"
-            sed "s/@WINAPPS_USER@/${OPT_WINAPPS_RDP_USER:-Administrator}/g" \
-                "$WINAPPS_TEMPLATE" >"$HOME/.config/winapps/winapps.conf"
-            chmod 600 "$HOME/.config/winapps/winapps.conf"
-        fi
-    fi
+    winapps_seed_scan_config "$installer"
 
     info "Running the WinApps installer (system-wide)"
     run "$installer" --system || rc=$?
@@ -4349,6 +5196,15 @@ winapps_remove() {
         fi
     done
 
+    # The program-scan password helper (root only), if a scan ever wrote one.
+    if [[ -n "${HOME:-}" && -e "$HOME/.config/winapps/scan-askpass" ]]; then
+        if [[ $DRY_RUN -eq 1 ]]; then
+            printf '%s  [dry-run]%s remove %s\n' "$C_CYAN" "$C_RESET" "$HOME/.config/winapps/scan-askpass"
+        else
+            rm -f "$HOME/.config/winapps/scan-askpass" && ok "Removed $HOME/.config/winapps/scan-askpass"
+        fi
+    fi
+
     # The Windows guest is only torn down when explicitly asked - its disk holds
     # a full Windows install and whatever was saved inside it.
     local vm="${OPT_WINAPPS_VM:-RDPWindows}"
@@ -4378,7 +5234,7 @@ winapps_remove() {
     note "  - each user's ~/.config/winapps/winapps.conf"
     note "  - the launchers in /usr/share/applications"
     note "  - the cached ISOs in $WINAPPS_ISO_CACHE"
-    note "To remove those too:  sudo $WINAPPS_ETC_DIR/setup.sh --uninstall"
+    note "To remove those too:  sudo $WINAPPS_ETC_DIR/setup.sh --system --uninstall"
     return 0
 }
 
@@ -4393,7 +5249,12 @@ winapps_print_summary() {
     case "$OPT_WINAPPS_BACKEND" in
         manual) printf '  Windows host   : %s:%s\n' "${OPT_WINAPPS_HOST:-?}" "${OPT_WINAPPS_PORT:-3389}" ;;
         libvirt) printf '  libvirt VM     : %s%s\n' "${OPT_WINAPPS_VM:-RDPWindows}" \
-                     "$( (( WINAPPS_VM_DEPLOYED )) && printf ' (installing now)' )" ;;
+                     "$( (( WINAPPS_VM_DEPLOYED )) && printf ' (installing now)' )"
+                 if [[ -n "$OPT_WINAPPS_LIBVIRT_GROUP" ]]; then
+                     printf '  virt-manager   : qemu:///system open to %s\n' "$OPT_WINAPPS_LIBVIRT_GROUP"
+                 else
+                     printf '  virt-manager   : local '\''libvirt'\'' group only\n'
+                 fi ;;
     esac
     if [[ -n "$freerdp" ]]; then
         printf '  FreeRDP        : %s\n' "$freerdp"
@@ -4425,6 +5286,107 @@ winapps_print_summary() {
             "$C_CYAN" "$WINAPPS_VM_DEPLOYER" "$C_RESET" "$C_DIM" "$C_RESET"
     fi
     return 0
+}
+
+# The AD group realmd was told may log in - the sensible default for who should
+# also be able to open the local Windows VM. Empty when logins were opened to
+# every domain user, or when realm isn't present.
+winapps_default_libvirt_group() {
+    have realm || return 0
+    realm list 2>/dev/null | awk -F': *' '/^[[:space:]]*permitted-groups:/ {print $2; exit}'
+}
+
+# ---------------------------------------------------------------------------
+# virt-manager / qemu:///system access for domain users
+#
+# The system libvirt socket (/run/libvirt/libvirt-sock) is mode 0770 root:libvirt
+# out of the box. A domain account is in no local group, so virt-manager's
+# connection is refused at the socket - before polkit is ever consulted - with a
+# bare "Permission denied on ... libvirt-sock", not an auth prompt. Per-user
+# 'usermod -aG libvirt' does not scale to a directory.
+#
+# The fix, applied once:
+#   - open the RW socket to every local user; authorisation still runs through
+#     polkit. Both the libvirtd.conf key and a drop-in on the .socket units are
+#     written, because whichever of the two is in force depends on whether the
+#     build is socket-activated (Fedora, recent Debian) or not.
+#   - a polkit rule granting org.libvirt.* to one AD group with no password.
+#
+# libvirt backend only - docker/podman/manual never touch the system libvirt.
+winapps_grant_libvirt_access() {
+    local grp="$1"
+    if [[ -z "$grp" ]]; then
+        printf '\n'
+        note "No libvirt access group set: virt-manager will reach qemu:///system"
+        note "only for members of the local 'libvirt' group. Add a domain user with"
+        note "'sudo usermod -aG libvirt <user>', or re-run with --winapps-libvirt-group."
+        return 0
+    fi
+
+    printf '\n'
+    info "Granting '$grp' access to the local Windows VM (qemu:///system)"
+
+    # --- socket permissions: the non-socket-activated path -----------------
+    local c hit=0
+    for c in /etc/libvirt/libvirtd.conf /etc/libvirt/virtqemud.conf /etc/libvirt/virtproxyd.conf; do
+        [[ -f "$c" ]] || continue
+        hit=1
+        if grep -Eq '^[[:space:]]*#?[[:space:]]*unix_sock_rw_perms[[:space:]]*=' "$c"; then
+            run_quiet sed -ri 's|^[[:space:]]*#?[[:space:]]*unix_sock_rw_perms[[:space:]]*=.*|unix_sock_rw_perms = "0777"|' "$c" \
+                && ok "$c: unix_sock_rw_perms = \"0777\""
+        elif [[ $DRY_RUN -eq 0 ]]; then
+            printf '\n# domain-join-setup: reachable by any local user; polkit still authorises\nunix_sock_rw_perms = "0777"\n' >>"$c" \
+                && ok "$c: unix_sock_rw_perms = \"0777\" appended"
+        fi
+    done
+    (( hit )) || note "No libvirt daemon config to adjust; relying on the socket drop-in."
+
+    # --- socket permissions: the socket-activated path --------------------
+    # Socket-activated libvirtd takes the mode from the .socket unit and ignores
+    # the .conf key entirely, so cover that with a drop-in on each unit present.
+    local sock
+    for sock in libvirtd virtqemud virtproxyd; do
+        unit_exists "$sock.socket" || continue
+        winapps_install_file "/etc/systemd/system/$sock.socket.d/override.conf" 0644 <<'SOCK_EOF'
+# Written by domain-join-setup. Any local user may open the socket; polkit still
+# decides who may manage qemu:///system - see the rule in
+# /etc/polkit-1/rules.d/49-domain-join-libvirt.rules.
+[Socket]
+SocketMode=0777
+SOCK_EOF
+    done
+
+    # --- polkit rule -----------------------------------------------------
+    local esc="$grp"
+    esc="${esc//\\/\\\\}"
+    esc="${esc//\"/\\\"}"
+    winapps_install_file /etc/polkit-1/rules.d/49-domain-join-libvirt.rules 0644 <<POLKIT_EOF
+// Written by domain-join-setup.
+// Members of "$grp" manage qemu:///system with no password prompt.
+// Delete this file to revoke it. Needs polkit with JS rules (0.106+).
+polkit.addRule(function(action, subject) {
+    if (action.id.indexOf("org.libvirt.") === 0 &&
+        subject.isInGroup("$esc")) {
+        return polkit.Result.YES;
+    }
+});
+POLKIT_EOF
+
+    # --- reload and restart so the socket is recreated with the new mode --
+    if have systemctl && [[ $DRY_RUN -eq 0 ]]; then
+        run_quiet systemctl daemon-reload
+        local u
+        for u in libvirtd.socket libvirtd-ro.socket libvirtd-admin.socket \
+                 virtqemud.socket virtqemud-ro.socket virtqemud-admin.socket \
+                 libvirtd.service virtqemud.service; do
+            unit_exists "$u" || continue
+            { systemctl is-active --quiet "$u" || systemctl is-enabled --quiet "$u"; } 2>/dev/null || continue
+            run_quiet systemctl restart "$u" && ok "restarted $u"
+        done
+    fi
+
+    note "Group membership is read at login: a user already signed in must log"
+    note "out and back in before virt-manager will connect."
 }
 
 # The whole WinApps step.
@@ -4528,6 +5490,21 @@ configure_winapps() {
         podman)  enable_service podman.socket ;;
     esac
 
+    # --- Domain-user access to qemu:///system (libvirt backend only) ------
+    if [[ "$OPT_WINAPPS_BACKEND" == "libvirt" ]]; then
+        if [[ -z "$OPT_WINAPPS_LIBVIRT_GROUP" && $ASSUME_YES -ne 1 \
+              && $VM_CONF_HAS_LIBVIRT_GROUP -ne 1 ]]; then
+            local dflt
+            dflt="$(winapps_default_libvirt_group)"
+            printf '\n'
+            note "virt-manager talks to the system libvirt, which a domain account"
+            note "cannot reach by default. Name the AD group whose members should be"
+            note "able to open and control the Windows VM (blank to skip)."
+            ask_value OPT_WINAPPS_LIBVIRT_GROUP "AD group for libvirt/virt-manager access" "$dflt"
+        fi
+        winapps_grant_libvirt_access "$OPT_WINAPPS_LIBVIRT_GROUP"
+    fi
+
     # --- Build the Windows guest (libvirt backend only) --------------------
     if [[ "$OPT_WINAPPS_BACKEND" == "libvirt" ]]; then
         local do_deploy=0
@@ -4571,6 +5548,7 @@ configure_winapps() {
     # --- Launchers ----------------------------------------------------------
     printf '\n'
     winapps_install_upstream || true
+    winapps_offer_cdrom_powercycle
 
     WINAPPS_CONFIGURED=1
     printf '\n'
@@ -5013,6 +5991,31 @@ action_winapps() {
     configure_winapps
 }
 
+# The WinApps program scan on its own. 'setup.sh --system' signs into Windows,
+# lists what is installed and rewrites the shared launchers - the same command
+# for the first scan and every re-scan after a program is added or removed. The
+# 'Windows apps for every user' step runs this at its end, so a batch that ran
+# that too has nothing left to do here.
+action_winapps_scan() {
+    heading "WinApps - scan Windows for installed programs"
+
+    if (( WINAPPS_CONFIGURED )); then
+        note "The WinApps step already scanned Windows in this run; nothing to do."
+        return 0
+    fi
+    if [[ ! -r "$WINAPPS_TEMPLATE" ]]; then
+        warn "WinApps is not set up on this machine yet ($WINAPPS_TEMPLATE is missing)."
+        note "Run 'Windows apps for every user' first - it writes the configuration"
+        note "and does the initial scan. This entry is for re-scanning afterwards."
+        return 1
+    fi
+
+    local rc=0
+    winapps_install_upstream || rc=$?
+    winapps_offer_cdrom_powercycle
+    return $rc
+}
+
 action_sddm_greeter() {
     local dm
     dm="$(active_display_manager)"
@@ -5101,10 +6104,10 @@ fi
 MENU_TITLE="Active Directory Domain Join - Setup and Configuration"
 
 # The entries fill a two-column grid, left column first. An even number of
-# entries splits evenly (here 6 and 6); an odd number leaves one over, drawn as
-# a full-width row centred underneath both columns. MENU_LEFT_COUNT and
-# MENU_RIGHT_COUNT below say where the split falls - keep their sum equal to the
-# entry count for an even list, or one short of it for an odd list.
+# entries splits evenly; an odd number puts the extra row in the left column
+# (MENU_LEFT_COUNT one more than MENU_RIGHT_COUNT). MENU_LEFT_COUNT and
+# MENU_RIGHT_COUNT below say where the split falls - their sum is the entry
+# count, and the two differ by no more than one.
 MENU_NAMES=(
     "Guided setup"
     "Install packages only"
@@ -5117,6 +6120,7 @@ MENU_NAMES=(
     "Grant sudo to a user or group"
     "Duo two-factor authentication"
     "Windows apps for every user"
+    "Scan Windows for installed apps"
     "Preflight checks and domain status"
 )
 # One line of explanation per entry, shown for whichever entry the cursor is
@@ -5134,22 +6138,24 @@ MENU_HINTS=(
     "Give an account or a group sudo through its own /etc/sudoers.d file"
     "Second factor for local and domain logins via Duo Unix, or remove it"
     "Windows programs in the app menu, configured per domain user via WinApps"
+    "Re-run the WinApps program scan - after the first install and any app change"
     "Read-only: hostname, clock, DNS, membership and service state"
 )
 
-MENU_LEFT_COUNT=6
+MENU_LEFT_COUNT=7
 MENU_RIGHT_COUNT=6
-MENU_TOTAL=12
+MENU_TOTAL=13
 MENU_CURSOR=0
-MENU_SELECTED=(0 0 0 0 0 0 0 0 0 0 0 0)
+MENU_SELECTED=(0 0 0 0 0 0 0 0 0 0 0 0 0)
 
 # The order selections run in: install first, then configure, then join, then
 # the settings that only make sense once the machine is a domain member - and
 # Duo last of all, since it is the only entry that can stop a login working.
 #
 # WinApps sits after the join (index 10, run late) because it reads the joined
-# realm to fill in RDP_DOMAIN, but still ahead of Duo.
-MENU_RUN_ORDER=(0 1 2 4 5 11 3 7 6 8 10 9)
+# realm to fill in RDP_DOMAIN, but still ahead of Duo. The WinApps scan (index
+# 11) runs straight after it; the read-only status check is index 12.
+MENU_RUN_ORDER=(0 1 2 4 5 12 3 7 6 8 10 11 9)
 
 MCOL=0
 MROW=0
@@ -5842,7 +6848,8 @@ menu_run_action() {
         8) action_sudo_access ;;
         9) action_duo ;;
         10) action_winapps ;;
-        11) action_status ;;
+        11) action_winapps_scan ;;
+        12) action_status ;;
         *) return 1 ;;
     esac
 }
@@ -5858,6 +6865,7 @@ reset_step_guards() {
     DUO_DONE=0
     POST_JOIN_TUNING_DONE=0
     SUDO_ACCESS_DONE=0
+    WINAPPS_CONFIGURED=0    # so a batch's scan entry can tell it already ran
 }
 
 # Run everything that was ticked, in MENU_RUN_ORDER.
@@ -6109,6 +7117,11 @@ ${C_BOLD}WINDOWS APPLICATIONS (WINAPPS)${C_RESET}
       --winapps-host ADDR Windows hostname or IP. Required for 'manual'.
       --winapps-port PORT RDP port (default 3389).
       --winapps-vm NAME   libvirt VM name (default RDPWindows).
+      --winapps-libvirt-group G
+                          AD group whose members may open the local Windows VM
+                          in virt-manager (qemu:///system). Defaults to the
+                          realm's permitted-logins group; blank skips it. Also
+                          settable as 'libvirt_group' in windows-vm.conf.
       --winapps-domain D  RDP_DOMAIN (default: the realm this machine joined).
       --winapps-creds M   askpass  - prompt each user for their own AD password
                           kerberos - single sign-on from the user's ticket
@@ -6131,14 +7144,34 @@ Building the Windows guest (libvirt backend only):
       --winapps-vm-ram N   Guest RAM in MiB   (default 4096).
       --winapps-vm-cpus N  Guest vCPUs        (default 4).
       --winapps-vm-disk N  Guest disk in GiB  (default 64).
+      --winapps-vm-user U  Local administrator account created inside the guest
+                           (default Docker). A Windows local account, not a
+                           domain one - it is what you sign in to the VM with.
+
+These answers can be written down once instead of typed each time:
+
+      --write-vm-config [F]  Write a commented windows-vm.conf and exit. It
+                           holds the unattended-install settings - iso, vm_name,
+                           admin, password, ram, cpus, disk and the Windows
+                           answers - plus 'libvirt_group'. Defaults to a file
+                           beside this script.
+      --vm-config FILE     Read those settings from FILE.
+      --no-vm-config       Ignore any windows-vm.conf that would be found.
+
+Without --vm-config the first of \$WINDOWS_VM_CONF, a windows-vm.conf beside
+this script, and /etc/winapps/windows-vm.conf is used. A flag beats the file,
+and WINAPPS_VM_PASS in the environment beats it too. There is deliberately no
+flag for the administrator password: a flag is visible in 'ps' to every user on
+the machine for as long as the build runs.
 
 The shared-mode password is read from the WINAPPS_RDP_PASS environment variable
 so it stays out of the process list. Note that 'shared' puts every user into the
 same Windows profile, which defeats the point of the domain join.
 
-The built VM's local administrator password is read from WINAPPS_VM_PASS; if
-unset, a random one is generated and printed once. The builder is also installed
-as 'winapps-vm-deploy' so the VM can be rebuilt later without re-running this.
+The built VM's local administrator password is read from windows-vm.conf or
+WINAPPS_VM_PASS; if neither sets it, a random one is generated and printed once.
+The builder is also installed as 'winapps-vm-deploy', which reads that same file,
+so the VM can be rebuilt later without re-running this.
 
 ${C_BOLD}EXAMPLES${C_RESET}
   # Interactive menu of everything the script can do
@@ -6150,6 +7183,11 @@ ${C_BOLD}EXAMPLES${C_RESET}
   # Unattended install plus join
   sudo ./domain-join-setup.sh -y -b sssd -g cockpit \\
        -e mkhomedir,timesync,shares -d corp.example.com -u svc-join --join
+
+  # Write the Windows VM answers down once, then build from them
+  ./domain-join-setup.sh --write-vm-config
+  \$EDITOR windows-vm.conf
+  sudo ./domain-join-setup.sh --winapps --winapps-deploy
 
   # Grant sudo to a domain group and one account, no prompts
   sudo ./domain-join-setup.sh -y --sudo-group 'Linux Admins@corp.example.com' \\
@@ -6200,6 +7238,7 @@ parse_args() {
             --winapps-host)     OPT_WINAPPS_HOST="${2:-}"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift 2 ;;
             --winapps-port)     OPT_WINAPPS_PORT="${2:-}"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift 2 ;;
             --winapps-vm)       OPT_WINAPPS_VM="${2:-}"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift 2 ;;
+            --winapps-libvirt-group) OPT_WINAPPS_LIBVIRT_GROUP="${2:-}"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift 2 ;;
             --winapps-domain)   OPT_WINAPPS_DOMAIN="${2:-}"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift 2 ;;
             --winapps-creds)    OPT_WINAPPS_CREDS="${2:-}"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift 2 ;;
             --winapps-user)     OPT_WINAPPS_RDP_USER="${2:-}"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift 2 ;;
@@ -6211,6 +7250,16 @@ parse_args() {
             --winapps-vm-ram)    OPT_WINAPPS_VM_RAM="${2:-}"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift 2 ;;
             --winapps-vm-cpus)   OPT_WINAPPS_VM_CPUS="${2:-}"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift 2 ;;
             --winapps-vm-disk)   OPT_WINAPPS_VM_DISK="${2:-}"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift 2 ;;
+            --winapps-vm-user)   OPT_WINAPPS_VM_ADMIN="${2:-}"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift 2 ;;
+            --vm-config)         shift 2 || shift $# ;;   # already read by vm_conf_prescan
+            --no-vm-config)      shift ;;                 # ditto
+            --write-vm-config)
+                WRITE_VM_CONF=1; CLI_DIRECTED=1
+                if [[ -n "${2:-}" && "${2:-}" != -* ]]; then
+                    WRITE_VM_CONF_PATH="$2"; shift 2
+                else
+                    shift
+                fi ;;
             --duo-repo)      DUO_ADD_REPO=1; shift ;;
             --no-duo-repo)   DUO_ADD_REPO=0; shift ;;
             --duo-build)     DUO_BUILD_SOURCE=1; shift ;;
@@ -6264,6 +7313,9 @@ parse_args() {
         elif [[ ! -f "$OPT_WINAPPS_ISO" ]]; then
             die "--winapps-iso: no such file '$OPT_WINAPPS_ISO'."
         fi
+    fi
+    if [[ -n "$OPT_WINAPPS_VM_ADMIN" ]] && ! winapps_vm_admin_ok "$OPT_WINAPPS_VM_ADMIN"; then
+        die "'$OPT_WINAPPS_VM_ADMIN' is not a name Windows accepts for a local account (20 characters or fewer, no spaces, no trailing dot, none of \" / \\ [ ] : ; | = , + * ? < > @)."
     fi
     for _p in "ram:$OPT_WINAPPS_VM_RAM" "cpus:$OPT_WINAPPS_VM_CPUS" "disk:$OPT_WINAPPS_VM_DISK"; do
         [[ -z "${_p#*:}" ]] && continue
@@ -6328,12 +7380,32 @@ menu_wanted() {
 }
 
 main() {
+    # The answer file is read first so a flag on the command line overwrites
+    # what it set, rather than the other way round.
+    vm_conf_prescan "$@"
+    vm_conf_load
     parse_args "$@"
+
+    if (( WRITE_VM_CONF )); then
+        vm_conf_write_sample "$WRITE_VM_CONF_PATH" || exit 1
+        exit 0
+    fi
+
     check_for_update    # before anything reads the system or edits a file
 
     detect_distro
     detect_de          # before the sudo re-exec, while the session vars exist
     require_root "$@"
+
+    # --winapps-remove / --winapps-vm-remove are teardown-only: go straight to
+    # the removal and stop. Without this they fall through to action_guided_setup,
+    # which would prompt for an AD backend and install packages before ever
+    # reaching winapps_remove at the end of configure_winapps.
+    if (( WINAPPS_REMOVE )); then
+        print_system_header
+        winapps_remove
+        exit $?
+    fi
 
     if menu_wanted; then
         while true; do

@@ -1,5 +1,13 @@
 # domain-join-setup
 
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Version](https://img.shields.io/github/v/tag/acebmxer/domain_join?label=version&sort=semver&color=brightgreen)](CHANGELOG.md)
+[![Last commit](https://img.shields.io/github/last-commit/acebmxer/domain_join)](https://github.com/acebmxer/domain_join/commits)
+[![Issues](https://img.shields.io/github/issues/acebmxer/domain_join)](https://github.com/acebmxer/domain_join/issues)
+[![Shell: Bash](https://img.shields.io/badge/shell-bash-4EAA25?logo=gnubash&logoColor=white)](domain-join-setup.sh)
+[![Platform: Linux](https://img.shields.io/badge/platform-linux-333333?logo=linux&logoColor=white)](#supported-systems)
+[![Tests](https://img.shields.io/badge/tests-476-informational)](tests/run-tests.sh)
+
 An interactive installer that sets up everything a Linux workstation needs to
 join and live on an **Active Directory** domain — on multiple distributions and
 under any desktop environment.
@@ -23,7 +31,7 @@ step is still available as a flag for unattended runs.
 
 ```
  ╔═════════════════════════════════════════════════════════════════════════════════╗
- ║              Active Directory Domain Join - Setup and Configuration              ║
+ ║             Active Directory Domain Join - Setup and Configuration              ║
  ╚═════════════════════════════════════════════════════════════════════════════════╝
              Distribution    : Fedora Linux 44 (KDE Plasma Desktop Edition)
              Package manager : dnf5 (rhel family)
@@ -31,12 +39,13 @@ step is still available as a flag for unattended runs.
              Domain          : not joined
              Mode            : changes will be applied
  ───────────────────────────────────────────────────────────────────────────────────
- ▸ [✓] Guided setup                        [ ] SDDM login screen
-   [ ] Install packages only               [ ] Post-join login settings
-   [ ] Graphical management tools          [ ] Grant sudo to a user or group
-   [ ] Join an Active Directory domain     [ ] Duo two-factor authentication
-   [ ] Home directories on first login     [ ] Windows apps for every user
+ ▸ [✓] Guided setup                        [ ] Post-join login settings
+   [ ] Install packages only               [ ] Grant sudo to a user or group
+   [ ] Graphical management tools          [ ] Duo two-factor authentication
+   [ ] Join an Active Directory domain     [ ] Windows apps for every user
+   [ ] Home directories on first login     [ ] Scan Windows for installed apps
    [✓] Network time synchronisation        [ ] Preflight checks and domain status
+   [ ] SDDM login screen
       Install, configure, then offer to join - the whole setup in one pass
  ───────────────────────────────────────────────────────────────────────────────────
  Selected: 2
@@ -64,9 +73,11 @@ whether the machine is already joined.
 | **Grant sudo to a user or group** | Asks for an account, a group, or one of each, and writes a `/etc/sudoers.d` drop-in for each. See [sudo rights](#sudo-rights). |
 | **Duo two-factor authentication** | Installs Duo Unix, writes `/etc/duo/pam_duo.conf`, and adds `pam_duo.so` to the services you pick — or takes it back out again. See [Duo](#duo-security-two-factor-authentication). |
 | **Windows apps for every user** | Installs WinApps system-wide and generates each domain user's configuration at login, so Windows programs in the app menu open under their own account. Can also build the Windows 11 VM (libvirt). See [WinApps](#windows-applications-for-every-domain-user). |
+| **Scan Windows for installed apps** | Re-runs the WinApps program scan (`setup.sh --system`) on its own — the same command as the first scan, for use whenever a program is added to or removed from Windows. The entry above already does this at the end of its run. |
 | **Preflight checks and domain status** | Read-only: hostname, clock, DNS SRV records, membership and service state. |
 
-The entries fill two even columns. The terminal only has to be 40x22; below that
+The entries fill two columns, the left one taking the odd row when the count is
+odd. The terminal only has to be 40x23; below that
 the menu says so rather than drawing something broken. It reflows live as the
 window is resized, first tightening the spacing between the columns, then
 dropping detail — the hint line, then the banner box — before it finally gives
@@ -195,6 +206,9 @@ Windows applications (WinApps):
       --winapps-host ADDR Windows hostname or IP. Required for 'manual'
       --winapps-port PORT RDP port (default 3389)
       --winapps-vm NAME   libvirt VM name (default RDPWindows)
+      --winapps-libvirt-group G
+                          AD group allowed to open the VM in virt-manager
+                          (default: the realm's permitted-logins group)
       --winapps-domain D  RDP_DOMAIN (default: the realm this machine joined)
       --winapps-creds M   askpass | kerberos | shared
       --winapps-user USER Windows service account, 'shared' mode only
@@ -207,6 +221,10 @@ Windows applications (WinApps):
       --winapps-vm-ram N  Guest RAM in MiB  (default 4096)
       --winapps-vm-cpus N Guest vCPUs       (default 4)
       --winapps-vm-disk N Guest disk in GiB (default 64)
+      --winapps-vm-user U Local administrator account created inside the guest
+      --write-vm-config   Write a commented windows-vm.conf and exit
+      --vm-config FILE    Read the VM's unattended-install answers from FILE
+      --no-vm-config      Ignore any windows-vm.conf that would be found
 ```
 
 The secret key is also read from the `DUO_SKEY` environment variable, which
@@ -832,9 +850,9 @@ With the **libvirt** backend the script can stand up the Windows guest itself
   QEMU agent installed on first boot
 - **Remote Desktop and RemoteApp** switched on, idle sleep disabled, the LAN set
   to a private profile
-- a local administrator account (`WINAPPS_VM_PASS`, or a random password printed
-  once), `q35` + UEFI + an emulated TPM 2.0, and the Windows 11 hardware checks
-  bypassed in the answer file so it installs regardless of host firmware
+- a **local administrator account** inside the guest — see below — `q35` + UEFI
+  + an emulated TPM 2.0, and the Windows 11 hardware checks bypassed in the
+  answer file so it installs regardless of host firmware
 - `virsh autostart` on, so WinApps can wake it
 
 Supply the install media with `--winapps-iso FILE`. This has to be the full
@@ -849,6 +867,179 @@ from time to time, so a local ISO is more reliable. ISOs are cached under
 
 Size it with `--winapps-vm-ram` (MiB, default 4096), `--winapps-vm-cpus`
 (default 4) and `--winapps-vm-disk` (GiB, default 64).
+
+#### The account inside the guest
+
+The unattended install creates one **local Windows account** and makes it an
+administrator. This is a Windows account on that VM, not a domain one: it is
+what you sign in with to finish setting the machine up, and — until you join the
+guest to the domain — the only account on it.
+
+The name is checked before it goes anywhere near the answer file: 20 characters
+or fewer, no spaces, no trailing dot, and none of `" / \ [ ] : ; | = , + * ? <
+> @`. Windows does not fail loudly on a name it dislikes — Setup simply creates
+no account, and the first sign of trouble is a VM nobody can log into.
+
+The password has **no flag**, deliberately: a flag is readable in `ps` by every
+user on the machine for as long as the build runs. Set it in `windows-vm.conf`
+below, or in `WINAPPS_VM_PASS`, or let the build generate one — that one is
+printed once, at the end, and stored nowhere.
+
+This account is **not** what WinApps connects as by default. In the recommended
+`askpass` mode each user connects as themselves with their own AD credentials,
+which is what lands them in their own Windows profile. Only
+`--winapps-creds shared` connects everyone as one fixed account, and that
+account can be this one.
+
+#### Opening the VM in virt-manager
+
+`virt-manager` connects to the system libvirt (`qemu:///system`), whose socket
+is `root:libvirt` `0770` out of the box. A domain account is in no local group,
+so the first time anyone logs in from the directory and opens Virtual Machine
+Manager it fails with **`Failed to connect socket to
+'/var/run/libvirt/libvirt-sock': Permission denied`** — the refusal happens at
+the socket, before polkit is consulted, so there is not even a password prompt.
+Adding each user to `libvirt` by hand does not scale to a directory.
+
+The libvirt backend fixes this once, for a whole group:
+
+- the RW socket is opened to every local user — `unix_sock_rw_perms = "0777"`
+  in the daemon config, and a `SocketMode=0777` drop-in on the `.socket` units
+  for socket-activated builds (Fedora, recent Debian) that ignore the config key
+- `/etc/polkit-1/rules.d/49-domain-join-libvirt.rules` then grants
+  `org.libvirt.*` to one AD group with no password prompt
+
+So the socket is *reachable* by anyone local, but *management* still goes
+through polkit. The step asks which group — defaulting to the realm's
+`permitted-groups` (the group named in the login-access question) — or takes it
+from `--winapps-libvirt-group 'Linux Admins@corp.example.com'` or a
+`libvirt_group` line in [`windows-vm.conf`](#windows-vmconf). Leave it blank
+to skip: access then stays with the local `libvirt` group only. Group
+membership is read at login, so a user already signed in must log out and back
+in. Revoke by deleting the rule file. Needs polkit with JavaScript rules
+(0.106+), which is every currently-supported Fedora, RHEL, Ubuntu and Debian.
+
+#### `windows-vm.conf`
+
+The answers the unattended install needs can be written down once instead of
+retyped every build:
+
+```bash
+./domain-join-setup.sh --write-vm-config
+```
+
+writes a commented `windows-vm.conf` next to the script, **mode `0600`** because
+it can hold the administrator password. A blank copy is committed here as
+[`windows-vm.conf.example`](windows-vm.conf.example) — `cp` it if you prefer,
+but `cp` does not give you `0600`:
+
+```bash
+cp windows-vm.conf.example windows-vm.conf
+chmod 600 windows-vm.conf
+```
+
+```ini
+# The VM itself
+iso           = /srv/iso/Win11_24H2_English_x64.iso
+vm_name       = RDPWindows
+ram           = 8192
+cpus          = 6
+disk          = 120
+
+# The answers Windows Setup asks for
+edition       = Windows 11 Pro
+product_key   = XXXXX-XXXXX-XXXXX-XXXXX-XXXXX
+computer_name = WIN11-LAB
+admin         = winadmin
+password      = choose something long
+owner         = Example User
+organization  = Example Ltd
+timezone      = Eastern Standard Time
+ui_language   = en-GB
+system_locale = en-GB
+user_locale   = en-GB
+input_locale  = 0809:00000809
+
+# WinApps wiring — not a build answer
+libvirt_group = Domain Admins
+```
+
+Everything between the sizing block and `libvirt_group` goes straight into
+`Autounattend.xml`:
+
+| Setting | Unattend setting | Default |
+|---|---|---|
+| `edition` | `/IMAGE/NAME` | Windows 11 Pro |
+| `product_key` | `ProductKey` | the generic Pro key |
+| `computer_name` | `ComputerName` | `*` — Setup generates one |
+| `admin`, `password` | `LocalAccount`, `AutoLogon` | `Docker`, random |
+| `owner` | `RegisteredOwner` | omitted |
+| `organization` | `RegisteredOrganization` | omitted |
+| `timezone` | `TimeZone` | `UTC` |
+| `ui_language` | `SetupUILanguage`, `UILanguage` | `en-US` |
+| `system_locale` | `SystemLocale` | follows `ui_language` |
+| `user_locale` | `UserLocale` | follows `ui_language` |
+| `input_locale` | `InputLocale` | `0409:00000409` |
+
+One more setting, `libvirt_group`, is **not** a build answer — it is the AD
+group given `virt-manager` access to the finished guest
+([above](#opening-the-vm-in-virt-manager)), otherwise only a prompt or
+`--winapps-libvirt-group`. Setting it blank (`libvirt_group =`) grants nobody
+and skips the prompt; leaving the line out keeps the prompt. `winapps-vm-deploy`
+reads the same file and ignores this key.
+
+That is the whole vocabulary. Anything else is an error naming the file and
+line, not a setting quietly ignored. Apart from `libvirt_group`, **this file
+covers the VM build and nothing else**; the domain join, Duo, sudo and package
+selection stay on the flags and the menu where they were.
+
+A few of these have sharp edges worth knowing:
+
+- **`product_key`** is not about activation. Setup needs a key of the right
+  edition to get past its own prompt without a human, so the build supplies
+  Microsoft's published generic Windows Pro key by default — it selects the
+  edition and nothing more. Change `edition` away from Pro and no key is
+  guessed for you: set `product_key`, or Setup will stop and ask. The build
+  says so when that happens rather than letting you find out 20 minutes in.
+- **`edition`** must be spelled the way the ISO spells it, since Setup matches
+  it against `/IMAGE/NAME`. `dism /Get-WimInfo /WimFile:…/sources/install.wim`
+  lists what a given ISO actually carries.
+- **`timezone`** is a *Windows* time zone name, not an IANA one — `Eastern
+  Standard Time`, not `America/New_York`. `tzutil /l` inside any Windows box
+  lists them. The default is `UTC`, which is predictable but probably not what
+  you want on a desktop you will look at.
+- **`ui_language`** only works if the ISO carries that language; a Windows ISO
+  is normally single-language. `system_locale` and `user_locale` work
+  regardless, which is why they are separate — an `en-GB` ISO is rare, but
+  British date formats on a US ISO are one line.
+- **`computer_name`** follows NetBIOS rules: 15 characters or fewer, letters
+  digits and hyphens, never all digits.
+
+Every one of these is validated before it reaches the answer file, and values
+are XML-escaped, so an organization named `Smith & Sons` does not produce a
+malformed `Autounattend.xml` that Setup ignores in silence.
+
+A `#` starts a comment only at the **start** of a line, so a password containing
+one needs no quoting. The file is read as data, never `source`d — it is parsed
+as root, and an answer file has no business running commands.
+
+Without `--vm-config`, the first of these that exists is read, and the run says
+which one it used:
+
+| Looked for | Why |
+|---|---|
+| `$WINDOWS_VM_CONF` | An explicit override for one run |
+| the directory holding the script | Travels with a copied checkout |
+| `/etc/winapps/windows-vm.conf` | Where the installer's other WinApps files live |
+
+A flag beats the file; `WINAPPS_VM_PASS` in the environment beats it too.
+`--no-vm-config` ignores any file that would have been found. `windows-vm.conf`
+is in `.gitignore`, so your filled-in copy will not follow the checkout to
+GitHub.
+
+`winapps-vm-deploy` reads the same file, so a later
+`sudo winapps-vm-deploy --force` rebuilds the guest with the settings that built
+it the first time.
 
 **What it does not do:** anything domain-related. The guest comes up in a
 workgroup; join it to Active Directory yourself (`sysdm.cpl`, or `Add-Computer`
@@ -875,19 +1066,37 @@ Windows has to exist first:
    to fill in `RDP_DOMAIN`.
 2. Run this script's WinApps step. It installs FreeRDP and the backend, writes
    the template, generator and login hooks, and seeds existing accounts. With
-   the libvirt backend it also offers to **build the Windows VM**
-   ([above](#building-the-vm)); otherwise deploy Windows yourself (container or
-   RDS host).
+   the libvirt backend it also grants an AD group access to `qemu:///system`
+   ([above](#opening-the-vm-in-virt-manager)) and offers to **build the Windows
+   VM** ([above](#building-the-vm)); otherwise deploy Windows yourself
+   (container or RDS host).
 3. **Join Windows to the domain.** The script never does this — not even for a
    VM it built.
 4. Scan Windows for installed programs to create the launchers:
    `sudo /etc/winapps/setup.sh --system` — and re-run that same command whenever
-   a program is added to or removed from Windows.
+   a program is added to or removed from Windows. This one scan signs into
+   Windows as the guest's **local** administrator (the `admin` / `password` in
+   `windows-vm.conf`), which works whether or not Windows is domain-joined; if
+   the build generated a random password it asks for one. It connects with
+   `/cert:ignore` — the guest's self-signed RDP certificate is regenerated when
+   it joins the domain, and `/cert:tofu` would refuse the changed key at a
+   prompt the scan cannot answer. The domain users who log in later authenticate
+   as themselves, per the credential mode above, and keep `/cert:tofu`.
 
 Step 2 asks whether Windows is already up. If it is not, the groundwork is still
 written and it prints the command for step 4 — so the script is safe to run
 before Windows exists. A VM built in step 2 takes 20–45 minutes to finish
 installing in the background; wait for it to reach the desktop before step 4.
+
+Answering yes at that prompt also offers to strip the install CD drives from a
+libvirt guest — the install, virtio and unattend media are only needed through
+first boot. It ejects the media from all three drives live, so the ISOs drop off
+the running guest immediately, and removes two of the three drives from the
+domain definition, leaving a single CD-ROM. libvirt cannot hot-unplug a CD-ROM,
+so the two empty drive letters stay until the guest is fully powered off — the
+step then offers to `virsh shutdown` and `start` it there and then to finish the
+job. Decline and they clear at the next full shutdown; `-y` skips the prompt and
+prints the manual commands.
 
 ### Day-to-day
 
@@ -936,6 +1145,8 @@ grep -rl pam_duo.so /etc/pam.d/     # which services require Duo
 | Duo denies every login | Wrong `ikey`/`skey`/`host`, or the account isn't enrolled under the username PAM sends. `journalctl -t pam_duo` shows which. |
 | Locked out after enabling Duo | Log in on a text console as a member of the bypass group, or from the greeter if `failmode = safe` and Duo is unreachable. Then `sudo sed -i '/pam_duo.so/d' /etc/pam.d/*`. |
 | Every `sudo` waits on a phone | `sudo` was among the protected services. Remove it: `sudo sed -i '/pam_duo.so/d' /etc/pam.d/sudo /etc/pam.d/sudo-i`. |
+| virt-manager: `Failed to connect socket to '/var/run/libvirt/libvirt-sock': Permission denied` | A domain user is in no local `libvirt` group. Re-run the WinApps step with `--winapps-libvirt-group '<AD group>'`, or add the one account with `sudo usermod -aG libvirt <user>`. Either way, log out and back in — group membership is read at login. |
+| virt-manager still asks for a password every time | The polkit rule's group name doesn't match what NSS returns. `id <user>` shows the exact form (`Linux Admins@corp.example.com`); put that in `/etc/polkit-1/rules.d/49-domain-join-libvirt.rules`. |
 
 A full log of every action is written to `/var/log/domain-join-setup.log`.
 
@@ -978,6 +1189,61 @@ PAM file's mode survives the rewrite and `--dry-run` never touches the disk; tha
 removal refuses to empty a PAM file; and that the secret key stays out of the
 `--dry-run` transcript while the config file is created mode `0600`.
 
+`windows-vm.conf` is covered the same way, since a build driven from a file is
+only as good as the parser reading it: that whitespace, quotes, comments, CRLF
+line endings and a `#` inside a password are handled the way the file's own
+header claims; that an unknown name, a name belonging to some other part of the
+installer, a missing `=` and a non-numeric size each stop the run naming the
+file and line; that a flag beats the file and `WINAPPS_VM_PASS` beats it too;
+that `--no-vm-config` really ignores it; and that the committed
+`windows-vm.conf.example` is byte-identical to what `--write-vm-config`
+produces, carries no uncommented setting, and mentions no name the parser would
+reject. Malformed product keys, over-long and all-digit computer names and
+bogus language tags are each rejected — by the installer *and* by the standalone
+builder, which has its own copy of the parser.
+
+`Autounattend.xml` is then rendered for real and read back, because that is
+where a wrong value costs 45 minutes rather than a second: that an empty
+settings file produces exactly the answer file the script produced before any of
+this existed; that each setting reaches the unattend element it claims to;
+that `system_locale` and `user_locale` follow `ui_language` when unset; that an
+edition with no key of its own leaves `ProductKey` out altogether rather than
+emitting an empty one, which Setup treats differently; that a value containing
+`&` or `<` comes out escaped; and that the result parses as XML in every case.
+The Windows account name is checked against every character Windows refuses,
+because an answer file it dislikes produces no account rather than an error.
+
+## Releases
+
+The version a checkout believes it is lives in `SCRIPT_VERSION` near the top of
+`domain-join-setup.sh`:
+
+```bash
+./domain-join-setup.sh --version
+# domain-join-setup 1.5.0
+```
+
+Versions follow [Semantic Versioning](https://semver.org/) — the major number
+for a change that breaks an existing flag or config file, the minor for a new
+menu entry or option, the patch for a fix that changes nothing about how the
+script is driven. Every version has an entry in [CHANGELOG.md](CHANGELOG.md) and
+an annotated git tag, so `git show v1.3.0:domain-join-setup.sh` prints a script
+whose own `--version` agrees with the tag it came from.
+
+There is no packaging step and nothing is published anywhere: cutting a release
+means bumping `SCRIPT_VERSION`, moving the **Unreleased** section of the
+changelog under the new number with today's date, committing, and tagging that
+commit.
+
+```bash
+git tag -a v1.5.0 -m "domain-join-setup 1.5.0"
+git push origin v1.5.0
+```
+
+Machines stay current through the script's own update check rather than through
+tags — see `--update` and `--no-update-check` — which fast-forwards the checkout
+from its remote. A tag is for reading history, not for delivery.
+
 ## License
 
-MIT
+Released under the [MIT License](LICENSE) — Copyright (c) 2026 acebmxer.

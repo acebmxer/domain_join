@@ -13,6 +13,11 @@ smb.conf
 krb5.conf
 resolv.conf
 
+# Answers for the unattended Windows install. It sits next to the script so a
+# copied checkout carries them, and it can hold the Windows administrator
+# password. The committed .example is a blank copy and is not ignored.
+windows-vm.conf
+
 # Backups the installer writes next to the files it edits, and its log.
 *.domain-join-setup.*.bak
 *.bak

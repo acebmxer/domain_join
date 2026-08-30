@@ -1,0 +1,160 @@
+##############################################################################
+# windows-vm.conf - answers for the unattended Windows install
+#
+# Read by domain-join-setup.sh when it builds the WinApps Windows VM, and by
+# the winapps-vm-deploy helper it installs. It covers the VM build, plus one
+# WinApps wiring setting - 'libvirt_group' - that is otherwise only a prompt.
+# The domain join, Duo and everything else stay on the flags and the menu.
+#
+# The settings between the sizing block and 'libvirt_group' go straight into
+# Autounattend.xml, and each one names the Windows unattend setting it becomes.
+#
+# Uncomment what you want to set. Anything left commented out keeps the default
+# shown, or is asked for during the build.
+#
+# Syntax: name = value, one per line. A '#' starts a comment only at the start
+# of a line, so a password containing one needs no quoting. Wrap a value in
+# quotes if its leading or trailing spaces matter.
+#
+# THIS FILE CAN HOLD THE WINDOWS ADMINISTRATOR PASSWORD. Keep it mode 0600 -
+# '--write-vm-config' creates it that way, a copy of the .example does not:
+#
+#   chmod 600 windows-vm.conf
+#
+# Where it is looked for, in order, when --vm-config does not name one:
+#   $WINDOWS_VM_CONF
+#   the directory holding domain-join-setup.sh
+#   /etc/winapps/windows-vm.conf
+#
+# A flag beats this file. WINAPPS_VM_PASS in the environment beats it too.
+##############################################################################
+
+
+# The Windows 10/11 installation media. The full path to the .iso file,
+# filename included - not the directory holding it. Left unset, the build
+# fetches Windows 11 from Microsoft with Mido, which is slower and less
+# reliable than an ISO you already have.
+#                                                      flag: --winapps-iso
+#iso = /srv/iso/Win11_24H2_English_x64.iso
+
+
+# What libvirt calls the guest.
+#                                                      flag: --winapps-vm
+#vm_name = RDPWindows
+
+
+# The local administrator account the unattended install creates, and its
+# password. This is a Windows *local* account, not a domain one: it is what you
+# sign in to the new VM with to finish setting it up, and until you join the
+# guest to the domain it is the only account on it.
+#
+# The name must be one Windows accepts: 20 characters or fewer, no spaces, no
+# trailing dot, and none of  " / \ [ ] : ; | = , + * ? < > @
+#
+# Leave the password unset and a random one is generated and printed once, at
+# the end of the build. That is fine, but it is printed only that once.
+#                                                      flag: --winapps-vm-user
+#admin    = winadmin
+#password = choose something long
+#
+# There is deliberately no flag for the password: a flag is visible in 'ps' to
+# every user on the machine for as long as the build runs. Put it here, or in
+# WINAPPS_VM_PASS, or let the build generate one.
+
+
+# Guest sizing. Windows 11 needs at least 4096 MiB and 64 GiB to install.
+#                                              flags: --winapps-vm-ram, -cpus,
+#                                                     -disk
+#ram  = 4096
+#cpus = 4
+#disk = 64
+
+
+#=============================================================================
+# The rest of the answer file
+#=============================================================================
+# These have no flags - they are set once for a machine and never typed again.
+# They land in Autounattend.xml, and the names below are the Windows unattend
+# settings they map to.
+
+
+# Which image on the ISO to install. This is the exact /IMAGE/NAME value Setup
+# matches against, so it has to be spelled the way the ISO spells it - "Windows
+# 11 Pro", "Windows 11 Enterprise", "Windows 10 Pro". 'dism /Get-WimInfo
+# /WimFile:<mounted iso>/sources/install.wim' lists what a given ISO carries.
+#                                                      unattend: /IMAGE/NAME
+#edition = Windows 11 Pro
+
+
+# Product key. Five groups of five. Setup needs a key of the right edition to
+# get past its own prompt unattended, so unless you have one, leave this alone
+# and the build uses Microsoft's published generic key for Windows Pro - which
+# selects the edition and nothing more. It does not activate Windows. If you
+# change 'edition' away from Pro you almost certainly need to set a key here.
+#                                                      unattend: ProductKey
+#product_key = XXXXX-XXXXX-XXXXX-XXXXX-XXXXX
+
+
+# The guest's Windows computer name. '*' lets Setup generate one. A real name
+# is 15 characters or fewer, letters digits and hyphens, and never all digits.
+#                                                      unattend: ComputerName
+#computer_name = *
+
+
+# Shown in Windows under 'Registered to'. Cosmetic; both are left out of the
+# answer file entirely if unset.
+#                                                      unattend: RegisteredOwner
+#                                                                RegisteredOrganization
+#owner        = Example User
+#organization = Example Ltd
+
+
+# The Windows time zone name - not an IANA one, so "Eastern Standard Time" and
+# not "America/New_York". 'tzutil /l' inside any Windows box lists them all.
+# Left unset it defaults to UTC; set it to your own zone. An empty value
+# ('timezone =') is rejected - remove the line instead.
+#                                                      unattend: TimeZone
+#timezone = Eastern Standard Time
+
+
+# Language and regional settings. ui_language is the Windows display language,
+# and unless you say otherwise the other two follow it - so an en-GB install
+# formats dates the British way without repeating yourself.
+#
+#   ui_language    the display language of Windows itself, and of Setup
+#   system_locale  the language non-Unicode programs assume  (defaults to above)
+#   user_locale    date, time, number and currency formats   (defaults to above)
+#
+# A display language only works if the ISO actually carries it; a Windows ISO
+# is normally single-language. system_locale and user_locale work regardless.
+#                                                      unattend: UILanguage
+#                                                                SystemLocale
+#                                                                UserLocale
+#ui_language   = en-US
+#system_locale = en-US
+#user_locale   = en-US
+
+
+# Keyboard layout, as Windows' own 'language:layout' hex pair - 0409:00000409
+# is US English, 0809:00000809 British, 040c:0000040c French. A plain language
+# tag such as en-GB works too, and several can be given separated by ';'.
+#                                                      unattend: InputLocale
+#input_locale = 0409:00000409
+
+
+#=============================================================================
+# WinApps wiring (libvirt backend only)
+#=============================================================================
+
+# The Active Directory group whose members may open and control the Windows
+# guest in virt-manager. A domain account is in no local group, so it cannot
+# reach the system libvirt socket by default; naming a group here writes a
+# polkit rule granting it 'org.libvirt.*' with no password. This is the only
+# setting in this file that is not part of the VM build.
+#
+# Set but blank ('libvirt_group =') means "grant nobody, don't ask" - the same
+# as pressing Enter on a blank answer at the prompt. Leave the line commented
+# out entirely and the build asks, defaulting to the realm's permitted-groups.
+# Use the exact spelling 'realm list' shows (it may include an '@domain').
+#                                                flag: --winapps-libvirt-group
+#libvirt_group = Domain Admins

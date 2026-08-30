@@ -261,21 +261,23 @@ check "60x30 is not too small"       "0" "$ML_TOO_SMALL"
 layout_at 30 12
 check "30x12 reports too small"      "1" "$ML_TOO_SMALL"
 # The floor the README quotes. Adding a menu entry moves it, so it is pinned.
-layout_at 40 22
-check "40x22 is the smallest usable size" "0" "$ML_TOO_SMALL"
-layout_at 39 22
+layout_at 40 23
+check "40x23 is the smallest usable size" "0" "$ML_TOO_SMALL"
+layout_at 39 23
 check "39 columns is too narrow"          "1" "$ML_TOO_SMALL"
-layout_at 40 21
-check "21 rows is too short"              "1" "$ML_TOO_SMALL"
+layout_at 40 22
+check "22 rows is too short"              "1" "$ML_TOO_SMALL"
 
 # No drawn line may be wider than the terminal, or the redraw leaves debris.
 overlong=0
 for size in "120 45" "100 40" "80 24" "70 30" "60 30" "45 24"; do
     set -- $size
     MENU_CURSOR=0
+    # Count display columns, not bytes: the menu box is drawn with multi-byte
+    # box-drawing characters, and mawk (Ubuntu's awk) would count each as 3.
     widest="$(COLUMNS="$1" LINES="$2" draw_menu \
         | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g' \
-        | awk '{ if (length($0) > m) m = length($0) } END { print m + 0 }')"
+        | python3 -c 'import sys; print(max((len(l.rstrip("\r\n")) for l in sys.stdin), default=0))')"
     (( widest > $1 )) && { overlong=1; printf '        %sx%s produced a %s-column line\n' "$1" "$2" "$widest"; }
 done
 check "every drawn line fits the terminal" "0" "$overlong"
@@ -1008,6 +1010,29 @@ check "--winapps-backend implies on" "1|libvirt||0"   "$(winapps_after --winapps
 check "--winapps-creds is stored"    "1||askpass|0"   "$(winapps_after --winapps-creds askpass)"
 check "--winapps-remove sets removal" "1|||1"         "$(winapps_after --winapps-remove)"
 
+# main() must short-circuit --winapps-remove straight to winapps_remove. Without
+# that it falls into action_guided_setup, which prompts for an AD backend and
+# installs packages before the removal ever runs.
+remove_dispatch() {
+    ( WINAPPS_REMOVE=0; CLI_DIRECTED=0
+      check_for_update() { :; }; detect_distro() { :; }; detect_de() { :; }
+      require_root() { :; }; print_system_header() { :; }
+      vm_conf_prescan() { :; }; vm_conf_load() { :; }
+      action_guided_setup() { printf 'GUIDED'; }
+      choose_backend()      { printf 'BACKEND'; }
+      winapps_remove()      { printf 'REMOVE'; }
+      main "$@" 2>/dev/null )
+}
+check "main sends --winapps-remove straight to removal" "REMOVE" \
+      "$(remove_dispatch --winapps-remove)"
+check "main sends --winapps-vm-remove straight to removal" "REMOVE" \
+      "$(remove_dispatch --winapps-vm-remove)"
+
+# Upstream setup.sh refuses --uninstall without --user/--system, and the
+# installer only ever installs --system.
+check_contains "the uninstall hint passes --system" "--system" \
+      "$( ( DRY_RUN=1; winapps_remove 2>/dev/null | grep -F 'setup.sh' ) )"
+
 # An invalid enum must stop the run rather than be carried into a config file.
 for bad in "--winapps-backend vmware" "--winapps-creds telepathy"; do
     if ( parse_args $bad ) >/dev/null 2>&1; then
@@ -1153,6 +1178,162 @@ seed_as jdoe >/dev/null
 check "a copy without the marker is left alone" 'RDP_USER="hand-edited"' \
       "$(grep '^RDP_USER=' "$OWN")"
 
+section "WinApps: the root program-scan config"
+# winapps_seed_scan_config writes root's ~/.config/winapps for 'setup.sh
+# --system'. It must connect as the guest's local admin, not a domain identity:
+# that account is all a fresh (or later domain-joined) guest has.
+SCAN_HOME="$WA_TMP/scanroot"; mkdir -p "$SCAN_HOME"
+WINAPPS_TEMPLATE="$WA_TMP/scan.template"
+winapps_write_template "CORP.EXAMPLE.COM" "libvirt" "kerberos" "" "" "IT-VM" >/dev/null 2>&1
+( HOME="$SCAN_HOME"; OPT_WINAPPS_VM_ADMIN="admin"; OPT_WINAPPS_VM_PASS="p'wd"
+  winapps_seed_scan_config /etc/winapps/setup.sh ) >/dev/null 2>&1
+SCAN_CONF="$SCAN_HOME/.config/winapps/winapps.conf"
+SCAN_PASS="$SCAN_HOME/.config/winapps/scan-askpass"
+check_line "it connects as the local admin from the config" 'RDP_USER="admin"' "$SCAN_CONF"
+check_line "it blanks the RDP domain"                       'RDP_DOMAIN=""'    "$SCAN_CONF"
+check_line "it keeps the libvirt VM name for IP discovery"  'VM_NAME="IT-VM"'  "$SCAN_CONF"
+check_line "it points RDP_ASKPASS at the scan helper"       'scan-askpass'     "$SCAN_CONF"
+if grep -qF '/sec:nla' "$SCAN_CONF"; then
+    printf '  %s it left Kerberos NLA on a local-account connection\n' "$(red FAIL)"; ((FAIL++))
+else
+    printf '  %s it drops Kerberos NLA for the local-account connection\n' "$(green PASS)"; ((PASS++))
+fi
+if grep -qF '/cert:ignore' "$SCAN_CONF" && ! grep -qF '/cert:tofu' "$SCAN_CONF"; then
+    printf '  %s it tolerates the guest cert changing on domain join (/cert:ignore)\n' "$(green PASS)"; ((PASS++))
+else
+    printf '  %s the scan still pins the guest cert with /cert:tofu\n' "$(red FAIL)"; ((FAIL++))
+fi
+if grep -qE '^RDP_PASS=""' "$SCAN_CONF" && ! grep -qF "p'wd" "$SCAN_CONF"; then
+    printf '  %s the password is never written into winapps.conf\n' "$(green PASS)"; ((PASS++))
+else
+    printf '  %s the password leaked into winapps.conf\n' "$(red FAIL)"; ((FAIL++))
+fi
+if [ "$(stat -c '%a' "$SCAN_PASS" 2>/dev/null)" = "700" ] && [ "$("$SCAN_PASS")" = "p'wd" ]; then
+    printf '  %s the askpass helper is 0700 and emits the exact password\n' "$(green PASS)"; ((PASS++))
+else
+    printf '  %s the askpass helper has the wrong mode or output\n' "$(red FAIL)"; ((FAIL++))
+fi
+# No password in the config and no tty: warn, no helper, no crash.
+SCAN_HOME2="$WA_TMP/scanroot2"; mkdir -p "$SCAN_HOME2"
+( HOME="$SCAN_HOME2"; OPT_WINAPPS_VM_ADMIN=""; OPT_WINAPPS_VM_PASS=""
+  winapps_seed_scan_config /etc/winapps/setup.sh ) >/dev/null 2>&1 </dev/null
+check_line "with no password it still writes a config as Docker" 'RDP_USER="Docker"' \
+      "$SCAN_HOME2/.config/winapps/winapps.conf"
+if [ -e "$SCAN_HOME2/.config/winapps/scan-askpass" ]; then
+    printf '  %s it left an empty askpass helper behind\n' "$(red FAIL)"; ((FAIL++))
+else
+    printf '  %s it writes no askpass helper without a password\n' "$(green PASS)"; ((PASS++))
+fi
+
+section "WinApps: stripping the install CD drives"
+# After the operator says Windows is up, the three install CDs have done their
+# job: winapps_strip_vm_cdroms ejects the media in the first drive and detaches
+# the other two, leaving one empty CD-ROM.
+EJECT_LOG="$WA_TMP/eject.log"
+cat >"$WA_TMP/virsh_stub" <<STUB
+virsh() {
+    case "\$*" in
+        *"dominfo"*)   return 0 ;;
+        *"domblklist --details"*)
+            printf ' Type Device Target Source\\n'
+            printf ' file disk  vda /var/lib/libvirt/images/vm.qcow2\\n'
+            printf ' file cdrom sda /var/lib/libvirt/images/vm-install.iso\\n'
+            printf ' file cdrom sdb /var/lib/winapps/iso/virtio-win.iso\\n'
+            printf ' file cdrom sdc /var/lib/libvirt/images/vm-unattend.iso\\n' ;;
+        *"domstate"*)     echo running ;;
+        *"change-media"*|*"detach-disk"*) echo "\$*" >>"$EJECT_LOG" ;;
+    esac
+}
+STUB
+run_strip() { (
+    OPT_WINAPPS_BACKEND="${1:-libvirt}"; OPT_WINAPPS_VM="IT-VM"; DRY_RUN=0
+    source "$WA_TMP/virsh_stub"
+    have() { [[ "$1" == virsh ]]; }
+    confirm() { return "${STRIP_CONFIRM:-0}"; }
+    ok() { :; }; warn() { :; }; note() { :; }; info() { :; }
+    winapps_strip_vm_cdroms
+) >/dev/null 2>&1; }
+
+: >"$EJECT_LOG"; STRIP_CONFIRM=0 run_strip
+check "it ejects the media in the kept drive"  "1" "$(grep -c 'change-media IT-VM sda --eject' "$EJECT_LOG")"
+check "it detaches the two spare drives"        "2" "$(grep -c 'detach-disk IT-VM' "$EJECT_LOG")"
+check "it does not detach the kept drive"       "0" "$(grep -c 'detach-disk IT-VM sda' "$EJECT_LOG")"
+check "it detaches the virtio drive"            "yes" \
+      "$(grep -q 'detach-disk IT-VM sdb' "$EJECT_LOG" && echo yes || echo no)"
+# libvirt rejects a live CD-ROM unplug, so the detach is --config only.
+check "the detach is persistent-only (no --live)" "0" \
+      "$(grep 'detach-disk' "$EJECT_LOG" | grep -c -- '--live')"
+check "the detach persists to the definition"  "2" \
+      "$(grep 'detach-disk' "$EJECT_LOG" | grep -c -- '--config')"
+check "the medium eject is live on a running guest" "yes" \
+      "$(grep 'change-media' "$EJECT_LOG" | grep -q -- '--live' && echo yes || echo no)"
+
+: >"$EJECT_LOG"; STRIP_CONFIRM=1 run_strip
+check "declining leaves every drive in place"   "0" "$(grep -cE 'change-media|detach-disk' "$EJECT_LOG")"
+
+: >"$EJECT_LOG"; STRIP_CONFIRM=0 run_strip docker
+check "a non-libvirt backend is skipped"        "0" "$(grep -cE 'change-media|detach-disk' "$EJECT_LOG")"
+
+# The spare drives' media is ejected live too, so the ISO drops off the running
+# guest at once even though the drive letter lingers until a full power cycle.
+: >"$EJECT_LOG"; STRIP_CONFIRM=0 run_strip
+check "the spare drives' media is ejected live" "2" \
+      "$(grep -cE 'change-media IT-VM sd[bc] --eject.*--live' "$EJECT_LOG")"
+check "the strip flags a pending power cycle"    "1" \
+      "$( OPT_WINAPPS_BACKEND=libvirt; OPT_WINAPPS_VM="IT-VM"; DRY_RUN=0
+          WINAPPS_CDROMS_PENDING=0
+          source "$WA_TMP/virsh_stub"; have() { [[ "$1" == virsh ]]; }
+          confirm() { return 0; }; ok() { :; }; warn() { :; }; note() { :; }; info() { :; }
+          winapps_strip_vm_cdroms >/dev/null 2>&1
+          printf '%s' "$WINAPPS_CDROMS_PENDING" )"
+
+section "WinApps: offering the post-strip power cycle"
+# winapps_offer_cdrom_powercycle only acts when the strip left drives pending,
+# and a declined prompt must not touch the guest.
+: >"$WA_TMP/pc.log"
+check "nothing pending: the guest is left alone" "0" \
+      "$( WINAPPS_CDROMS_PENDING=0; OPT_WINAPPS_VM="IT-VM"; DRY_RUN=0; ASSUME_YES=0
+          virsh() { echo "$*" >>"$WA_TMP/pc.log"; case "$*" in *domstate*) echo running ;; esac; }
+          have() { [[ "$1" == virsh ]]; }
+          confirm() { return 0; }; ok() { :; }; warn() { :; }; note() { :; }; info() { :; }
+          winapps_offer_cdrom_powercycle >/dev/null 2>&1
+          grep -c 'shutdown' "$WA_TMP/pc.log" )"
+: >"$WA_TMP/pc.log"
+check "declining the power cycle does not shut down" "0|0" \
+      "$( WINAPPS_CDROMS_PENDING=1; OPT_WINAPPS_VM="IT-VM"; DRY_RUN=0; ASSUME_YES=0
+          virsh() { echo "$*" >>"$WA_TMP/pc.log"; case "$*" in *domstate*) echo running ;; esac; }
+          have() { [[ "$1" == virsh ]]; }
+          confirm() { return 1; }; ok() { :; }; warn() { :; }; note() { :; }; info() { :; }
+          winapps_offer_cdrom_powercycle >/dev/null 2>&1
+          printf '%s|%s' "$(grep -c 'shutdown' "$WA_TMP/pc.log")" "$WINAPPS_CDROMS_PENDING" )"
+: >"$WA_TMP/pc.log"; rm -f "$WA_TMP/pc.down"
+check "accepting the power cycle shuts down then starts" "1|1" \
+      "$( WINAPPS_CDROMS_PENDING=1; OPT_WINAPPS_VM="IT-VM"; DRY_RUN=0; ASSUME_YES=0
+          virsh() { echo "$*" >>"$WA_TMP/pc.log"
+                    case "$*" in
+                        *shutdown*) : > "$WA_TMP/pc.down" ;;
+                        *domstate*) [[ -f "$WA_TMP/pc.down" ]] && echo 'shut off' || echo running ;;
+                    esac; }
+          have() { [[ "$1" == virsh ]]; }
+          confirm() { return 0; }; ok() { :; }; warn() { :; }; note() { :; }; info() { :; }
+          winapps_offer_cdrom_powercycle >/dev/null 2>&1
+          printf '%s|%s' "$(grep -c 'shutdown IT-VM' "$WA_TMP/pc.log")" \
+                         "$(grep -c 'start IT-VM' "$WA_TMP/pc.log")" )"
+
+section "WinApps: the standalone scan entry"
+check "a scan with no template set up bails" "1" \
+      "$( WINAPPS_TEMPLATE="$WA_TMP/nonexistent.template"; WINAPPS_CONFIGURED=0
+          heading() { :; }; warn() { :; }; note() { :; }
+          action_winapps_scan >/dev/null 2>&1; printf '%s' "$?" )"
+check "a scan is skipped when the install step already ran it" "0|0" \
+      "$( printf 'x\n' > "$WA_TMP/t.template"; WINAPPS_TEMPLATE="$WA_TMP/t.template"
+          WINAPPS_CONFIGURED=1
+          heading() { :; }; note() { :; }
+          winapps_install_upstream() { echo SCANNED >>"$WA_TMP/scan.log"; }
+          : > "$WA_TMP/scan.log"
+          action_winapps_scan >/dev/null 2>&1; rc=$?
+          printf '%s|%s' "$rc" "$(grep -c SCANNED "$WA_TMP/scan.log")" )"
+
 section "WinApps: the VM builder script"
 WINAPPS_VM_DEPLOYER="$WA_TMP/winapps-vm-deploy"
 winapps_write_vm_deployer >/dev/null 2>&1
@@ -1166,7 +1347,11 @@ check_line "it authors an unattended answer file"  'Autounattend.xml'        "$W
 # specialize/oobeSystem passes ("not a valid unattended Setup answer file",
 # 0x80220003) and the install dies with "computer restarted unexpectedly".
 check_line "its answer-file components are signed" 'publicKeyToken="31bf3856ad364e35"' "$WINAPPS_VM_DEPLOYER"
-check_line "it installs Windows 11 Pro"            '<Value>Windows 11 Pro</Value>' "$WINAPPS_VM_DEPLOYER"
+# The edition is a variable now, defaulted rather than hardcoded; that the
+# default really is Windows 11 Pro is checked against the rendered answer file
+# in "Autounattend.xml carries the answers" below.
+check_line "it installs the configured edition"   '<Value>$X_EDITION</Value>' "$WINAPPS_VM_DEPLOYER"
+check_line "the edition defaults to Windows 11 Pro" 'VM_EDITION="${VM_EDITION:-Windows 11 Pro}"' "$WINAPPS_VM_DEPLOYER"
 check_line "it bypasses the Win11 hardware checks" 'BypassTPMCheck'          "$WINAPPS_VM_DEPLOYER"
 check_line "it enables Remote Desktop"             'fDenyTSConnections'      "$WINAPPS_VM_DEPLOYER"
 check_line "it imports the RemoteApp registry"     'RDPApps.reg'             "$WINAPPS_VM_DEPLOYER"
@@ -1199,6 +1384,362 @@ else
 fi
 
 rm -rf "$WA_TMP"
+
+section "windows-vm.conf: parsing"
+VMC_TMP="$(mktemp -d)"
+vmc_read() {
+    local body="$1"; shift
+    printf '%s\n' "$body" > "$VMC_TMP/t.conf"
+    chmod 600 "$VMC_TMP/t.conf"
+    ( VM_CONF_FILE="$VMC_TMP/t.conf"; VM_CONF_HAS_SECRET=0
+      OPT_WINAPPS_ISO=""; OPT_WINAPPS_VM=""; OPT_WINAPPS_VM_ADMIN=""
+      OPT_WINAPPS_VM_PASS=""; OPT_WINAPPS_VM_RAM=""; OPT_WINAPPS_VM_CPUS=""
+      OPT_WINAPPS_VM_DISK=""
+      OPT_WINAPPS_LIBVIRT_GROUP=""; VM_CONF_HAS_LIBVIRT_GROUP=0
+      vm_conf_load >/dev/null 2>&1 || exit 1
+      local out="" v
+      for v in "$@"; do out+="${!v}|"; done
+      printf '%s' "${out%|}" )
+}
+check "the ISO path is read"      "/srv/w.iso" "$(vmc_read 'iso = /srv/w.iso' OPT_WINAPPS_ISO)"
+check "the guest name is read"    "Win11"      "$(vmc_read 'vm_name = Win11' OPT_WINAPPS_VM)"
+check "the admin account is read" "winadmin"   "$(vmc_read 'admin = winadmin' OPT_WINAPPS_VM_ADMIN)"
+check "the password is read"      "hunter2!"   "$(vmc_read 'password = hunter2!' OPT_WINAPPS_VM_PASS)"
+check "the sizes are read"        "8192|6|120" \
+      "$(vmc_read 'ram = 8192
+cpus = 6
+disk = 120' OPT_WINAPPS_VM_RAM OPT_WINAPPS_VM_CPUS OPT_WINAPPS_VM_DISK)"
+check "whitespace around = is ignored" "Win11" "$(vmc_read '   vm_name=Win11   ' OPT_WINAPPS_VM)"
+check "comments and blank lines are skipped" "Win11" \
+      "$(vmc_read '# a comment
+
+vm_name = Win11' OPT_WINAPPS_VM)"
+check "a '#' inside a password is not a comment" 'P@ss#word' \
+      "$(vmc_read 'password = P@ss#word' OPT_WINAPPS_VM_PASS)"
+check "quotes preserve a trailing space" "pass " \
+      "$(vmc_read 'password = "pass "' OPT_WINAPPS_VM_PASS)"
+check "a CRLF line ending is tolerated" "Win11" \
+      "$(vmc_read "$(printf 'vm_name = Win11\r')" OPT_WINAPPS_VM)"
+check "the libvirt group is read" "Domain Admins" \
+      "$(vmc_read 'libvirt_group = Domain Admins' OPT_WINAPPS_LIBVIRT_GROUP)"
+check "libvirt-group with a hyphen is the same key" "Domain Admins" \
+      "$(vmc_read 'libvirt-group = Domain Admins' OPT_WINAPPS_LIBVIRT_GROUP)"
+# A blank value is legal here (it means "grant nobody, don't prompt"), but the
+# key must still be recorded as seen so configure_winapps skips the prompt.
+check "a blank libvirt_group is still recorded" "|1" \
+      "$(vmc_read 'libvirt_group =' OPT_WINAPPS_LIBVIRT_GROUP VM_CONF_HAS_LIBVIRT_GROUP)"
+
+# Bad input must stop the run, naming the file and line.
+vmc_rejects() {
+    local desc="$1" body="$2"
+    printf '%s\n' "$body" > "$VMC_TMP/t.conf"
+    if ( VM_CONF_FILE="$VMC_TMP/t.conf"; vm_conf_load ) >/dev/null 2>&1; then
+        printf '  %s %s was accepted\n' "$(red FAIL)" "$desc"; ((FAIL++))
+    else
+        printf '  %s %s is rejected\n' "$(green PASS)" "$desc"; ((PASS++))
+    fi
+}
+vmc_rejects "an unknown setting"        'isoo = /x.iso'
+vmc_rejects "a setting from elsewhere"  'domain = corp.example.com'
+vmc_rejects "a line with no '='"        'iso'
+vmc_rejects "a non-numeric size"        'ram = lots'
+if ( VM_CONF_FILE="$VMC_TMP/nope.conf"; vm_conf_load ) >/dev/null 2>&1; then
+    printf '  %s a missing --vm-config file was accepted\n' "$(red FAIL)"; ((FAIL++))
+else
+    printf '  %s a missing --vm-config file is an error\n' "$(green PASS)"; ((PASS++))
+fi
+
+section "windows-vm.conf: the Windows answers"
+vmc_read2() {
+    local body="$1"; shift
+    printf '%s\n' "$body" > "$VMC_TMP/t.conf"
+    chmod 600 "$VMC_TMP/t.conf"
+    ( VM_CONF_FILE="$VMC_TMP/t.conf"
+      OPT_VM_EDITION=""; OPT_VM_PRODUCT_KEY=""; OPT_VM_COMPUTER_NAME=""
+      OPT_VM_OWNER=""; OPT_VM_ORGANIZATION=""; OPT_VM_TIMEZONE=""
+      OPT_VM_UI_LANGUAGE=""; OPT_VM_SYSTEM_LOCALE=""; OPT_VM_USER_LOCALE=""
+      OPT_VM_INPUT_LOCALE=""
+      vm_conf_load >/dev/null 2>&1 || exit 1
+      local out="" v
+      for v in "$@"; do out+="${!v}|"; done
+      printf '%s' "${out%|}" )
+}
+check "the edition is read"       "Windows 11 Enterprise" \
+      "$(vmc_read2 'edition = Windows 11 Enterprise' OPT_VM_EDITION)"
+check "the product key is read"   "ABCDE-12345-FGHIJ-67890-KLMNO" \
+      "$(vmc_read2 'product_key = ABCDE-12345-FGHIJ-67890-KLMNO' OPT_VM_PRODUCT_KEY)"
+check "the computer name is read" "WIN11-LAB" \
+      "$(vmc_read2 'computer_name = WIN11-LAB' OPT_VM_COMPUTER_NAME)"
+check "'*' is an allowed computer name" "*" \
+      "$(vmc_read2 'computer_name = *' OPT_VM_COMPUTER_NAME)"
+check "owner and organization are read" "Example User|Example Ltd" \
+      "$(vmc_read2 'owner = Example User
+organization = Example Ltd' OPT_VM_OWNER OPT_VM_ORGANIZATION)"
+check "the time zone is read"     "Eastern Standard Time" \
+      "$(vmc_read2 'timezone = Eastern Standard Time' OPT_VM_TIMEZONE)"
+check "the locales are read"      "en-GB|de-DE|fr-FR|0809:00000809" \
+      "$(vmc_read2 'ui_language   = en-GB
+system_locale = de-DE
+user_locale   = fr-FR
+input_locale  = 0809:00000809' OPT_VM_UI_LANGUAGE OPT_VM_SYSTEM_LOCALE \
+        OPT_VM_USER_LOCALE OPT_VM_INPUT_LOCALE)"
+check "a bare language tag is an input locale" "en-GB" \
+      "$(vmc_read2 'input_locale = en-GB' OPT_VM_INPUT_LOCALE)"
+
+vmc_rejects "a malformed product key"      'product_key = ABCDE-12345'
+vmc_rejects "a computer name over 15"      'computer_name = WAY-TOO-LONG-A-NAME'
+vmc_rejects "an all-digit computer name"   'computer_name = 12345'
+vmc_rejects "a computer name with a space" 'computer_name = WIN 11'
+vmc_rejects "a bogus language tag"         'ui_language = english'
+vmc_rejects "a bogus user locale"          'user_locale = 12345'
+vmc_rejects "an empty time zone"           'timezone ='
+vmc_rejects "a bogus input locale"         'input_locale = ?!'
+
+section "windows-vm.conf: precedence"
+printf 'ram = 8192\npassword = fromfile\n' > "$VMC_TMP/p.conf"
+chmod 600 "$VMC_TMP/p.conf"
+check "a flag beats the file" "2048" \
+      "$( OPT_WINAPPS_VM_RAM=""; VM_CONF_FILE="$VMC_TMP/p.conf"
+          vm_conf_load >/dev/null 2>&1
+          parse_args --winapps-vm-ram 2048 >/dev/null 2>&1
+          printf '%s' "$OPT_WINAPPS_VM_RAM" )"
+check "WINAPPS_VM_PASS beats the file" "fromenv" \
+      "$( OPT_WINAPPS_VM_PASS="fromenv"     # as the WINAPPS_VM_PASS default would
+          VM_CONF_FILE="$VMC_TMP/p.conf"; vm_conf_load >/dev/null 2>&1
+          printf '%s' "$OPT_WINAPPS_VM_PASS" )"
+check "the file is used when nothing else supplies it" "fromfile" \
+      "$( OPT_WINAPPS_VM_PASS=""
+          VM_CONF_FILE="$VMC_TMP/p.conf"; vm_conf_load >/dev/null 2>&1
+          printf '%s' "$OPT_WINAPPS_VM_PASS" )"
+check "--no-vm-config ignores the file" "|" \
+      "$( OPT_WINAPPS_VM_RAM=""; vm_conf_prescan --no-vm-config
+          VM_CONF_FILE="$VMC_TMP/p.conf"; vm_conf_load >/dev/null 2>&1
+          printf '%s|%s' "$OPT_WINAPPS_VM_RAM" "$VM_CONF_LOADED_FROM" )"
+check "--vm-config is picked out before the flags" "$VMC_TMP/p.conf" \
+      "$( vm_conf_prescan --winapps --vm-config "$VMC_TMP/p.conf" --winapps-deploy
+          printf '%s' "$VM_CONF_FILE" )"
+printf 'libvirt_group = From File\n' > "$VMC_TMP/lg.conf"
+chmod 600 "$VMC_TMP/lg.conf"
+check "--winapps-libvirt-group beats the file" "From Flag" \
+      "$( OPT_WINAPPS_LIBVIRT_GROUP=""; VM_CONF_FILE="$VMC_TMP/lg.conf"
+          vm_conf_load >/dev/null 2>&1
+          parse_args --winapps-libvirt-group "From Flag" >/dev/null 2>&1
+          printf '%s' "$OPT_WINAPPS_LIBVIRT_GROUP" )"
+check "the file supplies the libvirt group when no flag does" "From File" \
+      "$( OPT_WINAPPS_LIBVIRT_GROUP=""; VM_CONF_FILE="$VMC_TMP/lg.conf"
+          vm_conf_load >/dev/null 2>&1
+          printf '%s' "$OPT_WINAPPS_LIBVIRT_GROUP" )"
+
+section "windows-vm.conf: --write-vm-config and the sample"
+VMC_WROTE="$VMC_TMP/written.conf"
+if ( vm_conf_write_sample "$VMC_WROTE" ) >/dev/null 2>&1; then
+    printf '  %s --write-vm-config writes a file\n' "$(green PASS)"; ((PASS++))
+else
+    printf '  %s --write-vm-config failed\n' "$(red FAIL)"; ((FAIL++))
+fi
+check "it is created mode 0600" "600" "$(stat -c '%a' "$VMC_WROTE" 2>/dev/null)"
+if ( vm_conf_write_sample "$VMC_WROTE" ) >/dev/null 2>&1; then
+    printf '  %s --write-vm-config overwrote an existing file\n' "$(red FAIL)"; ((FAIL++))
+else
+    printf '  %s --write-vm-config refuses to overwrite\n' "$(green PASS)"; ((PASS++))
+fi
+# The sample committed to the repo is generated from the same heredoc, so it
+# cannot be allowed to drift away from what the script actually writes.
+VMC_SAMPLE="$SCRIPT_DIR/windows-vm.conf.example"
+if [[ -f "$VMC_SAMPLE" ]]; then
+    printf '  %s windows-vm.conf.example is committed\n' "$(green PASS)"; ((PASS++))
+    if diff -q "$VMC_SAMPLE" "$VMC_WROTE" >/dev/null 2>&1; then
+        printf '  %s the sample matches --write-vm-config\n' "$(green PASS)"; ((PASS++))
+    else
+        printf '  %s the sample has drifted from --write-vm-config\n' "$(red FAIL)"; ((FAIL++))
+        diff "$VMC_SAMPLE" "$VMC_WROTE" | head -10 | sed 's/^/        /'
+    fi
+    if grep -qE '^[a-z_]+[[:space:]]*=' "$VMC_SAMPLE"; then
+        printf '  %s the sample has an uncommented setting in it\n' "$(red FAIL)"; ((FAIL++))
+    else
+        printf '  %s every setting in the sample is commented out\n' "$(green PASS)"; ((PASS++))
+    fi
+    if grep -qE '/home/|/Users/' "$VMC_SAMPLE"; then
+        printf '  %s the sample contains a real home directory path\n' "$(red FAIL)"; ((FAIL++))
+    else
+        printf '  %s the sample carries no personal path\n' "$(green PASS)"; ((PASS++))
+    fi
+    # Every name it mentions must be one vm_conf_set accepts, and uncommenting
+    # the whole thing must parse.
+    VMC_BAD=""
+    while read -r n; do
+        grep -qE "^        $n\)" "$TARGET" || VMC_BAD+="$n "
+    done < <(sed -n 's/^#\([a-z_][a-z_0-9]*\)[[:space:]]*=.*/\1/p' "$VMC_SAMPLE" | sort -u)
+    check "every name in the sample is a real setting" "" "${VMC_BAD% }"
+    sed 's/^#\([a-z_][a-z_0-9]*[[:space:]]*=\)/\1/' "$VMC_SAMPLE" \
+        | grep -v '^#' | grep -v '^$' > "$VMC_TMP/all.conf"
+    chmod 600 "$VMC_TMP/all.conf"
+    if ( VM_CONF_FILE="$VMC_TMP/all.conf"; vm_conf_load ) >/dev/null 2>&1; then
+        printf '  %s every example value in the sample is valid\n' "$(green PASS)"; ((PASS++))
+    else
+        printf '  %s the sample holds a value it would reject\n' "$(red FAIL)"; ((FAIL++))
+        ( VM_CONF_FILE="$VMC_TMP/all.conf"; vm_conf_load ) 2>&1 | tail -2 | sed 's/^/        /'
+    fi
+else
+    printf '  %s windows-vm.conf.example is missing from the repo\n' "$(red FAIL)"; ((FAIL++))
+fi
+if have git && [[ -d "$SCRIPT_DIR/.git" ]]; then
+    git -C "$SCRIPT_DIR" check-ignore -q windows-vm.conf 2>/dev/null \
+        && { printf '  %s windows-vm.conf is gitignored\n' "$(green PASS)"; ((PASS++)); } \
+        || { printf '  %s windows-vm.conf is NOT gitignored\n' "$(red FAIL)"; ((FAIL++)); }
+    git -C "$SCRIPT_DIR" check-ignore -q windows-vm.conf.example 2>/dev/null \
+        && { printf '  %s the sample is gitignored and would never ship\n' "$(red FAIL)"; ((FAIL++)); } \
+        || { printf '  %s the sample is not gitignored\n' "$(green PASS)"; ((PASS++)); }
+fi
+
+section "Autounattend.xml carries the answers"
+# The answer file is where a wrong value costs 45 minutes, so it is rendered
+# for real and read back rather than checked by inspection.
+AU_TMP="$(mktemp -d)"
+mkdir -p "$AU_TMP/iso/oem"
+( DRY_RUN=0; WINAPPS_VM_DEPLOYER="$AU_TMP/deploy.sh"
+  winapps_install_file() { local d="$1"; shift; cat > "$d"; chmod 755 "$d"; }
+  winapps_write_vm_deployer ) >/dev/null 2>&1
+au_render() {
+    printf '%s\n' "$1" > "$AU_TMP/vm.conf"
+    chmod 600 "$AU_TMP/vm.conf"
+    rm -f "$AU_TMP/iso/Autounattend.xml"
+    ( WINDOWS_VM_CONF="$AU_TMP/vm.conf" ISO_ROOT="$AU_TMP/iso"
+      eval "$(sed -n '/^VM_NAME=/,/^\[ "\${#VM_ADMIN}" -le 20 \]/p' "$AU_TMP/deploy.sh")"
+      eval "$(sed -n '/^xesc()/,/^XML$/p' "$AU_TMP/deploy.sh")" ) >/dev/null 2>&1
+}
+au_has() {
+    local desc="$1" needle="$2"
+    if grep -qF -- "$needle" "$AU_TMP/iso/Autounattend.xml" 2>/dev/null; then
+        printf '  %s %s\n' "$(green PASS)" "$desc"; ((PASS++))
+    else
+        printf '  %s %s\n' "$(red FAIL)" "$desc"
+        printf '        %s not in the rendered answer file\n' "$needle"; ((FAIL++))
+    fi
+}
+au_wellformed() {
+    if python3 -c "import xml.dom.minidom,sys; xml.dom.minidom.parse(sys.argv[1])" \
+         "$AU_TMP/iso/Autounattend.xml" >/dev/null 2>&1; then
+        printf '  %s %s\n' "$(green PASS)" "$1"; ((PASS++))
+    else
+        printf '  %s %s\n' "$(red FAIL)" "$1"; ((FAIL++))
+    fi
+}
+
+# Defaults must render exactly what the script produced before any of this
+# existed - a settings file nobody has written must change nothing.
+au_render ''
+au_has "default edition is Windows 11 Pro" '<Value>Windows 11 Pro</Value>'
+au_has "default key is the generic Pro key" '<Key>W269N-WFGWX-YVC9B-4J6C9-T83GX</Key>'
+au_has "default computer name is generated" '<ComputerName>*</ComputerName>'
+au_has "default UI language is en-US"       '<UILanguage>en-US</UILanguage>'
+au_has "default input locale is US"         '<InputLocale>0409:00000409</InputLocale>'
+au_has "a time zone is always set"          '<TimeZone>UTC</TimeZone>'
+au_wellformed "the default answer file is well-formed XML"
+
+au_render 'edition       = Windows 11 Enterprise
+product_key   = ABCDE-12345-FGHIJ-67890-KLMNO
+computer_name = WIN11-LAB
+admin         = winadmin
+owner         = Example User
+organization  = Example Ltd
+timezone      = Eastern Standard Time
+ui_language   = en-GB
+input_locale  = 0809:00000809'
+au_has "the edition reaches /IMAGE/NAME"   '<Value>Windows 11 Enterprise</Value>'
+au_has "the product key reaches ProductKey" '<Key>ABCDE-12345-FGHIJ-67890-KLMNO</Key>'
+au_has "the computer name reaches the XML"  '<ComputerName>WIN11-LAB</ComputerName>'
+au_has "the time zone reaches the XML"      '<TimeZone>Eastern Standard Time</TimeZone>'
+au_has "the owner reaches the XML"          '<RegisteredOwner>Example User</RegisteredOwner>'
+au_has "the organization reaches the XML"   '<RegisteredOrganization>Example Ltd</RegisteredOrganization>'
+au_has "the keyboard reaches InputLocale"   '<InputLocale>0809:00000809</InputLocale>'
+au_has "the account reaches the XML"        '<Name>winadmin</Name>'
+# system_locale and user_locale were not set, so they follow ui_language.
+au_has "system_locale follows ui_language"  '<SystemLocale>en-GB</SystemLocale>'
+au_has "user_locale follows ui_language"    '<UserLocale>en-GB</UserLocale>'
+au_wellformed "a fully populated answer file is well-formed XML"
+
+# An edition with no key of its own must leave ProductKey out entirely rather
+# than emit an empty one, which Setup treats differently.
+au_render 'edition = Windows 11 Enterprise'
+if grep -q 'ProductKey' "$AU_TMP/iso/Autounattend.xml"; then
+    printf '  %s an empty ProductKey was emitted\n' "$(red FAIL)"; ((FAIL++))
+else
+    printf '  %s no key for that edition leaves ProductKey out\n' "$(green PASS)"; ((PASS++))
+fi
+au_wellformed "omitting ProductKey leaves well-formed XML"
+
+# A value with XML metacharacters must be escaped, not injected.
+au_render 'organization = Ampersand & <Sons>'
+au_has "XML metacharacters are escaped" '&amp; &lt;Sons&gt;'
+au_wellformed "an organization holding markup leaves well-formed XML"
+
+# The deployer must reject the same bad values the installer does.
+au_deploy_rejects() {
+    local desc="$1" body="$2"
+    printf '%s\n' "$body" > "$AU_TMP/vm.conf"
+    if ( WINDOWS_VM_CONF="$AU_TMP/vm.conf"
+         eval "$(sed -n '/^VM_NAME=/,/^\[ "\${#VM_ADMIN}" -le 20 \]/p' "$AU_TMP/deploy.sh")"
+       ) >/dev/null 2>&1; then
+        printf '  %s the builder accepted %s\n' "$(red FAIL)" "$desc"; ((FAIL++))
+    else
+        printf '  %s the builder rejects %s\n' "$(green PASS)" "$desc"; ((PASS++))
+    fi
+}
+au_deploy_rejects "a malformed product key"    'product_key = NOPE'
+au_deploy_rejects "an all-digit computer name" 'computer_name = 12345'
+au_deploy_rejects "a bogus language tag"       'ui_language = english'
+au_deploy_rejects "an unknown setting"         'domain = corp.example.com'
+au_deploy_rejects "a bad account name"         'admin = Bad Name'
+
+# libvirt_group is not a build setting, but the deployer reads the same file and
+# must skip it rather than abort on an "unknown setting".
+if ( printf 'libvirt_group = Domain Admins\nvm_name = OK\n' > "$AU_TMP/vm.conf"
+     WINDOWS_VM_CONF="$AU_TMP/vm.conf"
+     eval "$(sed -n '/^VM_NAME=/,/^\[ "\${#VM_ADMIN}" -le 20 \]/p' "$AU_TMP/deploy.sh")"
+   ) >/dev/null 2>&1; then
+    printf '  %s the builder ignores libvirt_group\n' "$(green PASS)"; ((PASS++))
+else
+    printf '  %s the builder choked on libvirt_group\n' "$(red FAIL)"; ((FAIL++))
+fi
+
+rm -rf "$AU_TMP"
+
+section "The VM's local administrator account"
+for good in Docker win-admin user_1 A; do
+    winapps_vm_admin_ok "$good" \
+        && { printf '  %s %s is accepted\n' "$(green PASS)" "$good"; ((PASS++)); } \
+        || { printf '  %s %s was rejected\n' "$(red FAIL)" "$good"; ((FAIL++)); }
+done
+for bad in "Win Admin" 'a\b' 'a"b' 'a:b' 'a;b' 'a|b' 'a=b' 'a,b' 'a+b' 'a*b' 'a?b' \
+           'a<b' 'a>b' 'a@b' 'a[b' 'a]b' 'a/b' 'trailingdot.' \
+           'ThisNameIsWayTooLongForWindows' ''; do
+    winapps_vm_admin_ok "$bad" \
+        && { printf '  %s "%s" was accepted\n' "$(red FAIL)" "$bad"; ((FAIL++)); } \
+        || { printf '  %s "%s" is rejected\n' "$(green PASS)" "$bad"; ((PASS++)); }
+done
+if ( parse_args --winapps-vm-user "Bad Name" ) >/dev/null 2>&1; then
+    printf '  %s --winapps-vm-user accepted a name with a space\n' "$(red FAIL)"; ((FAIL++))
+else
+    printf '  %s --winapps-vm-user rejects a name with a space\n' "$(green PASS)"; ((PASS++))
+fi
+check "--winapps-vm-user is stored" "win-admin" \
+      "$( OPT_WINAPPS_VM_ADMIN=""; parse_args --winapps-vm-user win-admin >/dev/null 2>&1
+          printf '%s' "$OPT_WINAPPS_VM_ADMIN" )"
+check "--winapps-libvirt-group is stored" "Linux Admins@corp.example.com" \
+      "$( OPT_WINAPPS_LIBVIRT_GROUP=""
+          parse_args --winapps-libvirt-group "Linux Admins@corp.example.com" >/dev/null 2>&1
+          printf '%s' "$OPT_WINAPPS_LIBVIRT_GROUP" )"
+# A name the config file supplies has to be checked too, not just a flag.
+if ( printf 'admin = Bad Name\n' > "$VMC_TMP/t.conf"
+     VM_CONF_FILE="$VMC_TMP/t.conf"; vm_conf_load >/dev/null 2>&1
+     parse_args ) >/dev/null 2>&1; then
+    printf '  %s a bad name in windows-vm.conf was accepted\n' "$(red FAIL)"; ((FAIL++))
+else
+    printf '  %s a bad name in windows-vm.conf is rejected\n' "$(green PASS)"; ((PASS++))
+fi
+
+rm -rf "$VMC_TMP"
 
 section "CLI smoke tests"
 for args in "--help" "--version"; do
