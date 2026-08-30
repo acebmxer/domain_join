@@ -1220,7 +1220,7 @@ The version a checkout believes it is lives in `SCRIPT_VERSION` near the top of
 
 ```bash
 ./domain-join-setup.sh --version
-# domain-join-setup 1.4.0
+# domain-join-setup 1.5.0
 ```
 
 Versions follow [Semantic Versioning](https://semver.org/) — the major number

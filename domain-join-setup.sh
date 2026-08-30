@@ -27,7 +27,7 @@
 set -uo pipefail
 
 readonly PROGRAM_NAME="domain-join-setup"
-readonly SCRIPT_VERSION="1.4.0"
+readonly SCRIPT_VERSION="1.5.0"
 
 # ---------------------------------------------------------------------------
 # Runtime options (overridable by flags)

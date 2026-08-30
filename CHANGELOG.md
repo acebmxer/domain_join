@@ -16,6 +16,13 @@ changed — not that an artefact was published anywhere.
 
 ## [Unreleased]
 
+## [1.5.0] — 2026-08-30
+
+A dedicated menu entry for re-scanning the Windows guest for installed apps,
+`libvirt_group` moved into `windows-vm.conf`, and the round of fixes that stops
+the WinApps teardown and program scan tripping over `sudo`, the guest's domain
+certificate and stray removal flags.
+
 ### Added
 
 - **"Scan Windows for installed apps" on the menu.** The WinApps program scan
@@ -70,9 +77,6 @@ changed — not that an artefact was published anywhere.
   asked for — defaulting to the realm's `permitted-groups` — or set with
   `--winapps-libvirt-group`; blank skips the whole thing. Authorisation still
   runs through polkit; deleting the rule file revokes it.
-
-### Added
-
 - **The WinApps step tidies up the guest's install CD drives.** The build
   attaches three CD-ROMs — the install ISO, the virtio drivers and the unattend
   answer disk. After you confirm Windows is installed and reachable, the step
@@ -300,7 +304,8 @@ whose script would print a different number than the tag it sits on, that work
 is recorded above under 1.0.0, which is what the script itself claimed at the
 time.
 
-[Unreleased]: https://github.com/acebmxer/domain_join/compare/v1.4.0...HEAD
+[Unreleased]: https://github.com/acebmxer/domain_join/compare/v1.5.0...HEAD
+[1.5.0]: https://github.com/acebmxer/domain_join/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/acebmxer/domain_join/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/acebmxer/domain_join/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/acebmxer/domain_join/compare/v1.0.0...v1.2.0
