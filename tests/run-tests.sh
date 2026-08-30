@@ -1175,6 +1175,11 @@ if grep -qF '/sec:nla' "$SCAN_CONF"; then
 else
     printf '  %s it drops Kerberos NLA for the local-account connection\n' "$(green PASS)"; ((PASS++))
 fi
+if grep -qF '/cert:ignore' "$SCAN_CONF" && ! grep -qF '/cert:tofu' "$SCAN_CONF"; then
+    printf '  %s it tolerates the guest cert changing on domain join (/cert:ignore)\n' "$(green PASS)"; ((PASS++))
+else
+    printf '  %s the scan still pins the guest cert with /cert:tofu\n' "$(red FAIL)"; ((FAIL++))
+fi
 if grep -qE '^RDP_PASS=""' "$SCAN_CONF" && ! grep -qF "p'wd" "$SCAN_CONF"; then
     printf '  %s the password is never written into winapps.conf\n' "$(green PASS)"; ((PASS++))
 else
@@ -1607,6 +1612,10 @@ fi
 check "--winapps-vm-user is stored" "win-admin" \
       "$( OPT_WINAPPS_VM_ADMIN=""; parse_args --winapps-vm-user win-admin >/dev/null 2>&1
           printf '%s' "$OPT_WINAPPS_VM_ADMIN" )"
+check "--winapps-libvirt-group is stored" "Linux Admins@corp.example.com" \
+      "$( OPT_WINAPPS_LIBVIRT_GROUP=""
+          parse_args --winapps-libvirt-group "Linux Admins@corp.example.com" >/dev/null 2>&1
+          printf '%s' "$OPT_WINAPPS_LIBVIRT_GROUP" )"
 # A name the config file supplies has to be checked too, not just a flag.
 if ( printf 'admin = Bad Name\n' > "$VMC_TMP/t.conf"
      VM_CONF_FILE="$VMC_TMP/t.conf"; vm_conf_load >/dev/null 2>&1

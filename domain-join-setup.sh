@@ -81,6 +81,7 @@ OPT_WINAPPS_DOMAIN=""    # RDP_DOMAIN (empty = derive from the joined realm)
 OPT_WINAPPS_CREDS=""     # askpass | kerberos | shared (empty = ask)
 OPT_WINAPPS_RDP_USER=""  # shared-credential mode only: the service account
 OPT_WINAPPS_RDP_PASS="${WINAPPS_RDP_PASS:-}"  # shared-credential mode only
+OPT_WINAPPS_LIBVIRT_GROUP=""  # AD group granted qemu:///system access (libvirt backend; empty = ask/derive)
 WINAPPS_REMOVE=0         # --winapps-remove: take the multi-user wiring back out
 
 # Building the Windows guest. libvirt backend only: the script can stand up a
@@ -4940,13 +4941,27 @@ winapps_seed_scan_config() {
 
     # Start from the template so libvirt IP discovery (VM_NAME) is preserved,
     # then override: connect as a local account, no domain, no Kerberos NLA.
+    #
+    # '/cert:tofu' becomes '/cert:ignore' for this one connection. The guest's
+    # self-signed RDP certificate is regenerated whenever its hostname changes -
+    # which it does the moment the guest is joined to the domain (CN goes from
+    # 'HOST' to 'HOST.realm'). TOFU then sees a *changed* key, refuses it, and
+    # prompts - but the scan runs with no terminal, so it aborts at the TLS
+    # handshake before authentication (ERRCONNECT_TLS_CONNECT_FAILED). The
+    # per-user template keeps '/cert:tofu'; this is the scan's copy only.
     sed -e "s|^RDP_USER=.*|RDP_USER=\"$scan_user\"|" \
         -e 's|^RDP_DOMAIN=.*|RDP_DOMAIN=""|' \
         -e 's|^RDP_PASS=.*|RDP_PASS=""|' \
         -e "s|^RDP_ASKPASS=.*|RDP_ASKPASS=\"$askpass\"|" \
         -e 's| /sec:nla||' \
+        -e 's|/cert:tofu|/cert:ignore|' \
         "$WINAPPS_TEMPLATE" >"$HOME/.config/winapps/winapps.conf"
     chmod 600 "$HOME/.config/winapps/winapps.conf"
+
+    # Drop any host key this root account pinned on an earlier scan attempt -
+    # with '/cert:ignore' FreeRDP no longer consults the store, but a stale pin
+    # left here is confusing to anyone who looks.
+    rm -f "$HOME/.config/freerdp/server/"*.pem 2>/dev/null
 
     if [[ -z "$scan_pass" ]]; then
         warn "No password available for the program scan; it will likely fail."
@@ -5148,7 +5163,12 @@ winapps_print_summary() {
     case "$OPT_WINAPPS_BACKEND" in
         manual) printf '  Windows host   : %s:%s\n' "${OPT_WINAPPS_HOST:-?}" "${OPT_WINAPPS_PORT:-3389}" ;;
         libvirt) printf '  libvirt VM     : %s%s\n' "${OPT_WINAPPS_VM:-RDPWindows}" \
-                     "$( (( WINAPPS_VM_DEPLOYED )) && printf ' (installing now)' )" ;;
+                     "$( (( WINAPPS_VM_DEPLOYED )) && printf ' (installing now)' )"
+                 if [[ -n "$OPT_WINAPPS_LIBVIRT_GROUP" ]]; then
+                     printf '  virt-manager   : qemu:///system open to %s\n' "$OPT_WINAPPS_LIBVIRT_GROUP"
+                 else
+                     printf '  virt-manager   : local '\''libvirt'\'' group only\n'
+                 fi ;;
     esac
     if [[ -n "$freerdp" ]]; then
         printf '  FreeRDP        : %s\n' "$freerdp"
@@ -5180,6 +5200,107 @@ winapps_print_summary() {
             "$C_CYAN" "$WINAPPS_VM_DEPLOYER" "$C_RESET" "$C_DIM" "$C_RESET"
     fi
     return 0
+}
+
+# The AD group realmd was told may log in - the sensible default for who should
+# also be able to open the local Windows VM. Empty when logins were opened to
+# every domain user, or when realm isn't present.
+winapps_default_libvirt_group() {
+    have realm || return 0
+    realm list 2>/dev/null | awk -F': *' '/^[[:space:]]*permitted-groups:/ {print $2; exit}'
+}
+
+# ---------------------------------------------------------------------------
+# virt-manager / qemu:///system access for domain users
+#
+# The system libvirt socket (/run/libvirt/libvirt-sock) is mode 0770 root:libvirt
+# out of the box. A domain account is in no local group, so virt-manager's
+# connection is refused at the socket - before polkit is ever consulted - with a
+# bare "Permission denied on ... libvirt-sock", not an auth prompt. Per-user
+# 'usermod -aG libvirt' does not scale to a directory.
+#
+# The fix, applied once:
+#   - open the RW socket to every local user; authorisation still runs through
+#     polkit. Both the libvirtd.conf key and a drop-in on the .socket units are
+#     written, because whichever of the two is in force depends on whether the
+#     build is socket-activated (Fedora, recent Debian) or not.
+#   - a polkit rule granting org.libvirt.* to one AD group with no password.
+#
+# libvirt backend only - docker/podman/manual never touch the system libvirt.
+winapps_grant_libvirt_access() {
+    local grp="$1"
+    if [[ -z "$grp" ]]; then
+        printf '\n'
+        note "No libvirt access group set: virt-manager will reach qemu:///system"
+        note "only for members of the local 'libvirt' group. Add a domain user with"
+        note "'sudo usermod -aG libvirt <user>', or re-run with --winapps-libvirt-group."
+        return 0
+    fi
+
+    printf '\n'
+    info "Granting '$grp' access to the local Windows VM (qemu:///system)"
+
+    # --- socket permissions: the non-socket-activated path -----------------
+    local c hit=0
+    for c in /etc/libvirt/libvirtd.conf /etc/libvirt/virtqemud.conf /etc/libvirt/virtproxyd.conf; do
+        [[ -f "$c" ]] || continue
+        hit=1
+        if grep -Eq '^[[:space:]]*#?[[:space:]]*unix_sock_rw_perms[[:space:]]*=' "$c"; then
+            run_quiet sed -ri 's|^[[:space:]]*#?[[:space:]]*unix_sock_rw_perms[[:space:]]*=.*|unix_sock_rw_perms = "0777"|' "$c" \
+                && ok "$c: unix_sock_rw_perms = \"0777\""
+        elif [[ $DRY_RUN -eq 0 ]]; then
+            printf '\n# domain-join-setup: reachable by any local user; polkit still authorises\nunix_sock_rw_perms = "0777"\n' >>"$c" \
+                && ok "$c: unix_sock_rw_perms = \"0777\" appended"
+        fi
+    done
+    (( hit )) || note "No libvirt daemon config to adjust; relying on the socket drop-in."
+
+    # --- socket permissions: the socket-activated path --------------------
+    # Socket-activated libvirtd takes the mode from the .socket unit and ignores
+    # the .conf key entirely, so cover that with a drop-in on each unit present.
+    local sock
+    for sock in libvirtd virtqemud virtproxyd; do
+        unit_exists "$sock.socket" || continue
+        winapps_install_file "/etc/systemd/system/$sock.socket.d/override.conf" 0644 <<'SOCK_EOF'
+# Written by domain-join-setup. Any local user may open the socket; polkit still
+# decides who may manage qemu:///system - see the rule in
+# /etc/polkit-1/rules.d/49-domain-join-libvirt.rules.
+[Socket]
+SocketMode=0777
+SOCK_EOF
+    done
+
+    # --- polkit rule -----------------------------------------------------
+    local esc="$grp"
+    esc="${esc//\\/\\\\}"
+    esc="${esc//\"/\\\"}"
+    winapps_install_file /etc/polkit-1/rules.d/49-domain-join-libvirt.rules 0644 <<POLKIT_EOF
+// Written by domain-join-setup.
+// Members of "$grp" manage qemu:///system with no password prompt.
+// Delete this file to revoke it. Needs polkit with JS rules (0.106+).
+polkit.addRule(function(action, subject) {
+    if (action.id.indexOf("org.libvirt.") === 0 &&
+        subject.isInGroup("$esc")) {
+        return polkit.Result.YES;
+    }
+});
+POLKIT_EOF
+
+    # --- reload and restart so the socket is recreated with the new mode --
+    if have systemctl && [[ $DRY_RUN -eq 0 ]]; then
+        run_quiet systemctl daemon-reload
+        local u
+        for u in libvirtd.socket libvirtd-ro.socket libvirtd-admin.socket \
+                 virtqemud.socket virtqemud-ro.socket virtqemud-admin.socket \
+                 libvirtd.service virtqemud.service; do
+            unit_exists "$u" || continue
+            { systemctl is-active --quiet "$u" || systemctl is-enabled --quiet "$u"; } 2>/dev/null || continue
+            run_quiet systemctl restart "$u" && ok "restarted $u"
+        done
+    fi
+
+    note "Group membership is read at login: a user already signed in must log"
+    note "out and back in before virt-manager will connect."
 }
 
 # The whole WinApps step.
@@ -5282,6 +5403,20 @@ configure_winapps() {
         docker)  enable_service docker.service ;;
         podman)  enable_service podman.socket ;;
     esac
+
+    # --- Domain-user access to qemu:///system (libvirt backend only) ------
+    if [[ "$OPT_WINAPPS_BACKEND" == "libvirt" ]]; then
+        if [[ -z "$OPT_WINAPPS_LIBVIRT_GROUP" && $ASSUME_YES -ne 1 ]]; then
+            local dflt
+            dflt="$(winapps_default_libvirt_group)"
+            printf '\n'
+            note "virt-manager talks to the system libvirt, which a domain account"
+            note "cannot reach by default. Name the AD group whose members should be"
+            note "able to open and control the Windows VM (blank to skip)."
+            ask_value OPT_WINAPPS_LIBVIRT_GROUP "AD group for libvirt/virt-manager access" "$dflt"
+        fi
+        winapps_grant_libvirt_access "$OPT_WINAPPS_LIBVIRT_GROUP"
+    fi
 
     # --- Build the Windows guest (libvirt backend only) --------------------
     if [[ "$OPT_WINAPPS_BACKEND" == "libvirt" ]]; then
@@ -6864,6 +6999,10 @@ ${C_BOLD}WINDOWS APPLICATIONS (WINAPPS)${C_RESET}
       --winapps-host ADDR Windows hostname or IP. Required for 'manual'.
       --winapps-port PORT RDP port (default 3389).
       --winapps-vm NAME   libvirt VM name (default RDPWindows).
+      --winapps-libvirt-group G
+                          AD group whose members may open the local Windows VM
+                          in virt-manager (qemu:///system). Defaults to the
+                          realm's permitted-logins group; blank skips it.
       --winapps-domain D  RDP_DOMAIN (default: the realm this machine joined).
       --winapps-creds M   askpass  - prompt each user for their own AD password
                           kerberos - single sign-on from the user's ticket
@@ -6979,6 +7118,7 @@ parse_args() {
             --winapps-host)     OPT_WINAPPS_HOST="${2:-}"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift 2 ;;
             --winapps-port)     OPT_WINAPPS_PORT="${2:-}"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift 2 ;;
             --winapps-vm)       OPT_WINAPPS_VM="${2:-}"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift 2 ;;
+            --winapps-libvirt-group) OPT_WINAPPS_LIBVIRT_GROUP="${2:-}"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift 2 ;;
             --winapps-domain)   OPT_WINAPPS_DOMAIN="${2:-}"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift 2 ;;
             --winapps-creds)    OPT_WINAPPS_CREDS="${2:-}"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift 2 ;;
             --winapps-user)     OPT_WINAPPS_RDP_USER="${2:-}"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift 2 ;;

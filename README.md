@@ -6,7 +6,7 @@
 [![Issues](https://img.shields.io/github/issues/acebmxer/domain_join)](https://github.com/acebmxer/domain_join/issues)
 [![Shell: Bash](https://img.shields.io/badge/shell-bash-4EAA25?logo=gnubash&logoColor=white)](domain-join-setup.sh)
 [![Platform: Linux](https://img.shields.io/badge/platform-linux-333333?logo=linux&logoColor=white)](#supported-systems)
-[![Tests](https://img.shields.io/badge/tests-456-informational)](tests/run-tests.sh)
+[![Tests](https://img.shields.io/badge/tests-476-informational)](tests/run-tests.sh)
 
 An interactive installer that sets up everything a Linux workstation needs to
 join and live on an **Active Directory** domain — on multiple distributions and
@@ -203,6 +203,9 @@ Windows applications (WinApps):
       --winapps-host ADDR Windows hostname or IP. Required for 'manual'
       --winapps-port PORT RDP port (default 3389)
       --winapps-vm NAME   libvirt VM name (default RDPWindows)
+      --winapps-libvirt-group G
+                          AD group allowed to open the VM in virt-manager
+                          (default: the realm's permitted-logins group)
       --winapps-domain D  RDP_DOMAIN (default: the realm this machine joined)
       --winapps-creds M   askpass | kerberos | shared
       --winapps-user USER Windows service account, 'shared' mode only
@@ -885,6 +888,33 @@ which is what lands them in their own Windows profile. Only
 `--winapps-creds shared` connects everyone as one fixed account, and that
 account can be this one.
 
+#### Opening the VM in virt-manager
+
+`virt-manager` connects to the system libvirt (`qemu:///system`), whose socket
+is `root:libvirt` `0770` out of the box. A domain account is in no local group,
+so the first time anyone logs in from the directory and opens Virtual Machine
+Manager it fails with **`Failed to connect socket to
+'/var/run/libvirt/libvirt-sock': Permission denied`** — the refusal happens at
+the socket, before polkit is consulted, so there is not even a password prompt.
+Adding each user to `libvirt` by hand does not scale to a directory.
+
+The libvirt backend fixes this once, for a whole group:
+
+- the RW socket is opened to every local user — `unix_sock_rw_perms = "0777"`
+  in the daemon config, and a `SocketMode=0777` drop-in on the `.socket` units
+  for socket-activated builds (Fedora, recent Debian) that ignore the config key
+- `/etc/polkit-1/rules.d/49-domain-join-libvirt.rules` then grants
+  `org.libvirt.*` to one AD group with no password prompt
+
+So the socket is *reachable* by anyone local, but *management* still goes
+through polkit. The step asks which group — defaulting to the realm's
+`permitted-groups` (the group named in the login-access question) — or takes it
+from `--winapps-libvirt-group 'Linux Admins@corp.example.com'`. Leave it blank
+to skip: access then stays with the local `libvirt` group only. Group
+membership is read at login, so a user already signed in must log out and back
+in. Revoke by deleting the rule file. Needs polkit with JavaScript rules
+(0.106+), which is every currently-supported Fedora, RHEL, Ubuntu and Debian.
+
 #### `windows-vm.conf`
 
 The answers the unattended install needs can be written down once instead of
@@ -1021,9 +1051,10 @@ Windows has to exist first:
    to fill in `RDP_DOMAIN`.
 2. Run this script's WinApps step. It installs FreeRDP and the backend, writes
    the template, generator and login hooks, and seeds existing accounts. With
-   the libvirt backend it also offers to **build the Windows VM**
-   ([above](#building-the-vm)); otherwise deploy Windows yourself (container or
-   RDS host).
+   the libvirt backend it also grants an AD group access to `qemu:///system`
+   ([above](#opening-the-vm-in-virt-manager)) and offers to **build the Windows
+   VM** ([above](#building-the-vm)); otherwise deploy Windows yourself
+   (container or RDS host).
 3. **Join Windows to the domain.** The script never does this — not even for a
    VM it built.
 4. Scan Windows for installed programs to create the launchers:
@@ -1031,8 +1062,11 @@ Windows has to exist first:
    a program is added to or removed from Windows. This one scan signs into
    Windows as the guest's **local** administrator (the `admin` / `password` in
    `windows-vm.conf`), which works whether or not Windows is domain-joined; if
-   the build generated a random password it asks for one. The domain users who
-   log in later authenticate as themselves, per the credential mode above.
+   the build generated a random password it asks for one. It connects with
+   `/cert:ignore` — the guest's self-signed RDP certificate is regenerated when
+   it joins the domain, and `/cert:tofu` would refuse the changed key at a
+   prompt the scan cannot answer. The domain users who log in later authenticate
+   as themselves, per the credential mode above, and keep `/cert:tofu`.
 
 Step 2 asks whether Windows is already up. If it is not, the groundwork is still
 written and it prints the command for step 4 — so the script is safe to run
@@ -1092,6 +1126,8 @@ grep -rl pam_duo.so /etc/pam.d/     # which services require Duo
 | Duo denies every login | Wrong `ikey`/`skey`/`host`, or the account isn't enrolled under the username PAM sends. `journalctl -t pam_duo` shows which. |
 | Locked out after enabling Duo | Log in on a text console as a member of the bypass group, or from the greeter if `failmode = safe` and Duo is unreachable. Then `sudo sed -i '/pam_duo.so/d' /etc/pam.d/*`. |
 | Every `sudo` waits on a phone | `sudo` was among the protected services. Remove it: `sudo sed -i '/pam_duo.so/d' /etc/pam.d/sudo /etc/pam.d/sudo-i`. |
+| virt-manager: `Failed to connect socket to '/var/run/libvirt/libvirt-sock': Permission denied` | A domain user is in no local `libvirt` group. Re-run the WinApps step with `--winapps-libvirt-group '<AD group>'`, or add the one account with `sudo usermod -aG libvirt <user>`. Either way, log out and back in — group membership is read at login. |
+| virt-manager still asks for a password every time | The polkit rule's group name doesn't match what NSS returns. `id <user>` shows the exact form (`Linux Admins@corp.example.com`); put that in `/etc/polkit-1/rules.d/49-domain-join-libvirt.rules`. |
 
 A full log of every action is written to `/var/log/domain-join-setup.log`.
 

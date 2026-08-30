@@ -40,6 +40,18 @@ changed — not that an artefact was published anywhere.
   text, Copyright (c) 2026 acebmxer.
 - **Badges in the README** — license, version, last commit, open issues, shell,
   platform and the test count.
+- **The WinApps libvirt backend now grants domain users access to
+  `qemu:///system`.** A domain account is in no local group, so
+  `virt-manager` was refused at `/run/libvirt/libvirt-sock` with a bare
+  "Permission denied" — before polkit was ever consulted — the first time
+  anyone logged in from the directory. The step now opens the RW socket to
+  every local user (via both `unix_sock_rw_perms` in the daemon config and a
+  `SocketMode` drop-in on the `.socket` units, since socket-activated builds
+  ignore the former) and writes `/etc/polkit-1/rules.d/49-domain-join-libvirt.rules`
+  granting `org.libvirt.*` to one AD group with no password. The group is
+  asked for — defaulting to the realm's `permitted-groups` — or set with
+  `--winapps-libvirt-group`; blank skips the whole thing. Authorisation still
+  runs through polkit; deleting the rule file revokes it.
 
 ### Added
 
@@ -81,6 +93,16 @@ changed — not that an artefact was published anywhere.
   password goes into a root-only askpass helper, never `RDP_PASS`, so it is
   never a `/p:` argument in `ps` or the WinApps log; with no password in the
   config the scan asks for one. Domain-user sign-in is unchanged.
+- **The WinApps program scan aborted at the TLS handshake once the guest was
+  domain-joined.** The guest's self-signed RDP certificate is regenerated when
+  its hostname changes — which happens the moment it joins the domain (the CN
+  goes from `HOST` to `HOST.realm`). FreeRDP's `/cert:tofu` then sees a
+  *changed* host key, refuses it and prompts — but the scan has no terminal, so
+  it died with `ERRCONNECT_TLS_CONNECT_FAILED` before authentication was even
+  attempted. The scan's copy of `winapps.conf` now uses `/cert:ignore` for that
+  one connection (the per-user template keeps `/cert:tofu`), and any host key a
+  previous attempt pinned under `/root/.config/freerdp/server/` is cleared
+  first.
 - The menu banner in the README was one column too wide: the title row's
   interior measured 82 characters against an 81-character `╔═╗` border, so the
   closing `║` sat one place past the corner. The README now uses the same
