@@ -4146,16 +4146,19 @@ virsh -c "$LIBVIRT_URI" autostart "$VM_NAME" >/dev/null 2>&1 || true
 # boot the empty system disk (boot.order=1) fails and OVMF falls through to
 # the CD, which otherwise stops at "Press any key to boot from CD or DVD...".
 #
-# Send ESC, not ENTER, and only for the ~90s it takes to clear firmware: ESC
-# satisfies the "press any key" prompt but does NOT click the Cancel button
-# on the graphical "Installing Windows" screen the way ENTER does, and it
-# answers "No" to the "Are you sure you want to quit?" dialog. The taps must
-# be finished before WinPE / Setup takes over. After install the disk boots
-# directly and none of this fires again.
+# This is a FIRMWARE-ONLY window: the "press any key" prompt shows ~5-15s
+# after power-on and lasts ~5s, so tap for ~25s and then STOP HARD. Blindly
+# sending keys any longer is dangerous - once WinPE / Windows Setup is up,
+# ANY keystroke (ENTER, ESC, ...) can pop "Are you sure you want to quit?"
+# on the Setup GUI and, with bad luck on button focus, abort the install.
+# ESC is used because it is the least harmful of the options during that
+# brief overlap risk. If the host is slow enough to miss the window the
+# operator taps a key by hand (the NOTE below tells them how). After install
+# the disk boots directly and none of this fires again.
 if [ "${NOPROMPT_OK:-0}" != "1" ]; then
 (
-    sleep 3
-    for _ in $(seq 1 45); do
+    sleep 4
+    for _ in $(seq 1 11); do
         virsh -c "$LIBVIRT_URI" send-key "$VM_NAME" KEY_ESC >/dev/null 2>&1
         sleep 2
     done
