@@ -4142,25 +4142,30 @@ virt-install \
 virsh -c "$LIBVIRT_URI" autostart "$VM_NAME" >/dev/null 2>&1 || true
 
 # Belt and braces for the CD boot prompt - only when the ISO patch that
-# removes it (see iso_efi_noprompt) did not take on this media. On the first
-# boot the empty system disk (boot.order=1) fails and OVMF falls through to
-# the CD, which otherwise stops at "Press any key to boot from CD or DVD...".
+# removes it (see iso_efi_noprompt) did not take on this media, which is the
+# norm for current Microsoft-download ISOs (24H2/25H2): they carry no
+# efisys.bin file, only a hidden El Torito image, so there is nothing to
+# overwrite in place. On the first boot the empty system disk (boot.order=1)
+# fails and OVMF falls through to the CD, where "Press any key to boot from
+# CD or DVD..." would otherwise wait forever.
 #
-# This is a FIRMWARE-ONLY window: the "press any key" prompt shows ~5-15s
-# after power-on and lasts ~5s, so tap for ~25s and then STOP HARD. Blindly
-# sending keys any longer is dangerous - once WinPE / Windows Setup is up,
-# ANY keystroke (ENTER, ESC, ...) can pop "Are you sure you want to quit?"
-# on the Setup GUI and, with bad luck on button focus, abort the install.
-# ESC is used because it is the least harmful of the options during that
-# brief overlap risk. If the host is slow enough to miss the window the
-# operator taps a key by hand (the NOTE below tells them how). After install
-# the disk boots directly and none of this fires again.
+# Under UEFI/OVMF that prompt has NO timeout (unlike the legacy BIOS
+# etfsboot) - it waits indefinitely for a key. So there is no short window
+# to chase: one keystroke any time after the prompt renders (~T+5-12s: OVMF
+# POST + failed empty-disk boot + cdboot load) starts Setup. We send a few
+# ENTERs from T+5 to T+14 and then STOP HARD - by ~T+20-25s WinPE's GUI is
+# up and any further keystroke can pop "Are you sure you want to quit?" on
+# the Setup UI. ENTER, not ESC: ENTER is a no-op on the WinPE "getting a few
+# things ready" screen, whereas ESC is exactly what opens that quit dialog.
+# If a slow host misses even this window the operator taps a key by hand
+# (the NOTE below says how). After install the disk boots directly and none
+# of this fires again.
 if [ "${NOPROMPT_OK:-0}" != "1" ]; then
 (
-    sleep 4
-    for _ in $(seq 1 11); do
-        virsh -c "$LIBVIRT_URI" send-key "$VM_NAME" KEY_ESC >/dev/null 2>&1
-        sleep 2
+    sleep 5
+    for _ in 1 2 3 4; do
+        virsh -c "$LIBVIRT_URI" send-key "$VM_NAME" KEY_ENTER >/dev/null 2>&1
+        sleep 3
     done
 ) >/dev/null 2>&1 &
 fi
@@ -4172,10 +4177,10 @@ echo ""
 echo "    Watch it:   virt-viewer --connect $LIBVIRT_URI $VM_NAME"
 echo ""
 if [ "${NOPROMPT_OK:-0}" != "1" ]; then
-echo "  NOTE: the CD boot prompt could not be removed from this ISO. If the"
-echo "  first boot stops at 'Press any key to boot from CD or DVD...', open"
-echo "  the viewer above and press a key. (A key is also sent automatically,"
-echo "  but that can miss the ~5-second window.)"
+echo "  NOTE: the CD boot prompt could not be removed from this ISO (normal for"
+echo "  current 24H2/25H2 media). ENTER is sent automatically ~5-15s after boot;"
+echo "  if the first boot still sits at 'Press any key to boot from CD or"
+echo "  DVD...', open the viewer above and press a key."
 echo ""
 fi
 echo "  The install is unattended and reboots itself a few times. Give it"
