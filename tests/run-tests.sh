@@ -1183,7 +1183,8 @@ check_line "it patches the ISO past the CD boot prompt" 'efisys_noprompt.bin' "$
 check_line "it overwrites the boot image extent"   'conv=notrunc'           "$WINAPPS_VM_DEPLOYER"
 check_line "it locates the boot image by LBA"      'report_lba'             "$WINAPPS_VM_DEPLOYER"
 check_line "it records whether the prompt was removed" '"$_src_sz" "$_mode" > "$_mk"' "$WINAPPS_VM_DEPLOYER"
-check_line "it keeps a key-tap safety net"         'send-key "$VM_NAME" KEY_ENTER' "$WINAPPS_VM_DEPLOYER"
+check_line "it keeps a key-tap safety net"         'send-key "$VM_NAME" KEY_ESC' "$WINAPPS_VM_DEPLOYER"
+check_line "the key-tap net is skipped when the prompt is gone" 'if [ "${NOPROMPT_OK:-0}" != "1" ]; then' "$WINAPPS_VM_DEPLOYER"
 check_line "it warns when the prompt is still there" 'the CD boot prompt could not be removed' "$WINAPPS_VM_DEPLOYER"
 check_line "it points the user at the app scan"    'setup.sh --system'      "$WINAPPS_VM_DEPLOYER"
 # The '--help' banner must not fall through to the argument parser.

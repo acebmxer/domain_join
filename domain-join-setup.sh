@@ -4141,22 +4141,26 @@ virt-install \
 
 virsh -c "$LIBVIRT_URI" autostart "$VM_NAME" >/dev/null 2>&1 || true
 
-# Belt and braces for the CD boot prompt. The install ISO is patched to boot
-# straight through (see iso_efi_noprompt), but in case that did not take on
-# this media, also tap a key every couple of seconds for the first few
-# minutes: on the first boot the empty system disk (boot.order=1) fails and
-# OVMF falls through to the CD, which otherwise stops at "Press any key to
-# boot from CD or DVD...". 'send-key' is unreliable that early in firmware,
-# hence the ISO patch is the real fix - but the extra keystrokes are free
-# insurance and harmless once Setup (driven by Autounattend.xml) is running.
-# After install the disk boots directly and none of this fires again.
+# Belt and braces for the CD boot prompt - only when the ISO patch that
+# removes it (see iso_efi_noprompt) did not take on this media. On the first
+# boot the empty system disk (boot.order=1) fails and OVMF falls through to
+# the CD, which otherwise stops at "Press any key to boot from CD or DVD...".
+#
+# Send ESC, not ENTER, and only for the ~90s it takes to clear firmware: ESC
+# satisfies the "press any key" prompt but does NOT click the Cancel button
+# on the graphical "Installing Windows" screen the way ENTER does, and it
+# answers "No" to the "Are you sure you want to quit?" dialog. The taps must
+# be finished before WinPE / Setup takes over. After install the disk boots
+# directly and none of this fires again.
+if [ "${NOPROMPT_OK:-0}" != "1" ]; then
 (
-    sleep 5
-    for _ in $(seq 1 150); do
-        virsh -c "$LIBVIRT_URI" send-key "$VM_NAME" KEY_ENTER >/dev/null 2>&1
+    sleep 3
+    for _ in $(seq 1 45); do
+        virsh -c "$LIBVIRT_URI" send-key "$VM_NAME" KEY_ESC >/dev/null 2>&1
         sleep 2
     done
 ) >/dev/null 2>&1 &
+fi
 
 echo ""
 echo "  ---------------------------------------------------------------------------"
