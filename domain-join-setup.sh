@@ -3638,6 +3638,10 @@ WINAPPS_PROFILE_D="/etc/profile.d/winapps-user-config.sh"
 WINAPPS_AUTOSTART="/etc/xdg/autostart/winapps-user-config.desktop"
 WINAPPS_SKEL_DIR="/etc/skel/.config/winapps"
 WINAPPS_UPSTREAM_URL="https://raw.githubusercontent.com/winapps-org/winapps/main/setup.sh"
+# The launcher symlink an upstream '--system' install drops. Its presence is
+# what tells winapps_install_upstream a re-scan needs '--add-apps', not
+# '--system' (which would abort on the existing install).
+WINAPPS_SYS_LAUNCHER="/usr/local/bin/winapps"
 WINAPPS_CONFIGURED=0
 WINAPPS_CDROMS_PENDING=0   # spare CD drives detached --config but still on the
                           # running guest; cleared by a full power cycle
@@ -4888,8 +4892,9 @@ echo "  programs and create the launchers:"
 echo ""
 echo "    sudo /etc/winapps/setup.sh --system"
 echo ""
-echo "  Re-run that same command any time you install or remove a program in"
-echo "  Windows, to refresh the launchers."
+echo "  After a program is added in Windows, refresh the launchers with:"
+echo ""
+echo "    sudo /etc/winapps/setup.sh --system --add-apps"
 echo ""
 echo "  This guest is NOT domain-joined - do that from inside Windows if you"
 echo "  want AD logins and network shares."
@@ -5218,20 +5223,33 @@ winapps_offer_cdrom_powercycle() {
     fi
 }
 
-# Run the upstream installer with --system, which is what puts the launchers in
+# Run the upstream installer, which is what puts the launchers in
 # /usr/share/applications for every account.
 #
 # It cannot be run blind: the installer connects to Windows and enumerates the
 # installed programs, so Windows has to be up and reachable over RDP. When it is
 # not, the groundwork is left in place and the command is printed for later.
+#
+# The first run uses '--system'. Once WinApps is installed, '--system' aborts
+# with "EXISTING 'SYSTEM' WINAPPS INSTALLATION" (exit 3), so a re-scan uses
+# '--system --add-apps' - upstream's path for re-running the Windows program
+# scan and refreshing the launchers over an existing install. It picks up newly
+# installed programs; it does not remove launchers for programs taken back off
+# Windows (for that: setup.sh --system --uninstall, then setup.sh --system).
 winapps_install_upstream() {
     local installer="$WINAPPS_ETC_DIR/setup.sh" rc=0
+    local -a mode=(--system)
+    local label="system-wide"
+    if [[ -e "$WINAPPS_SYS_LAUNCHER" ]]; then
+        mode=(--system --add-apps)
+        label="refresh installed apps"
+    fi
 
     if ! confirm "Is the Windows side already installed, domain-joined and reachable over RDP?" "n"; then
         printf '\n'
         note "Leaving the WinApps launchers for later - Windows has to be up first."
         note "Once it is, run:"
-        printf '    %ssudo %s --system%s\n' "$C_CYAN" "$installer" "$C_RESET"
+        printf '    %ssudo %s %s%s\n' "$C_CYAN" "$installer" "${mode[*]}" "$C_RESET"
         return 0
     fi
 
@@ -5241,7 +5259,7 @@ winapps_install_upstream() {
     if [[ $DRY_RUN -eq 1 ]]; then
         printf '%s  [dry-run]%s download %s to %s\n' \
             "$C_CYAN" "$C_RESET" "$WINAPPS_UPSTREAM_URL" "$installer"
-        printf '%s  [dry-run]%s %s --system\n' "$C_CYAN" "$C_RESET" "$installer"
+        printf '%s  [dry-run]%s %s %s\n' "$C_CYAN" "$C_RESET" "$installer" "${mode[*]}"
         return 0
     fi
 
@@ -5249,18 +5267,31 @@ winapps_install_upstream() {
     if ! fetch_url "$WINAPPS_UPSTREAM_URL" "$installer"; then
         err "Could not download the WinApps installer."
         note "The rest of the configuration is in place; re-run this step when the"
-        note "network allows, or install WinApps by hand with --system."
+        note "network allows, or install WinApps by hand with ${mode[*]}."
         return 1
     fi
     chmod 0755 "$installer"
 
+    # Upstream's '--add-apps' existing-install check is broken for a normal
+    # layout: it tests '-d "${SYS_SOURCE_PATH}/winapps"', a directory that is
+    # never created (the source tree is ${SYS_SOURCE_PATH} itself), so it
+    # reports NO EXISTING WINAPPS INSTALLATION and exits. Relax the two '&&'
+    # tests in our fetched copy to "the source tree is present". A no-op on a
+    # fixed upstream, where the pattern will not match.
+    if [[ " ${mode[*]} " == *" --add-apps "* ]]; then
+        sed -i \
+            -e 's| && -d "${SYS_SOURCE_PATH}/winapps"| \&\& -d "${SYS_SOURCE_PATH}"|' \
+            -e 's| && -d "${USER_SOURCE_PATH}/winapps"| \&\& -d "${USER_SOURCE_PATH}"|' \
+            "$installer"
+    fi
+
     winapps_seed_scan_config "$installer"
 
-    info "Running the WinApps installer (system-wide)"
-    run "$installer" --system || rc=$?
+    info "Running the WinApps installer ($label)"
+    run "$installer" "${mode[@]}" || rc=$?
     if (( rc != 0 )); then
         warn "The WinApps installer exited non-zero; the launchers may be incomplete."
-        note "Re-run it once Windows is reachable:  sudo $installer --system"
+        note "Re-run it once Windows is reachable:  sudo $installer ${mode[*]}"
         return 1
     fi
     ok "WinApps launchers installed in /usr/share/applications"
@@ -5370,9 +5401,10 @@ winapps_print_summary() {
     printf '    %ssudo %s --all%s\n' "$C_CYAN" "$WINAPPS_SEEDER" "$C_RESET"
     printf '\n'
     printf '  %sTo scan (or re-scan) Windows for programs and refresh the launchers:%s\n' "$C_BOLD" "$C_RESET"
-    printf '    %ssudo %s/setup.sh --system%s\n' "$C_CYAN" "$WINAPPS_ETC_DIR" "$C_RESET"
-    printf '    Run it after the first install, and again whenever a program is\n'
-    printf '    added to or removed from Windows.\n'
+    printf '    %ssudo %s/setup.sh --system%s            (first scan)\n' "$C_CYAN" "$WINAPPS_ETC_DIR" "$C_RESET"
+    printf '    %ssudo %s/setup.sh --system --add-apps%s (re-scan)\n' "$C_CYAN" "$WINAPPS_ETC_DIR" "$C_RESET"
+    printf '    Re-scan whenever a program is added to Windows. The menu entry\n'
+    printf '    "Scan Windows for installed apps" runs the right one for you.\n'
 
     if [[ -x "$WINAPPS_VM_DEPLOYER" ]]; then
         printf '\n'
@@ -6243,11 +6275,11 @@ action_winapps() {
     configure_winapps
 }
 
-# The WinApps program scan on its own. 'setup.sh --system' signs into Windows,
-# lists what is installed and rewrites the shared launchers - the same command
-# for the first scan and every re-scan after a program is added or removed. The
-# 'Windows apps for every user' step runs this at its end, so a batch that ran
-# that too has nothing left to do here.
+# The WinApps program scan on its own: sign into Windows, list what is installed
+# and rewrite the shared launchers. The initial scan is a plain 'setup.sh
+# --system'; here, with WinApps already installed, winapps_install_upstream runs
+# 'setup.sh --system --add-apps' instead. The 'Windows apps for every user' step
+# runs this at its end, so a batch that ran that too has nothing left to do here.
 action_winapps_scan() {
     heading "WinApps - scan Windows for installed programs"
 

@@ -1358,6 +1358,26 @@ check "a scan is skipped when the install step already ran it" "0|0" \
           : > "$WA_TMP/scan.log"
           action_winapps_scan >/dev/null 2>&1; rc=$?
           printf '%s|%s' "$rc" "$(grep -c SCANNED "$WA_TMP/scan.log")" )"
+check "a first scan (WinApps not installed yet) runs plain --system" "yes" \
+      "$( WINAPPS_SYS_LAUNCHER="$WA_TMP/no-such-launcher"; DRY_RUN=1
+          confirm() { return 0; }; info() { :; }; note() { :; }; ok() { :; }; warn() { :; }
+          winapps_strip_vm_cdroms() { :; }
+          out="$(winapps_install_upstream 2>/dev/null)"
+          [[ "$out" == *'setup.sh --system'* && "$out" != *--add-apps* ]] && echo yes || echo no )"
+check "a re-scan (WinApps already installed) runs --system --add-apps" "yes" \
+      "$( : > "$WA_TMP/wa-launcher"; WINAPPS_SYS_LAUNCHER="$WA_TMP/wa-launcher"; DRY_RUN=1
+          confirm() { return 0; }; info() { :; }; note() { :; }; ok() { :; }; warn() { :; }
+          winapps_strip_vm_cdroms() { :; }
+          out="$(winapps_install_upstream 2>/dev/null)"
+          [[ "$out" == *'setup.sh --system --add-apps'* ]] && echo yes || echo no )"
+check "the re-scan corrects the broken upstream --add-apps install check" "yes" \
+      "$( d="$WA_TMP/wa-patch"; mkdir -p "$d"; WINAPPS_ETC_DIR="$d"; DRY_RUN=0
+          : > "$WA_TMP/wa-launcher"; WINAPPS_SYS_LAUNCHER="$WA_TMP/wa-launcher"
+          confirm() { return 0; }; info() { :; }; note() { :; }; ok() { :; }; warn() { :; }; err() { :; }
+          winapps_strip_vm_cdroms() { :; }; winapps_seed_scan_config() { :; }; run() { :; }
+          fetch_url() { printf '%s\n' 'X && -d "${SYS_SOURCE_PATH}/winapps" ]]; then' > "$2"; }
+          winapps_install_upstream >/dev/null 2>&1
+          grep -qF 'X && -d "${SYS_SOURCE_PATH}" ]]; then' "$d/setup.sh" && echo yes || echo no )"
 
 section "WinApps: the VM builder script"
 WINAPPS_VM_DEPLOYER="$WA_TMP/winapps-vm-deploy"

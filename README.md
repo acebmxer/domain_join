@@ -73,7 +73,7 @@ whether the machine is already joined.
 | **Grant sudo to a user or group** | Asks for an account, a group, or one of each, and writes a `/etc/sudoers.d` drop-in for each. See [sudo rights](#sudo-rights). |
 | **Duo two-factor authentication** | Installs Duo Unix, writes `/etc/duo/pam_duo.conf`, and adds `pam_duo.so` to the services you pick — or takes it back out again. See [Duo](#duo-security-two-factor-authentication). |
 | **Windows apps for every user** | Installs WinApps system-wide and generates each domain user's configuration at login, so Windows programs in the app menu open under their own account. Can also build the Windows 11 VM (libvirt). See [WinApps](#windows-applications-for-every-domain-user). |
-| **Scan Windows for installed apps** | Re-runs the WinApps program scan (`setup.sh --system`) on its own — the same command as the first scan, for use whenever a program is added to or removed from Windows. The entry above already does this at the end of its run. |
+| **Scan Windows for installed apps** | Re-runs the WinApps program scan on its own (`setup.sh --system --add-apps` once WinApps is installed), for use whenever a program is added to Windows. The entry above already does the first scan at the end of its run. |
 | **Preflight checks and domain status** | Read-only: hostname, clock, DNS SRV records, membership and service state. |
 
 The entries fill two columns, the left one taking the odd row when the count is
@@ -1106,8 +1106,11 @@ Windows has to exist first:
 3. **Join Windows to the domain.** The script never does this — not even for a
    VM it built.
 4. Scan Windows for installed programs to create the launchers:
-   `sudo /etc/winapps/setup.sh --system` — and re-run that same command whenever
-   a program is added to or removed from Windows. This one scan signs into
+   `sudo /etc/winapps/setup.sh --system`. Afterwards, whenever a program is
+   added to Windows, refresh the launchers with
+   `sudo /etc/winapps/setup.sh --system --add-apps` (or the **Scan Windows for
+   installed apps** menu entry, which picks the right one). Plain `--system`
+   aborts once WinApps is installed. This scan signs into
    Windows as the guest's **local** administrator (the `admin` / `password` in
    `windows-vm.conf`), which works whether or not Windows is domain-joined; if
    the build generated a random password it asks for one. It connects with
@@ -1136,15 +1139,15 @@ prints the manual commands.
 ```bash
 sudo nano /etc/winapps/winapps.conf.template   # change a setting for everyone
 sudo /usr/local/bin/winapps-user-config --all  # push it out now, not at next login
-sudo /etc/winapps/setup.sh --system            # scan / re-scan Windows for apps
+sudo /etc/winapps/setup.sh --system --add-apps  # re-scan Windows for new apps
 sudo winapps-vm-deploy --force                 # rebuild the Windows VM (libvirt)
 sudo ./domain-join-setup.sh --winapps-remove   # take the wiring back out
 sudo ./domain-join-setup.sh --winapps-vm-remove # ...and delete the libvirt guest
 ```
 
 New apps installed in Windows need one re-scan on the machine
-(`setup.sh --system`); new *users* need nothing at all — they are configured the
-moment they log in.
+(`setup.sh --system --add-apps`); new *users* need nothing at all — they are
+configured the moment they log in.
 
 ---
 

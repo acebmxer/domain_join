@@ -71,6 +71,24 @@ changed — not that an artefact was published anywhere.
   form this machine uses. `root` is always allowed. The setup step reports
   whether the group resolves and at which GID.
 
+### Fixed
+
+- **Re-scanning Windows for installed apps works.** The scan re-ran the upstream
+  installer as `setup.sh --system`, which aborts with "EXISTING 'SYSTEM'
+  WINAPPS INSTALLATION" (exit 3) once WinApps is installed — so a re-scan after
+  installing a program never completed. `winapps_install_upstream` now runs
+  `setup.sh --system --add-apps` when a system install is already present
+  (`/usr/local/bin/winapps` exists), and plain `--system` only for the first
+  install. `--add-apps` re-runs the Windows program scan and refreshes the
+  launchers; it does not prune launchers for programs removed from Windows —
+  for that, `setup.sh --system --uninstall` then `setup.sh --system`.
+
+  Upstream's own `--add-apps` existing-install check is broken for a normal
+  layout (it tests for a `winapps` directory inside the source tree that is
+  never created), so it would report "NO EXISTING WINAPPS INSTALLATION". The
+  fetched installer is corrected in place before it runs; a no-op once upstream
+  fixes it.
+
 ## [1.5.0] — 2026-08-30
 
 A dedicated menu entry for re-scanning the Windows guest for installed apps,
