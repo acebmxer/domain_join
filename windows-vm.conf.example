@@ -51,7 +51,8 @@
 # guest to the domain it is the only account on it.
 #
 # The name must be one Windows accepts: 20 characters or fewer, no spaces, no
-# trailing dot, and none of  " / \ [ ] : ; | = , + * ? < > @
+# trailing dot, and none of  " / \ [ ] : ; | = , + * ? < > @  - omit the line
+# and the build uses 'winadmin'.
 #
 # Leave the password unset and a random one is generated and printed once, at
 # the end of the build. That is fine, but it is printed only that once.
@@ -145,7 +146,7 @@
 
 
 #=============================================================================
-# WinApps access (libvirt backend only)
+# WinApps access
 #=============================================================================
 # These are not part of the VM build - they decide who, on this machine, may
 # launch the Windows apps and who may drive the guest in virt-manager. The

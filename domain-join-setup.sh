@@ -63,6 +63,12 @@ DUO_BUILD_SOURCE=-1     # -1 = ask before building Duo Unix from source
 
 # WinApps - Windows applications launched from the Linux desktop over RDP.
 #
+# The Windows side is a local VM under libvirt/KVM, joined to the domain in its
+# own right, so each user's Windows profile, group policy and mapped drives come
+# from Active Directory exactly as on a physical Windows box. (WinApps upstream
+# also supports Docker/Podman containers and an existing remote host; this
+# installer builds and manages the local VM and does not offer those.)
+#
 # The multi-user problem this solves: 'winapps' hard-codes its configuration
 # path to ${HOME}/.config/winapps/winapps.conf and has no system-wide fallback,
 # so a --system install puts the launchers in /usr/share/applications for
@@ -73,10 +79,7 @@ DUO_BUILD_SOURCE=-1     # -1 = ask before building Duo Unix from source
 # substituted in - which is also what makes the RDP session land in the right
 # Windows profile.
 OPT_WINAPPS=-1           # -1 = ask, 0 = no, 1 = yes
-OPT_WINAPPS_BACKEND=""   # libvirt | docker | podman | manual (empty = ask)
-OPT_WINAPPS_HOST=""      # RDP_IP: the Windows host, for the 'manual' backend
-OPT_WINAPPS_PORT=""      # RDP_PORT (empty = 3389)
-OPT_WINAPPS_VM=""        # VM_NAME, libvirt only (empty = RDPWindows)
+OPT_WINAPPS_VM=""        # VM_NAME of the local Windows guest (empty = RDPWindows)
 OPT_WINAPPS_DOMAIN=""    # RDP_DOMAIN (empty = derive from the joined realm)
 OPT_WINAPPS_CREDS=""     # askpass | kerberos | shared (empty = ask)
 OPT_WINAPPS_RDP_USER=""  # shared-credential mode only: the service account
@@ -91,16 +94,16 @@ OPT_WINAPPS_VM_AUTOSTART=""      # yes|no|"" (auto): 'virsh autostart' the guest
                                  # not the user. "" = follows OPT_WINAPPS_LAUNCHER_RO.
 WINAPPS_REMOVE=0         # --winapps-remove: take the multi-user wiring back out
 
-# Building the Windows guest. libvirt backend only: the script can stand up a
-# WinApps-ready Windows 11 Pro VM (unattended install, virtio drivers, RDP and
-# RemoteApp enabled). It does nothing domain-related - joining the guest to AD,
-# and anything else inside Windows, is left to the operator.
-OPT_WINAPPS_DEPLOY=-1    # -1 = ask, 0 = no, 1 = yes  (libvirt backend only)
+# Building the Windows guest: the script can stand up a WinApps-ready Windows 11
+# Pro VM (unattended install, virtio drivers, RDP and RemoteApp enabled). It
+# does nothing domain-related - joining the guest to AD, and anything else
+# inside Windows, is left to the operator.
+OPT_WINAPPS_DEPLOY=-1    # -1 = ask, 0 = no, 1 = yes
 OPT_WINAPPS_ISO=""       # path to a Windows 10/11 ISO; empty = fetch with Mido
 OPT_WINAPPS_VM_RAM=""    # guest RAM in MiB   (empty = 4096)
 OPT_WINAPPS_VM_CPUS=""   # guest vCPUs        (empty = 4)
 OPT_WINAPPS_VM_DISK=""   # guest disk in GiB  (empty = 64)
-OPT_WINAPPS_VM_ADMIN=""  # local admin account for the built VM (empty = Docker)
+OPT_WINAPPS_VM_ADMIN=""  # local admin account for the built VM (empty = winadmin)
 OPT_WINAPPS_VM_PASS="${WINAPPS_VM_PASS:-}"  # local admin password for the built VM
 
 # The rest of the Autounattend.xml answers. These come from windows-vm.conf
@@ -538,7 +541,8 @@ vm_conf_write_sample() {
 # guest to the domain it is the only account on it.
 #
 # The name must be one Windows accepts: 20 characters or fewer, no spaces, no
-# trailing dot, and none of  " / \ [ ] : ; | = , + * ? < > @
+# trailing dot, and none of  " / \ [ ] : ; | = , + * ? < > @  - omit the line
+# and the build uses 'winadmin'.
 #
 # Leave the password unset and a random one is generated and printed once, at
 # the end of the build. That is fine, but it is printed only that once.
@@ -632,7 +636,7 @@ vm_conf_write_sample() {
 
 
 #=============================================================================
-# WinApps access (libvirt backend only)
+# WinApps access
 #=============================================================================
 # These are not part of the VM build - they decide who, on this machine, may
 # launch the Windows apps and who may drive the guest in virt-manager. The
@@ -1075,9 +1079,7 @@ pkgs_for() {
         suse:extra_winapps)   echo "curl dialog freerdp git iproute2 libnotify-tools netcat-openbsd" ;;
         arch:extra_winapps)   echo "curl dialog freerdp git iproute2 libnotify openbsd-netcat" ;;
 
-        # Backend that hosts the Windows guest. Only the chosen one is
-        # installed, and 'manual' (an existing RDP host on the network) needs
-        # none of it.
+        # Virtualisation stack that hosts the Windows guest.
         debian:winapps_libvirt) echo "qemu-kvm libvirt-daemon-system libvirt-clients virt-manager virtiofsd libvirt-daemon-config-network" ;;
         rhel:winapps_libvirt)   echo "qemu-kvm libvirt virt-manager virt-install virtiofsd libvirt-daemon-config-network" ;;
         suse:winapps_libvirt)   echo "qemu-kvm libvirt virt-manager virt-install" ;;
@@ -1090,16 +1092,6 @@ pkgs_for() {
         rhel:winapps_deploy)   echo "edk2-ovmf swtpm swtpm-tools xorriso virt-viewer qemu-img" ;;
         suse:winapps_deploy)   echo "qemu-ovmf-x86_64 swtpm swtpm-tools xorriso virt-viewer qemu-tools" ;;
         arch:winapps_deploy)   echo "edk2-ovmf swtpm libisoburn virt-viewer" ;;
-
-        debian:winapps_docker) echo "docker.io docker-compose-v2" ;;
-        rhel:winapps_docker)   echo "docker docker-compose" ;;
-        suse:winapps_docker)   echo "docker docker-compose" ;;
-        arch:winapps_docker)   echo "docker docker-compose" ;;
-
-        debian:winapps_podman) echo "podman podman-compose" ;;
-        rhel:winapps_podman)   echo "podman podman-compose" ;;
-        suse:winapps_podman)   echo "podman podman-compose" ;;
-        arch:winapps_podman)   echo "podman podman-compose" ;;
 
         # Build dependencies for Duo's source release, used where no package
         # carrying pam_duo.so exists.
@@ -3726,16 +3718,6 @@ winapps_freerdp_cmd() {
     return 1
 }
 
-winapps_choose_backend() {
-    local -a entries=()
-    entries+=("libvirt|Local Windows VM via libvirt/KVM  ${C_GREEN}(recommended here)${C_RESET}|Runs Windows as a full virtual machine on this PC. The VM is joined to the domain in its own right, so a user's Windows profile, group policy and mapped drives all come from Active Directory exactly as they would on a physical Windows box. Best for a workstation that is used by one person at a time.")
-    entries+=("manual|An existing Windows host on the network|No VM is run here at all: the launchers point at a Windows machine you already have, typically a Remote Desktop Session Host joined to the same domain. Much lighter on the client, and the only sensible option if you are rolling this out to more than a handful of PCs. You will be asked for its address.")
-    entries+=("docker|Windows in a Docker container|Uses the dockur/windows image to run Windows under Docker. Quicker to stand up than libvirt and easy to reset, but it is still a full Windows install underneath and joining it to the domain is on you.")
-    entries+=("podman|Windows in a Podman container|As above but rootless-capable under Podman. Note that FreeRDP has to be invoked through 'podman unshare' for rootless networking, which WinApps handles for you.")
-
-    menu_single OPT_WINAPPS_BACKEND "Where should the Windows side run?" "libvirt" "${entries[@]}"
-}
-
 winapps_choose_creds() {
     local -a entries=()
     entries+=("askpass|Ask each user for their own AD password  ${C_GREEN}(recommended)${C_RESET}|Nothing secret is stored on disk. The first time a user opens a Windows app they are prompted for their Active Directory password, which is handed to FreeRDP through its askpass interface and never appears on a command line or in a log. It is cached in the kernel session keyring where available, so they are asked once per login rather than once per app.")
@@ -3813,8 +3795,8 @@ WINAPPS_ASKPASS_EOF
 # place any of this is edited: change it here and every user picks the change up
 # at their next login.
 winapps_write_template() {
-    local domain="$1" backend="$2" creds="$3" host="$4" port="$5" vm="$6"
-    local rdp_user_line rdp_pass_line askpass_line ip_line flags
+    local domain="$1" creds="$2" vm="$3"
+    local rdp_user_line rdp_pass_line askpass_line flags
 
     # '@WINAPPS_USER@' is the substitution the seeder makes per user. In shared
     # mode there is nothing to substitute - everyone is the same account.
@@ -3836,10 +3818,9 @@ winapps_write_template() {
         flags="$flags /sec:nla"
     fi
 
-    ip_line="RDP_IP=\"${host:-127.0.0.1}\""
-    # libvirt discovers the guest address from the VM itself, and hard-coding
-    # one here would override that with something that goes stale on reboot.
-    [[ "$backend" == "libvirt" ]] && ip_line='#RDP_IP=""   # libvirt: discovered from VM_NAME at runtime'
+    # libvirt discovers the guest address from the VM itself; a hard-coded one
+    # here would override that with something that goes stale on reboot.
+    local ip_line='#RDP_IP=""   # discovered from VM_NAME at runtime'
 
     # Read-only libvirt for ordinary domain users. This file is 'source'd by the
     # WinApps launcher after it has defined its own functions and before it calls
@@ -3847,7 +3828,7 @@ winapps_write_template() {
     # run. Members of the AD group keep read-write libvirt (a polkit rule) and
     # virt-manager; everyone else gets exactly enough to launch an app.
     local ro_block=""
-    if [[ "$OPT_WINAPPS_LAUNCHER_RO" == "yes" && "$backend" == "libvirt" ]]; then
+    if [[ "$OPT_WINAPPS_LAUNCHER_RO" == "yes" ]]; then
         ro_block=$(cat <<'RO_BLOCK_EOF'
 
 
@@ -3930,13 +3911,13 @@ RDP_DOMAIN="$domain"
 $ip_line
 
 # [RDP PORT]
-RDP_PORT="${port:-3389}"
+RDP_PORT="3389"
 
-# [VM NAME] - libvirt only; must match the domain name shown by 'virsh list'.
+# [VM NAME] - must match the domain name shown by 'virsh list'.
 VM_NAME="${vm:-RDPWindows}"
 
 # [WINAPPS BACKEND]
-WAFLAVOR="$backend"
+WAFLAVOR="libvirt"
 
 # [DISPLAY SCALING] - 100, 140 or 180.
 RDP_SCALE="100"
@@ -4109,7 +4090,7 @@ winapps_seed_all() {
 }
 
 # ---------------------------------------------------------------------------
-# --winapps-deploy - build the Windows guest (libvirt backend only)
+# --winapps-deploy - build the Windows guest
 # ---------------------------------------------------------------------------
 # This is the one part of the WinApps step that touches Windows itself. It
 # stands up an *unattended* Windows 11 Pro install with the virtio drivers,
@@ -4135,7 +4116,7 @@ winapps_write_vm_deployer() {
 #
 #   Environment (all optional):
 #     WA_VM_NAME   libvirt domain name           (default RDPWindows)
-#     WA_VM_ADMIN  local administrator account   (default Docker)
+#     WA_VM_ADMIN  local administrator account   (default winadmin)
 #     WA_VM_PASS   local administrator password  (default: random, printed once)
 #     WA_VM_RAM    guest RAM in MiB              (default 4096)
 #     WA_VM_CPUS   guest vCPUs                   (default 4)
@@ -4228,7 +4209,7 @@ if [ -f "$VM_CONF" ] && [ -r "$VM_CONF" ]; then
     unset _line _key _val
 fi
 
-VM_ADMIN="${VM_ADMIN:-Docker}"
+VM_ADMIN="${VM_ADMIN:-winadmin}"
 VM_RAM="${VM_RAM:-4096}"
 VM_CPUS="${VM_CPUS:-4}"
 VM_DISK="${VM_DISK:-64}"
@@ -4932,7 +4913,7 @@ winapps_vm_admin_ok() {
     return 0
 }
 
-# Collect the guest parameters and run the deployer. libvirt backend only.
+# Collect the guest parameters and run the deployer.
 winapps_deploy_vm() {
     local ram="${OPT_WINAPPS_VM_RAM:-4096}" cpus="${OPT_WINAPPS_VM_CPUS:-4}"
     local disk="${OPT_WINAPPS_VM_DISK:-64}" iso="$OPT_WINAPPS_ISO"
@@ -4985,7 +4966,7 @@ winapps_deploy_vm() {
             note "Windows. It is a Windows account, not a domain one - it is what you"
             note "sign in to the new VM with to finish setting it up."
             while : ; do
-                ask_value admin "Windows local administrator account" "Docker"
+                ask_value admin "Windows local administrator account" "winadmin"
                 winapps_vm_admin_ok "$admin" && break
                 err "Windows will not accept that name: 20 characters or fewer, no"
                 note "spaces and none of  \" / \\ [ ] : ; | = , + * ? < > @  and no trailing dot."
@@ -5006,7 +4987,7 @@ winapps_deploy_vm() {
             pass2=""
         fi
     fi
-    admin="${admin:-Docker}"
+    admin="${admin:-winadmin}"
     if ! winapps_vm_admin_ok "$admin"; then
         err "'$admin' is not a name Windows will accept for a local account."
         note "20 characters or fewer, no spaces, no trailing dot, and none of"
@@ -5059,7 +5040,7 @@ winapps_seed_scan_config() {
     local installer="${1:-$WINAPPS_ETC_DIR/setup.sh}"
     [[ -n "${HOME:-}" && -r "$WINAPPS_TEMPLATE" ]] || return 0
 
-    local scan_user="${OPT_WINAPPS_VM_ADMIN:-Docker}"
+    local scan_user="${OPT_WINAPPS_VM_ADMIN:-winadmin}"
     local scan_pass="$OPT_WINAPPS_VM_PASS"
     if [[ -z "$scan_pass" && -t 0 ]]; then
         printf '\n'
@@ -5118,9 +5099,8 @@ winapps_seed_scan_config() {
 # (the '-install.iso', virtio and unattend media) have done their job - they are
 # only read during Setup and first boot. Eject any media still loaded so a later
 # reboot cannot drop back into Setup, and detach the spare drives, leaving one
-# empty CD-ROM for mounting an ISO by hand later. libvirt backend only.
+# empty CD-ROM for mounting an ISO by hand later.
 winapps_strip_vm_cdroms() {
-    [[ "$OPT_WINAPPS_BACKEND" == "libvirt" ]] || return 0
     have virsh || return 0
 
     local vm="${OPT_WINAPPS_VM:-RDPWindows}" uri="qemu:///system"
@@ -5354,27 +5334,23 @@ winapps_print_summary() {
     freerdp="$(winapps_freerdp_cmd)" || freerdp=""
 
     heading "WinApps summary"
-    printf '  Backend        : %s%s%s\n' "$C_BOLD" "$OPT_WINAPPS_BACKEND" "$C_RESET"
     printf '  Credentials    : %s%s%s\n' "$C_BOLD" "$OPT_WINAPPS_CREDS" "$C_RESET"
     printf '  RDP domain     : %s\n' "${OPT_WINAPPS_DOMAIN:-<none>}"
-    case "$OPT_WINAPPS_BACKEND" in
-        manual) printf '  Windows host   : %s:%s\n' "${OPT_WINAPPS_HOST:-?}" "${OPT_WINAPPS_PORT:-3389}" ;;
-        libvirt) printf '  libvirt VM     : %s%s\n' "${OPT_WINAPPS_VM:-RDPWindows}" \
-                     "$( (( WINAPPS_VM_DEPLOYED )) && printf ' (installing now)' )"
-                 if [[ -n "$OPT_WINAPPS_LIBVIRT_GROUP" ]]; then
-                     if [[ "$OPT_WINAPPS_LIBVIRT_RESTRICT" == "yes" ]]; then
-                         printf '  virt-manager   : %s only (qemu:///system read-write via polkit)\n' "$OPT_WINAPPS_LIBVIRT_GROUP"
-                     else
-                         printf '  virt-manager   : %s (plus every local user - libvirt_restrict off)\n' "$OPT_WINAPPS_LIBVIRT_GROUP"
-                     fi
-                 else
-                     printf '  virt-manager   : local '\''libvirt'\'' group only\n'
-                 fi
-                 [[ "$OPT_WINAPPS_LAUNCHER_RO" == "yes" ]] && \
-                     printf '  app launchers   : every domain user (libvirt read-only)\n'
-                 [[ "$OPT_WINAPPS_VM_AUTOSTART" == "yes" ]] && \
-                     printf '  guest autostart : on (starts with this computer)\n' ;;
-    esac
+    printf '  Windows VM     : %s%s\n' "${OPT_WINAPPS_VM:-RDPWindows}" \
+        "$( (( WINAPPS_VM_DEPLOYED )) && printf ' (installing now)' )"
+    if [[ -n "$OPT_WINAPPS_LIBVIRT_GROUP" ]]; then
+        if [[ "$OPT_WINAPPS_LIBVIRT_RESTRICT" == "yes" ]]; then
+            printf '  virt-manager   : %s only (qemu:///system read-write via polkit)\n' "$OPT_WINAPPS_LIBVIRT_GROUP"
+        else
+            printf '  virt-manager   : %s (plus every local user - libvirt_restrict off)\n' "$OPT_WINAPPS_LIBVIRT_GROUP"
+        fi
+    else
+        printf '  virt-manager   : local '\''libvirt'\'' group only\n'
+    fi
+    [[ "$OPT_WINAPPS_LAUNCHER_RO" == "yes" ]] && \
+        printf '  app launchers  : every domain user (libvirt read-only)\n'
+    [[ "$OPT_WINAPPS_VM_AUTOSTART" == "yes" ]] && \
+        printf '  guest autostart: on (starts with this computer)\n'
     if [[ -n "$freerdp" ]]; then
         printf '  FreeRDP        : %s\n' "$freerdp"
     else
@@ -5398,7 +5374,7 @@ winapps_print_summary() {
     printf '    Run it after the first install, and again whenever a program is\n'
     printf '    added to or removed from Windows.\n'
 
-    if [[ "$OPT_WINAPPS_BACKEND" == "libvirt" && -x "$WINAPPS_VM_DEPLOYER" ]]; then
+    if [[ -x "$WINAPPS_VM_DEPLOYER" ]]; then
         printf '\n'
         printf '  %sTo build or rebuild the Windows VM:%s\n' "$C_BOLD" "$C_RESET"
         printf '    %ssudo %s%s            %s(--force to replace an existing one)%s\n' \
@@ -5526,7 +5502,7 @@ winapps_enable_ro_sockets() {
 #     full control and the polkit rule would do nothing. The read-only socket
 #     stays open (auth_unix_ro = "none"): that is what the shared launchers use.
 #
-# libvirt backend only - docker/podman/manual never touch the system libvirt.
+# The read-only socket stays open for the shared launchers; polkit gates RW.
 
 winapps_grant_libvirt_access() {
     local grp="$1"
@@ -5694,12 +5670,6 @@ configure_winapps() {
     printf '\n'
 
     # --- Choices ------------------------------------------------------------
-    [[ -z "$OPT_WINAPPS_BACKEND" ]] && winapps_choose_backend
-    if [[ ! "$OPT_WINAPPS_BACKEND" =~ ^(libvirt|docker|podman|manual)$ ]]; then
-        err "Invalid WinApps backend '$OPT_WINAPPS_BACKEND'."
-        return 1
-    fi
-
     [[ -z "$OPT_WINAPPS_CREDS" ]] && winapps_choose_creds
     if [[ ! "$OPT_WINAPPS_CREDS" =~ ^(askpass|kerberos|shared)$ ]]; then
         err "Invalid WinApps credential mode '$OPT_WINAPPS_CREDS'."
@@ -5716,32 +5686,23 @@ configure_winapps() {
         fi
     fi
 
-    if [[ "$OPT_WINAPPS_BACKEND" == "manual" && -z "$OPT_WINAPPS_HOST" ]]; then
-        ask_value OPT_WINAPPS_HOST "Address of the Windows host (hostname or IP)" ""
-        if [[ -z "$OPT_WINAPPS_HOST" ]]; then
-            err "The 'manual' backend needs an address to connect to."
-            return 1
-        fi
-    fi
-    [[ "$OPT_WINAPPS_BACKEND" == "libvirt" && -z "$OPT_WINAPPS_VM" ]] && \
-        ask_value OPT_WINAPPS_VM "libvirt VM name" "RDPWindows"
+    [[ -z "$OPT_WINAPPS_VM" ]] && \
+        ask_value OPT_WINAPPS_VM "Windows VM name" "RDPWindows"
 
     # Who may drive virt-manager. Asked here, before the template is written, so
     # winapps_access_resolve knows whether the read-only launcher path applies.
-    if [[ "$OPT_WINAPPS_BACKEND" == "libvirt" ]]; then
-        if [[ -z "$OPT_WINAPPS_LIBVIRT_GROUP" && $ASSUME_YES -ne 1 \
-              && $VM_CONF_HAS_LIBVIRT_GROUP -ne 1 ]]; then
-            local dflt
-            dflt="$(winapps_default_libvirt_group)"
-            printf '\n'
-            note "virt-manager talks to the system libvirt, which a domain account"
-            note "cannot reach by default. Name the AD group whose members should be"
-            note "able to open and control the Windows VM (blank to skip)."
-            note "Everyone else still launches the Windows apps - read-only."
-            ask_value OPT_WINAPPS_LIBVIRT_GROUP "AD group for libvirt/virt-manager access" "$dflt"
-        fi
-        winapps_access_resolve
+    if [[ -z "$OPT_WINAPPS_LIBVIRT_GROUP" && $ASSUME_YES -ne 1 \
+          && $VM_CONF_HAS_LIBVIRT_GROUP -ne 1 ]]; then
+        local dflt
+        dflt="$(winapps_default_libvirt_group)"
+        printf '\n'
+        note "virt-manager talks to the system libvirt, which a domain account"
+        note "cannot reach by default. Name the AD group whose members should be"
+        note "able to open and control the Windows VM (blank to skip)."
+        note "Everyone else still launches the Windows apps - read-only."
+        ask_value OPT_WINAPPS_LIBVIRT_GROUP "AD group for libvirt/virt-manager access" "$dflt"
     fi
+    winapps_access_resolve
 
     if [[ "$OPT_WINAPPS_CREDS" == "shared" ]]; then
         warn "Every user will connect to Windows as the same account."
@@ -5760,17 +5721,14 @@ configure_winapps() {
     # --- Packages -----------------------------------------------------------
     local -a pkgs=() add=()
     read -r -a pkgs <<<"$(pkgs_for extra_winapps)"
-    if [[ "$OPT_WINAPPS_BACKEND" != "manual" ]]; then
-        local group_pkgs
-        group_pkgs="$(pkgs_for "winapps_${OPT_WINAPPS_BACKEND}")"
-        [[ -n "$group_pkgs" ]] && { read -r -a add <<<"$group_pkgs"; pkgs+=("${add[@]}"); }
-    fi
+    local group_pkgs
+    group_pkgs="$(pkgs_for winapps_libvirt)"
+    [[ -n "$group_pkgs" ]] && { read -r -a add <<<"$group_pkgs"; pkgs+=("${add[@]}"); }
 
     refresh_repos
     filter_available "${pkgs[@]}"
     if [[ ${#SKIPPED_PACKAGES[@]} -gt 0 ]]; then
         warn "Not available on this system: ${SKIPPED_PACKAGES[*]}"
-        note "Docker in particular is often only in the vendor's own repository."
     fi
     if [[ ${#AVAILABLE_PACKAGES[@]} -gt 0 ]]; then
         printf '\n'
@@ -5788,58 +5746,48 @@ configure_winapps() {
     # --- The configuration --------------------------------------------------
     printf '\n'
     winapps_write_askpass || return 1
-    winapps_write_template "$OPT_WINAPPS_DOMAIN" "$OPT_WINAPPS_BACKEND" \
-        "$OPT_WINAPPS_CREDS" "$OPT_WINAPPS_HOST" "$OPT_WINAPPS_PORT" \
+    winapps_write_template "$OPT_WINAPPS_DOMAIN" "$OPT_WINAPPS_CREDS" \
         "$OPT_WINAPPS_VM" || return 1
     winapps_write_seeder || return 1
     winapps_wire_login_hooks || return 1
     winapps_seed_all
 
-    # --- Backend services ---------------------------------------------------
-    case "$OPT_WINAPPS_BACKEND" in
-        libvirt) enable_service libvirtd.service ;;
-        docker)  enable_service docker.service ;;
-        podman)  enable_service podman.socket ;;
+    enable_service libvirtd.service
+
+    # --- Domain-user access to qemu:///system -----------------------------
+    winapps_grant_libvirt_access "$OPT_WINAPPS_LIBVIRT_GROUP"
+    winapps_vm_autostart_apply
+
+    # --- Build the Windows guest -----------------------------------------
+    local do_deploy=0
+    case "$OPT_WINAPPS_DEPLOY" in
+        1) do_deploy=1 ;;
+        0) do_deploy=0 ;;
+        *) [[ $ASSUME_YES -ne 1 ]] \
+             && confirm "Build the Windows 11 VM now with virt-install (unattended, ~20-45 min)?" "n" \
+             && do_deploy=1 ;;
     esac
 
-    # --- Domain-user access to qemu:///system (libvirt backend only) ------
-    if [[ "$OPT_WINAPPS_BACKEND" == "libvirt" ]]; then
-        winapps_grant_libvirt_access "$OPT_WINAPPS_LIBVIRT_GROUP"
-        winapps_vm_autostart_apply
-    fi
-
-    # --- Build the Windows guest (libvirt backend only) --------------------
-    if [[ "$OPT_WINAPPS_BACKEND" == "libvirt" ]]; then
-        local do_deploy=0
-        case "$OPT_WINAPPS_DEPLOY" in
-            1) do_deploy=1 ;;
-            0) do_deploy=0 ;;
-            *) [[ $ASSUME_YES -ne 1 ]] \
-                 && confirm "Build the Windows 11 VM now with virt-install (unattended, ~20-45 min)?" "n" \
-                 && do_deploy=1 ;;
-        esac
-
-        if (( do_deploy )); then
-            printf '\n'
-            local -a dep_pkgs=()
-            read -r -a dep_pkgs <<<"$(pkgs_for winapps_deploy)"
-            if [[ ${#dep_pkgs[@]} -gt 0 ]]; then
-                filter_available "${dep_pkgs[@]}"
-                if [[ ${#AVAILABLE_PACKAGES[@]} -gt 0 ]]; then
-                    info "Deploy dependencies: ${AVAILABLE_PACKAGES[*]}"
-                    install_packages "${AVAILABLE_PACKAGES[@]}" \
-                        || warn "Some deploy dependencies did not install; virt-install may fail."
-                fi
-                [[ ${#SKIPPED_PACKAGES[@]} -gt 0 ]] && \
-                    warn "Not available here: ${SKIPPED_PACKAGES[*]}"
+    if (( do_deploy )); then
+        printf '\n'
+        local -a dep_pkgs=()
+        read -r -a dep_pkgs <<<"$(pkgs_for winapps_deploy)"
+        if [[ ${#dep_pkgs[@]} -gt 0 ]]; then
+            filter_available "${dep_pkgs[@]}"
+            if [[ ${#AVAILABLE_PACKAGES[@]} -gt 0 ]]; then
+                info "Deploy dependencies: ${AVAILABLE_PACKAGES[*]}"
+                install_packages "${AVAILABLE_PACKAGES[@]}" \
+                    || warn "Some deploy dependencies did not install; virt-install may fail."
             fi
-            winapps_write_vm_deployer || return 1
-            winapps_deploy_vm || true
-            winapps_vm_autostart_apply   # the guest exists now; the deployer also sets this
-        else
-            winapps_write_vm_deployer || true
-            note "Skipping the VM build. When you want it:  sudo $WINAPPS_VM_DEPLOYER"
+            [[ ${#SKIPPED_PACKAGES[@]} -gt 0 ]] && \
+                warn "Not available here: ${SKIPPED_PACKAGES[*]}"
         fi
+        winapps_write_vm_deployer || return 1
+        winapps_deploy_vm || true
+        winapps_vm_autostart_apply   # the guest exists now; the deployer also sets this
+    else
+        winapps_write_vm_deployer || true
+        note "Skipping the VM build. When you want it:  sudo $WINAPPS_VM_DEPLOYER"
     fi
 
     if ! winapps_freerdp_cmd >/dev/null; then
@@ -7414,13 +7362,12 @@ The secret key is also read from the DUO_SKEY environment variable, which keeps
 it out of the process list and the shell history.
 
 ${C_BOLD}WINDOWS APPLICATIONS (WINAPPS)${C_RESET}
+      Runs the Windows side as a local VM under libvirt/KVM, joined to the
+      domain in its own right. (WinApps upstream also does Docker/Podman and a
+      remote RDP host; this installer builds and manages the local VM only.)
       --winapps           Set up WinApps for all users (same as -e winapps).
       --no-winapps        Never set up WinApps, whatever the extras say.
-      --winapps-backend B libvirt (local VM), manual (existing RDP host on the
-                          network), docker or podman.
-      --winapps-host ADDR Windows hostname or IP. Required for 'manual'.
-      --winapps-port PORT RDP port (default 3389).
-      --winapps-vm NAME   libvirt VM name (default RDPWindows).
+      --winapps-vm NAME   Windows VM name (default RDPWindows).
       --winapps-libvirt-group G
                           AD group whose members get read-write libvirt - the
                           start/stop/reconfigure virt-manager does. Defaults to
@@ -7449,7 +7396,7 @@ ${C_BOLD}WINDOWS APPLICATIONS (WINAPPS)${C_RESET}
       --winapps-vm-remove With --winapps-remove, also 'virsh undefine' the guest
                           and delete its disk.
 
-Building the Windows guest (libvirt backend only):
+Building the Windows guest:
       --winapps-deploy    Build a WinApps-ready Windows 11 Pro VM: unattended
                           install, virtio drivers, RDP and RemoteApp on. Nothing
                           domain-related - join it to AD yourself.
@@ -7462,7 +7409,7 @@ Building the Windows guest (libvirt backend only):
       --winapps-vm-cpus N  Guest vCPUs        (default 4).
       --winapps-vm-disk N  Guest disk in GiB  (default 64).
       --winapps-vm-user U  Local administrator account created inside the guest
-                           (default Docker). A Windows local account, not a
+                           (default winadmin). A Windows local account, not a
                            domain one - it is what you sign in to the VM with.
 
 These answers can be written down once instead of typed each time:
@@ -7551,9 +7498,6 @@ parse_args() {
             --duo-exempt)    OPT_DUO_EXEMPT_GROUP="${2:-}"; OPT_DUO=1; CLI_DIRECTED=1; shift 2 ;;
             --winapps)          OPT_WINAPPS=1; CLI_DIRECTED=1; shift ;;
             --no-winapps)       OPT_WINAPPS=0; CLI_DIRECTED=1; shift ;;
-            --winapps-backend)  OPT_WINAPPS_BACKEND="${2:-}"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift 2 ;;
-            --winapps-host)     OPT_WINAPPS_HOST="${2:-}"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift 2 ;;
-            --winapps-port)     OPT_WINAPPS_PORT="${2:-}"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift 2 ;;
             --winapps-vm)       OPT_WINAPPS_VM="${2:-}"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift 2 ;;
             --winapps-libvirt-group) OPT_WINAPPS_LIBVIRT_GROUP="${2:-}"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift 2 ;;
             --winapps-libvirt-restrict)    OPT_WINAPPS_LIBVIRT_RESTRICT="yes"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift ;;
@@ -7609,27 +7553,14 @@ parse_args() {
         die "Invalid --duo-failmode '$OPT_DUO_FAILMODE' (expected safe or secure)."
     fi
 
-    if [[ -n "$OPT_WINAPPS_BACKEND" && ! "$OPT_WINAPPS_BACKEND" =~ ^(libvirt|docker|podman|manual)$ ]]; then
-        die "Invalid --winapps-backend '$OPT_WINAPPS_BACKEND' (expected libvirt, docker, podman or manual)."
-    fi
-
     if [[ -n "$OPT_WINAPPS_CREDS" && ! "$OPT_WINAPPS_CREDS" =~ ^(askpass|kerberos|shared)$ ]]; then
         die "Invalid --winapps-creds '$OPT_WINAPPS_CREDS' (expected askpass, kerberos or shared)."
-    fi
-
-    if [[ "$OPT_WINAPPS_BACKEND" == "manual" && -n "$OPT_WINAPPS_HOST" ]]; then
-        :
-    elif [[ "$OPT_WINAPPS_BACKEND" == "manual" && $ASSUME_YES -eq 1 ]]; then
-        die "--winapps-backend manual needs --winapps-host to say where Windows is."
     fi
 
     if [[ "$OPT_WINAPPS_CREDS" == "shared" && $ASSUME_YES -eq 1 && -z "$OPT_WINAPPS_RDP_USER" ]]; then
         die "--winapps-creds shared needs --winapps-user (and WINAPPS_RDP_PASS in the environment)."
     fi
 
-    if [[ "$OPT_WINAPPS_DEPLOY" == "1" && -n "$OPT_WINAPPS_BACKEND" && "$OPT_WINAPPS_BACKEND" != "libvirt" ]]; then
-        die "--winapps-deploy only applies to the libvirt backend (got '$OPT_WINAPPS_BACKEND')."
-    fi
     if [[ -n "$OPT_WINAPPS_ISO" ]]; then
         if [[ -d "$OPT_WINAPPS_ISO" ]]; then
             die "--winapps-iso is a directory ('$OPT_WINAPPS_ISO'). Give the full path to the .iso file, filename included."

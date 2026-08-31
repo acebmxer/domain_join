@@ -998,17 +998,15 @@ SUDOERS_DIR="/etc/sudoers.d"
 
 section "WinApps: the flags"
 winapps_after() {
-    ( OPT_WINAPPS=-1; OPT_WINAPPS_BACKEND=""; OPT_WINAPPS_CREDS=""
-      OPT_WINAPPS_HOST=""; OPT_WINAPPS_RDP_USER=""; WINAPPS_REMOVE=0; ASSUME_YES=0
+    ( OPT_WINAPPS=-1; OPT_WINAPPS_CREDS=""
+      OPT_WINAPPS_RDP_USER=""; WINAPPS_REMOVE=0; ASSUME_YES=0
       parse_args "$@" >/dev/null 2>&1
-      printf '%s|%s|%s|%s' "$OPT_WINAPPS" "$OPT_WINAPPS_BACKEND" \
-             "$OPT_WINAPPS_CREDS" "$WINAPPS_REMOVE" )
+      printf '%s|%s|%s' "$OPT_WINAPPS" "$OPT_WINAPPS_CREDS" "$WINAPPS_REMOVE" )
 }
-check "--winapps turns it on"        "1|||0"          "$(winapps_after --winapps)"
-check "--no-winapps turns it off"    "0|||0"          "$(winapps_after --no-winapps)"
-check "--winapps-backend implies on" "1|libvirt||0"   "$(winapps_after --winapps-backend libvirt)"
-check "--winapps-creds is stored"    "1||askpass|0"   "$(winapps_after --winapps-creds askpass)"
-check "--winapps-remove sets removal" "1|||1"         "$(winapps_after --winapps-remove)"
+check "--winapps turns it on"        "1||0"        "$(winapps_after --winapps)"
+check "--no-winapps turns it off"    "0||0"        "$(winapps_after --no-winapps)"
+check "--winapps-creds implies on"   "1|askpass|0" "$(winapps_after --winapps-creds askpass)"
+check "--winapps-remove sets removal" "1||1"       "$(winapps_after --winapps-remove)"
 
 # main() must short-circuit --winapps-remove straight to winapps_remove. Without
 # that it falls into action_guided_setup, which prompts for an AD backend and
@@ -1034,7 +1032,7 @@ check_contains "the uninstall hint passes --system" "--system" \
       "$( ( DRY_RUN=1; winapps_remove 2>/dev/null | grep -F 'setup.sh' ) )"
 
 # An invalid enum must stop the run rather than be carried into a config file.
-for bad in "--winapps-backend vmware" "--winapps-creds telepathy"; do
+for bad in "--winapps-creds telepathy"; do
     if ( parse_args $bad ) >/dev/null 2>&1; then
         printf '  %s %s was accepted\n' "$(red FAIL)" "$bad"; ((FAIL++))
     else
@@ -1042,18 +1040,16 @@ for bad in "--winapps-backend vmware" "--winapps-creds telepathy"; do
     fi
 done
 
-# 'manual' has nothing to connect to without a host, and -y cannot ask.
-if ( ASSUME_YES=1; parse_args -y --winapps-backend manual ) >/dev/null 2>&1; then
-    printf '  %s manual backend with no host was accepted under -y\n' "$(red FAIL)"; ((FAIL++))
+# The backend/host flags are gone - the tool is libvirt-only now.
+if ( parse_args --winapps-backend libvirt ) >/dev/null 2>&1; then
+    printf '  %s --winapps-backend still parses\n' "$(red FAIL)"; ((FAIL++))
 else
-    printf '  %s manual backend demands --winapps-host under -y\n' "$(green PASS)"; ((PASS++))
+    printf '  %s --winapps-backend is no longer a flag\n' "$(green PASS)"; ((PASS++))
 fi
-check "manual backend is fine with a host" "1|manual||0" \
-      "$(winapps_after --winapps-backend manual --winapps-host win.corp.example.com)"
 
 section "WinApps: the VM builder flags"
 winapps_deploy_after() {
-    ( OPT_WINAPPS=-1; OPT_WINAPPS_BACKEND=""; OPT_WINAPPS_DEPLOY=-1
+    ( OPT_WINAPPS=-1; OPT_WINAPPS_DEPLOY=-1
       OPT_WINAPPS_ISO=""; OPT_WINAPPS_VM_RAM=""; OPT_WINAPPS_VM_CPUS=""
       OPT_WINAPPS_VM_DISK=""; WINAPPS_VM_REMOVE=0; WINAPPS_REMOVE=0; ASSUME_YES=0
       parse_args "$@" >/dev/null 2>&1
@@ -1069,11 +1065,9 @@ check "--winapps-vm-remove sets both flags" "1" \
             parse_args --winapps-vm-remove >/dev/null 2>&1
             printf '%s' "$(( WINAPPS_VM_REMOVE & WINAPPS_REMOVE ))" ) )"
 
-# Non-libvirt backend + deploy must be refused, a bad size must stop the run,
-# and --winapps-iso must be a real .iso *file* - a directory or a missing path
-# is refused rather than carried into the builder.
-for bad in "--winapps-deploy --winapps-backend docker" \
-           "--winapps-deploy --winapps-vm-ram plenty" \
+# A bad size must stop the run, and --winapps-iso must be a real .iso *file* -
+# a directory or a missing path is refused rather than carried into the builder.
+for bad in "--winapps-deploy --winapps-vm-ram plenty" \
            "--winapps-iso /nonexistent/windows.iso" \
            "--winapps-iso /tmp"; do
     if ( parse_args $bad ) >/dev/null 2>&1; then
@@ -1111,10 +1105,11 @@ check_line() {
     fi
 }
 
-winapps_write_template "CORP.EXAMPLE.COM" "libvirt" "askpass" "" "" "RDPWindows" >/dev/null 2>&1
+winapps_write_template "CORP.EXAMPLE.COM" "askpass" "RDPWindows" >/dev/null 2>&1
 check_line "the template carries the substitution token" 'RDP_USER="@WINAPPS_USER@"' "$WINAPPS_TEMPLATE"
 check_line "the domain is written through"               'RDP_DOMAIN="CORP.EXAMPLE.COM"' "$WINAPPS_TEMPLATE"
-check_line "the backend is written through"              'WAFLAVOR="libvirt"' "$WINAPPS_TEMPLATE"
+check_line "the flavor is always libvirt"                'WAFLAVOR="libvirt"' "$WINAPPS_TEMPLATE"
+check_line "the VM name is written through"              'VM_NAME="RDPWindows"' "$WINAPPS_TEMPLATE"
 if grep -q '^RDP_PASS=""' "$WINAPPS_TEMPLATE"; then
     printf '  %s askpass mode stores no password\n' "$(green PASS)"; ((PASS++))
 else
@@ -1122,18 +1117,18 @@ else
 fi
 # libvirt discovers the guest address itself; a hard-coded one goes stale.
 if grep -qE '^RDP_IP=' "$WINAPPS_TEMPLATE"; then
-    printf '  %s libvirt pinned RDP_IP when it should not\n' "$(red FAIL)"; ((FAIL++))
+    printf '  %s the template pinned RDP_IP when it should not\n' "$(red FAIL)"; ((FAIL++))
 else
-    printf '  %s libvirt leaves RDP_IP for runtime discovery\n' "$(green PASS)"; ((PASS++))
+    printf '  %s the template leaves RDP_IP for runtime discovery\n' "$(green PASS)"; ((PASS++))
 fi
 
-# Read-only launcher block: appended for libvirt when winapps_launcher_readonly
-# is on, and it must be valid shell (the WinApps launcher sources this file).
+# Read-only launcher block: appended when winapps_launcher_readonly is on, and
+# it must be valid shell (the WinApps launcher sources this file).
 ( OPT_WINAPPS_LAUNCHER_RO="yes"
-  winapps_write_template "CORP" "libvirt" "askpass" "" "" "RDPWindows" ) >/dev/null 2>&1
-check_line "the RO block is appended for libvirt"      '>>> domain-join-setup: read-only libvirt access >>>' "$WINAPPS_TEMPLATE"
-check_line "it overrides the launcher group check"     'waCheckGroupMembership() { :; }'                     "$WINAPPS_TEMPLATE"
-check_line "its libvirt calls are read-only"           'virsh -r -c qemu:///system'                          "$WINAPPS_TEMPLATE"
+  winapps_write_template "CORP" "askpass" "RDPWindows" ) >/dev/null 2>&1
+check_line "the RO block is appended"              '>>> domain-join-setup: read-only libvirt access >>>' "$WINAPPS_TEMPLATE"
+check_line "it overrides the launcher group check" 'waCheckGroupMembership() { :; }'                     "$WINAPPS_TEMPLATE"
+check_line "its libvirt calls are read-only"       'virsh -r -c qemu:///system'                          "$WINAPPS_TEMPLATE"
 if bash -n "$WINAPPS_TEMPLATE" 2>/dev/null; then
     printf '  %s the template with the RO block is valid shell\n' "$(green PASS)"; ((PASS++))
 else
@@ -1145,29 +1140,18 @@ else
     printf '  %s the RO block still leaves RDP_IP dynamic\n' "$(green PASS)"; ((PASS++))
 fi
 ( OPT_WINAPPS_LAUNCHER_RO="no"
-  winapps_write_template "CORP" "libvirt" "askpass" "" "" "RDPWindows" ) >/dev/null 2>&1
+  winapps_write_template "CORP" "askpass" "RDPWindows" ) >/dev/null 2>&1
 if grep -qF 'domain-join-setup: read-only libvirt access' "$WINAPPS_TEMPLATE"; then
     printf '  %s the RO block is written even when turned off\n' "$(red FAIL)"; ((FAIL++))
 else
     printf '  %s winapps_launcher_readonly=no omits the RO block\n' "$(green PASS)"; ((PASS++))
 fi
-( OPT_WINAPPS_LAUNCHER_RO="yes"
-  winapps_write_template "CORP" "manual" "askpass" "10.0.0.9" "3390" "" ) >/dev/null 2>&1
-if grep -qF 'domain-join-setup: read-only libvirt access' "$WINAPPS_TEMPLATE"; then
-    printf '  %s a non-libvirt backend got the libvirt RO block\n' "$(red FAIL)"; ((FAIL++))
-else
-    printf '  %s the RO block is libvirt-only\n' "$(green PASS)"; ((PASS++))
-fi
-winapps_write_template "CORP.EXAMPLE.COM" "libvirt" "askpass" "" "" "RDPWindows" >/dev/null 2>&1
-
-winapps_write_template "CORP" "manual" "askpass" "10.0.0.9" "3390" "" >/dev/null 2>&1
-check_line "manual pins the host"    'RDP_IP="10.0.0.9"' "$WINAPPS_TEMPLATE"
-check_line "manual honours the port" 'RDP_PORT="3390"'   "$WINAPPS_TEMPLATE"
+winapps_write_template "CORP.EXAMPLE.COM" "askpass" "RDPWindows" >/dev/null 2>&1
 
 # Shared mode is the one path that writes a secret, so prove it lands and that
 # the token is gone - a leftover token would try to log in as '@WINAPPS_USER@'.
 OPT_WINAPPS_RDP_USER="svc-winapps"; OPT_WINAPPS_RDP_PASS="hunter2"
-winapps_write_template "CORP" "manual" "shared" "10.0.0.9" "" "" >/dev/null 2>&1
+winapps_write_template "CORP" "shared" "RDPWindows" >/dev/null 2>&1
 check_line "shared mode writes the service account" 'RDP_USER="svc-winapps"' "$WINAPPS_TEMPLATE"
 check_line "shared mode writes the password"        'RDP_PASS="hunter2"'     "$WINAPPS_TEMPLATE"
 if grep -qF '@WINAPPS_USER@' "$WINAPPS_TEMPLATE" | grep -qv '^#'; then
@@ -1179,7 +1163,7 @@ OPT_WINAPPS_RDP_USER=""; OPT_WINAPPS_RDP_PASS=""
 
 section "WinApps: the per-user generator"
 WINAPPS_SEEDER="$WA_TMP/winapps-user-config"
-winapps_write_template "CORP.EXAMPLE.COM" "libvirt" "askpass" "" "" "RDPWindows" >/dev/null 2>&1
+winapps_write_template "CORP.EXAMPLE.COM" "askpass" "RDPWindows" >/dev/null 2>&1
 winapps_write_seeder >/dev/null 2>&1
 
 if bash -n "$WINAPPS_SEEDER" 2>/dev/null; then
@@ -1218,7 +1202,7 @@ section "WinApps: the root program-scan config"
 SCAN_HOME="$WA_TMP/scanroot"; mkdir -p "$SCAN_HOME"
 WINAPPS_TEMPLATE="$WA_TMP/scan.template"
 ( OPT_WINAPPS_LAUNCHER_RO="yes"
-  winapps_write_template "CORP.EXAMPLE.COM" "libvirt" "kerberos" "" "" "IT-VM" ) >/dev/null 2>&1
+  winapps_write_template "CORP.EXAMPLE.COM" "kerberos" "IT-VM" ) >/dev/null 2>&1
 ( HOME="$SCAN_HOME"; OPT_WINAPPS_VM_ADMIN="admin"; OPT_WINAPPS_VM_PASS="p'wd"
   winapps_seed_scan_config /etc/winapps/setup.sh ) >/dev/null 2>&1
 SCAN_CONF="$SCAN_HOME/.config/winapps/winapps.conf"
@@ -1261,7 +1245,7 @@ fi
 SCAN_HOME2="$WA_TMP/scanroot2"; mkdir -p "$SCAN_HOME2"
 ( HOME="$SCAN_HOME2"; OPT_WINAPPS_VM_ADMIN=""; OPT_WINAPPS_VM_PASS=""
   winapps_seed_scan_config /etc/winapps/setup.sh ) >/dev/null 2>&1 </dev/null
-check_line "with no password it still writes a config as Docker" 'RDP_USER="Docker"' \
+check_line "with no password it still writes a config as winadmin" 'RDP_USER="winadmin"' \
       "$SCAN_HOME2/.config/winapps/winapps.conf"
 if [ -e "$SCAN_HOME2/.config/winapps/scan-askpass" ]; then
     printf '  %s it left an empty askpass helper behind\n' "$(red FAIL)"; ((FAIL++))
@@ -1290,7 +1274,7 @@ virsh() {
 }
 STUB
 run_strip() { (
-    OPT_WINAPPS_BACKEND="${1:-libvirt}"; OPT_WINAPPS_VM="IT-VM"; DRY_RUN=0
+    OPT_WINAPPS_VM="IT-VM"; DRY_RUN=0
     source "$WA_TMP/virsh_stub"
     have() { [[ "$1" == virsh ]]; }
     confirm() { return "${STRIP_CONFIRM:-0}"; }
@@ -1315,16 +1299,13 @@ check "the medium eject is live on a running guest" "yes" \
 : >"$EJECT_LOG"; STRIP_CONFIRM=1 run_strip
 check "declining leaves every drive in place"   "0" "$(grep -cE 'change-media|detach-disk' "$EJECT_LOG")"
 
-: >"$EJECT_LOG"; STRIP_CONFIRM=0 run_strip docker
-check "a non-libvirt backend is skipped"        "0" "$(grep -cE 'change-media|detach-disk' "$EJECT_LOG")"
-
 # The spare drives' media is ejected live too, so the ISO drops off the running
 # guest at once even though the drive letter lingers until a full power cycle.
 : >"$EJECT_LOG"; STRIP_CONFIRM=0 run_strip
 check "the spare drives' media is ejected live" "2" \
       "$(grep -cE 'change-media IT-VM sd[bc] --eject.*--live' "$EJECT_LOG")"
 check "the strip flags a pending power cycle"    "1" \
-      "$( OPT_WINAPPS_BACKEND=libvirt; OPT_WINAPPS_VM="IT-VM"; DRY_RUN=0
+      "$( OPT_WINAPPS_VM="IT-VM"; DRY_RUN=0
           WINAPPS_CDROMS_PENDING=0
           source "$WA_TMP/virsh_stub"; have() { [[ "$1" == virsh ]]; }
           confirm() { return 0; }; ok() { :; }; warn() { :; }; note() { :; }; info() { :; }
@@ -1795,7 +1776,7 @@ fi
 rm -rf "$AU_TMP"
 
 section "The VM's local administrator account"
-for good in Docker win-admin user_1 A; do
+for good in winadmin win-admin user_1 A; do
     winapps_vm_admin_ok "$good" \
         && { printf '  %s %s is accepted\n' "$(green PASS)" "$good"; ((PASS++)); } \
         || { printf '  %s %s was rejected\n' "$(red FAIL)" "$good"; ((FAIL++)); }

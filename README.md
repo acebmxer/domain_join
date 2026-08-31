@@ -202,10 +202,7 @@ Duo two-factor authentication:
 Windows applications (WinApps):
       --winapps           Set up WinApps for all users (same as -e winapps)
       --no-winapps        Never set up WinApps, whatever the extras say
-      --winapps-backend B libvirt | manual | docker | podman
-      --winapps-host ADDR Windows hostname or IP. Required for 'manual'
-      --winapps-port PORT RDP port (default 3389)
-      --winapps-vm NAME   libvirt VM name (default RDPWindows)
+      --winapps-vm NAME   Windows VM name (default RDPWindows)
       --winapps-libvirt-group G
                           AD group given read-write libvirt / virt-manager
                           (default: the realm's permitted-logins group)
@@ -222,7 +219,7 @@ Windows applications (WinApps):
       --winapps-user USER Windows service account, 'shared' mode only
       --winapps-remove    Remove the multi-user wiring
       --winapps-vm-remove With --winapps-remove, also delete the libvirt guest
-      --winapps-deploy    Build the Windows 11 VM (libvirt backend only)
+      --winapps-deploy    Build the Windows 11 VM
       --no-winapps-deploy Never build the VM; just install the builder script
       --winapps-iso FILE  Full path to a Windows .iso file, filename and all
                           (else fetched with Mido)
@@ -818,7 +815,7 @@ One root-owned template, expanded per user at login:
 /etc/profile.d/winapps-user-config.sh  runs the generator for shell/SSH logins
 /etc/xdg/autostart/winapps-user-config.desktop   ...and for graphical ones
 /etc/skel/.config/winapps/winapps.conf covers the very first login
-/usr/local/bin/winapps-vm-deploy       builds the Windows VM (libvirt backend)
+/usr/local/bin/winapps-vm-deploy       builds the Windows VM
 ```
 
 The generator substitutes `@WINAPPS_USER@` with the login name, stripping a
@@ -836,17 +833,22 @@ of their file and it is never regenerated.
 
 ### Where Windows runs
 
-| Choice | Description |
-| --- | --- |
-| **libvirt** *(default)* | A local Windows VM via KVM. Join the VM to the domain in its own right and each user's profile, GPOs and mapped drives come from AD as on a physical box. Best when the PC is used by one person at a time. This is the only backend the script can **build** for you — see [Building the VM](#building-the-vm). |
-| **manual** | No VM here at all — the launchers point at a Windows host you already have, typically a Remote Desktop Session Host on the domain. Much lighter, and the sane option beyond a handful of PCs. |
-| **docker** / **podman** | Windows in a container via `dockur/windows`. Quick to stand up and easy to reset; joining it to the domain is still on you. |
+A **local Windows VM under libvirt/KVM**, joined to the domain in its own right,
+so each user's profile, GPOs and mapped drives come from AD exactly as on a
+physical box. The script installs the virtualisation stack, builds the guest for
+you if you want ([Building the VM](#building-the-vm)), and wires up the per-user
+launchers.
+
+WinApps upstream also supports Docker/Podman containers (`dockur/windows`) and
+pointing at an existing remote RDP host. This installer does **not** offer those:
+the containers it would not domain-join, and a remote/RDS host is a separate
+piece of infrastructure. If you want one of those, install WinApps by hand — this
+tool is specifically "join *this* workstation and give it a local Windows VM."
 
 ### Building the VM
 
-With the **libvirt** backend the script can stand up the Windows guest itself
-(`--winapps-deploy`, or answer yes when it offers). It installs a
-`winapps-vm-deploy` helper and runs it:
+The script can stand up the Windows guest itself (`--winapps-deploy`, or answer
+yes when it offers). It installs a `winapps-vm-deploy` helper and runs it:
 
 - an **unattended** Windows 11 Pro install — no clicking through setup. The
   helper prepares a copy of the ISO under `/var/lib/libvirt/images/` with the
@@ -910,7 +912,7 @@ A domain-joined workstation needs two different things from libvirt:
 - **only some people** should be able to start, stop or reconfigure the guest
   in Virtual Machine Manager.
 
-The libvirt backend splits them:
+This installer splits them:
 
 - **Launching apps** — the shared launchers reach libvirt **read-only**. A block
   appended to the config template (which the WinApps launcher `source`s)
@@ -998,7 +1000,7 @@ into `Autounattend.xml`:
 | `edition` | `/IMAGE/NAME` | Windows 11 Pro |
 | `product_key` | `ProductKey` | the generic Pro key |
 | `computer_name` | `ComputerName` | `*` — Setup generates one |
-| `admin`, `password` | `LocalAccount`, `AutoLogon` | `Docker`, random |
+| `admin`, `password` | `LocalAccount`, `AutoLogon` | `winadmin`, random |
 | `owner` | `RegisteredOwner` | omitted |
 | `organization` | `RegisteredOrganization` | omitted |
 | `timezone` | `TimeZone` | `UTC` |
@@ -1096,12 +1098,11 @@ Windows has to exist first:
 
 1. Install Linux and **join it to the domain** — WinApps reads the joined realm
    to fill in `RDP_DOMAIN`.
-2. Run this script's WinApps step. It installs FreeRDP and the backend, writes
-   the template, generator and login hooks, and seeds existing accounts. With
-   the libvirt backend it also grants an AD group access to `qemu:///system`
-   ([above](#who-can-launch-apps-and-who-can-drive-the-vm)) and offers to **build the Windows
-   VM** ([above](#building-the-vm)); otherwise deploy Windows yourself
-   (container or RDS host).
+2. Run this script's WinApps step. It installs FreeRDP and the virtualisation
+   stack, writes the template, generator and login hooks, seeds existing
+   accounts, grants an AD group access to `qemu:///system`
+   ([above](#who-can-launch-apps-and-who-can-drive-the-vm)), and offers to
+   **build the Windows VM** ([above](#building-the-vm)).
 3. **Join Windows to the domain.** The script never does this — not even for a
    VM it built.
 4. Scan Windows for installed programs to create the launchers:

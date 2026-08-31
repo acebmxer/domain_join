@@ -16,7 +16,24 @@ changed — not that an artefact was published anywhere.
 
 ## [Unreleased]
 
+### Removed
+
+- **WinApps is libvirt-only now.** The `docker`, `podman` and `manual` backends
+  are gone, along with `--winapps-backend`, `--winapps-host` and
+  `--winapps-port`. The containers this tool would never domain-join, and a
+  remote/RDS host is separate infrastructure — neither fits "join *this*
+  workstation and give it a local Windows VM," which is all this installer does.
+  `WAFLAVOR` in the generated template is always `libvirt`; RDP port is 3389
+  (change it in the template if the guest uses another). WinApps upstream still
+  supports all of them for a hand install.
+
 ### Changed
+
+- **The built-in VM local-administrator account is `winadmin`, not `Docker`.**
+  The old default was a leftover from upstream WinApps and did not match the
+  name the example config and docs already used. Set `admin =` in
+  `windows-vm.conf` (or `--winapps-vm-user`) to override, same as before. Only
+  affects VMs built from here with no account name given.
 
 - **Every domain user can launch the Windows apps out of the box.** The libvirt
   backend now assumes what a domain workstation actually needs: Outlook, Word
