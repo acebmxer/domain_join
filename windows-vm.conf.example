@@ -2,12 +2,14 @@
 # windows-vm.conf - answers for the unattended Windows install
 #
 # Read by domain-join-setup.sh when it builds the WinApps Windows VM, and by
-# the winapps-vm-deploy helper it installs. It covers the VM build, plus one
-# WinApps wiring setting - 'libvirt_group' - that is otherwise only a prompt.
-# The domain join, Duo and everything else stay on the flags and the menu.
+# the winapps-vm-deploy helper it installs. It covers the VM build, plus the
+# WinApps access settings (who may launch the apps, who may drive the guest)
+# that are otherwise only prompts. The domain join, Duo and everything else
+# stay on the flags and the menu.
 #
-# The settings between the sizing block and 'libvirt_group' go straight into
-# Autounattend.xml, and each one names the Windows unattend setting it becomes.
+# The settings between the sizing block and the "WinApps access" section go
+# straight into Autounattend.xml, each naming the Windows unattend setting it
+# becomes.
 #
 # Uncomment what you want to set. Anything left commented out keeps the default
 # shown, or is asked for during the build.
@@ -143,18 +145,44 @@
 
 
 #=============================================================================
-# WinApps wiring (libvirt backend only)
+# WinApps access (libvirt backend only)
 #=============================================================================
+# These are not part of the VM build - they decide who, on this machine, may
+# launch the Windows apps and who may drive the guest in virt-manager. The
+# defaults are what a domain workstation wants: every domain user launches the
+# apps, only a named group manages the VM.
 
-# The Active Directory group whose members may open and control the Windows
-# guest in virt-manager. A domain account is in no local group, so it cannot
-# reach the system libvirt socket by default; naming a group here writes a
-# polkit rule granting it 'org.libvirt.*' with no password. This is the only
-# setting in this file that is not part of the VM build.
+# The Active Directory group whose members get READ-WRITE libvirt - the
+# start / stop / reconfigure that 'virt-manager' does. Members get it with no
+# password prompt. 'Domain Admins' is the usual answer. Spell it however you
+# like - short, 'Domain Admins@corp.example.com', or 'CORP\Domain Admins' - the
+# polkit rule is written to match every form (and the GID), so it works whether
+# or not SSSD uses fully-qualified names here. root is always allowed.
 #
-# Set but blank ('libvirt_group =') means "grant nobody, don't ask" - the same
-# as pressing Enter on a blank answer at the prompt. Leave the line commented
-# out entirely and the build asks, defaulting to the realm's permitted-groups.
-# Use the exact spelling 'realm list' shows (it may include an '@domain').
+# Set but blank ('libvirt_group =') means "grant nobody, don't ask". Leave the
+# line commented out and the build asks, defaulting to the realm's
+# permitted-groups. Ordinary domain users do not need this - they reach the
+# guest read-only through the shared launchers regardless (see below).
 #                                                flag: --winapps-libvirt-group
 #libvirt_group = Domain Admins
+
+# Enforce the line above. Debian and Ubuntu ship libvirt trusting the socket
+# rather than polkit, so without this the group grant is cosmetic and every
+# local user can manage the guest. 'yes' switches the read-write socket to
+# polkit so only 'libvirt_group' gets in; the read-only socket stays open.
+# Default: yes when 'libvirt_group' is set, no when it is not.
+#                                    flags: --winapps-libvirt-restrict / --no-
+#libvirt_restrict = yes
+
+# Let every domain user launch the Windows apps without being in any local
+# group, by having the shared launchers reach libvirt read-only (enough to see
+# the guest and find its address, not to control it). Turning this off restores
+# upstream WinApps' behaviour, where each user must be added to 'libvirt' and
+# 'kvm' by hand. Default: yes.
+#                              flags: --winapps-launcher-readonly / --no-
+#winapps_launcher_readonly = yes
+
+# Have libvirt start the guest when the host boots, so a user who only has
+# read-only libvirt never needs to start it. Default: yes.
+#                                    flags: --winapps-vm-autostart / --no-
+#winapps_vm_autostart = yes

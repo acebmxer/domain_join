@@ -207,8 +207,16 @@ Windows applications (WinApps):
       --winapps-port PORT RDP port (default 3389)
       --winapps-vm NAME   libvirt VM name (default RDPWindows)
       --winapps-libvirt-group G
-                          AD group allowed to open the VM in virt-manager
+                          AD group given read-write libvirt / virt-manager
                           (default: the realm's permitted-logins group)
+      --winapps-libvirt-restrict, --no-...
+                          Gate read-write qemu:///system through polkit
+                          (default: on when a group is named)
+      --winapps-launcher-readonly, --no-...
+                          Shared launchers reach libvirt read-only, so every
+                          domain user can launch apps (default: on)
+      --winapps-vm-autostart, --no-...
+                          'virsh autostart' the guest (default: on)
       --winapps-domain D  RDP_DOMAIN (default: the realm this machine joined)
       --winapps-creds M   askpass | kerberos | shared
       --winapps-user USER Windows service account, 'shared' mode only
@@ -891,33 +899,48 @@ which is what lands them in their own Windows profile. Only
 `--winapps-creds shared` connects everyone as one fixed account, and that
 account can be this one.
 
-#### Opening the VM in virt-manager
+#### Who can launch apps, and who can drive the VM
 
-`virt-manager` connects to the system libvirt (`qemu:///system`), whose socket
-is `root:libvirt` `0770` out of the box. A domain account is in no local group,
-so the first time anyone logs in from the directory and opens Virtual Machine
-Manager it fails with **`Failed to connect socket to
-'/var/run/libvirt/libvirt-sock': Permission denied`** — the refusal happens at
-the socket, before polkit is consulted, so there is not even a password prompt.
-Adding each user to `libvirt` by hand does not scale to a directory.
+A domain-joined workstation needs two different things from libvirt:
 
-The libvirt backend fixes this once, for a whole group:
+- **every domain user** must be able to launch the Windows apps (Outlook, Word,
+  …). Upstream WinApps refuses to run unless the user is in the local `libvirt`
+  and `kvm` groups, and a domain account is in neither — `usermod -aG` for each
+  one does not scale to a directory.
+- **only some people** should be able to start, stop or reconfigure the guest
+  in Virtual Machine Manager.
 
-- the RW socket is opened to every local user — `unix_sock_rw_perms = "0777"`
-  in the daemon config, and a `SocketMode=0777` drop-in on the `.socket` units
-  for socket-activated builds (Fedora, recent Debian) that ignore the config key
-- `/etc/polkit-1/rules.d/49-domain-join-libvirt.rules` then grants
-  `org.libvirt.*` to one AD group with no password prompt
+The libvirt backend splits them:
 
-So the socket is *reachable* by anyone local, but *management* still goes
-through polkit. The step asks which group — defaulting to the realm's
-`permitted-groups` (the group named in the login-access question) — or takes it
-from `--winapps-libvirt-group 'Linux Admins@corp.example.com'` or a
-`libvirt_group` line in [`windows-vm.conf`](#windows-vmconf). Leave it blank
-to skip: access then stays with the local `libvirt` group only. Group
-membership is read at login, so a user already signed in must log out and back
-in. Revoke by deleting the rule file. Needs polkit with JavaScript rules
-(0.106+), which is every currently-supported Fedora, RHEL, Ubuntu and Debian.
+- **Launching apps** — the shared launchers reach libvirt **read-only**. A block
+  appended to the config template (which the WinApps launcher `source`s)
+  overrides its libvirt helpers: the `libvirt`/`kvm` group check is dropped, and
+  the "is it up?" and address-lookup calls use `virsh -r` against the
+  read-only socket, which is open to every local user by default on every
+  supported distro. Nothing to add anyone to. `winapps_launcher_readonly = no`
+  turns this off and restores the upstream behaviour.
+- **Driving the VM** — `virt-manager` needs read-write `qemu:///system`. The
+  RW socket is opened so the request reaches polkit
+  (`unix_sock_rw_perms = "0777"`, plus a `SocketMode=0777` drop-in for
+  socket-activated builds), `/etc/polkit-1/rules.d/49-domain-join-libvirt.rules`
+  grants `org.libvirt.*` to one AD group, and — because Debian and Ubuntu ship
+  `auth_unix_rw = "none"`, which would ignore that rule and hand every local
+  user full control — `libvirt_restrict` sets `auth_unix_rw = "polkit"` so the
+  rule is actually consulted. It is skipped, with a warning, where polkit is
+  too old for JavaScript rules (pre-0.106; it would lock `qemu:///system` to
+  root). The group comes from the prompt (defaulting to the realm's
+  `permitted-groups`), `--winapps-libvirt-group 'Domain Admins'`, or a
+  `libvirt_group` line in [`windows-vm.conf`](#windows-vmconf); blank skips it
+  and RW access stays with the local `libvirt` group. You can spell it however
+  `id` shows it — the rule is written to match the short name (`Domain Admins`),
+  the fully-qualified name (`Domain Admins@corp.example.com`), the `DOMAIN\`
+  form, their lower-cased variants and the numeric GID, so it works whether or
+  not SSSD uses fully-qualified names on this machine. `root` is always allowed.
+  Group membership is read at login, so a member already signed in must log out
+  and back in.
+
+So that a read-only user is never stuck waiting for a stopped guest,
+`winapps_vm_autostart` has libvirt start it when the host boots.
 
 #### `windows-vm.conf`
 
@@ -960,12 +983,15 @@ system_locale = en-GB
 user_locale   = en-GB
 input_locale  = 0809:00000809
 
-# WinApps wiring — not a build answer
-libvirt_group = Domain Admins
+# WinApps access — not build answers
+libvirt_group             = Domain Admins
+libvirt_restrict          = yes
+winapps_launcher_readonly = yes
+winapps_vm_autostart      = yes
 ```
 
-Everything between the sizing block and `libvirt_group` goes straight into
-`Autounattend.xml`:
+Everything between the sizing block and the WinApps access section goes straight
+into `Autounattend.xml`:
 
 | Setting | Unattend setting | Default |
 |---|---|---|
@@ -981,17 +1007,23 @@ Everything between the sizing block and `libvirt_group` goes straight into
 | `user_locale` | `UserLocale` | follows `ui_language` |
 | `input_locale` | `InputLocale` | `0409:00000409` |
 
-One more setting, `libvirt_group`, is **not** a build answer — it is the AD
-group given `virt-manager` access to the finished guest
-([above](#opening-the-vm-in-virt-manager)), otherwise only a prompt or
-`--winapps-libvirt-group`. Setting it blank (`libvirt_group =`) grants nobody
-and skips the prompt; leaving the line out keeps the prompt. `winapps-vm-deploy`
-reads the same file and ignores this key.
+The last four are **not** build answers — they decide who, on this machine, may
+launch the Windows apps and who may drive the guest
+([above](#who-can-launch-apps-and-who-can-drive-the-vm)):
+
+| Setting | What it does | Default |
+|---|---|---|
+| `libvirt_group` | AD group given **read-write** libvirt (the start/stop/reconfigure `virt-manager` does). Blank grants nobody and skips the prompt; omitting the line keeps the prompt. | realm's permitted-groups |
+| `libvirt_restrict` | Switch `auth_unix_rw` to `polkit` so only `libvirt_group` gets read-write in — without it, Debian and Ubuntu trust the socket and the grant does nothing. | `yes` when a group is named |
+| `winapps_launcher_readonly` | Shared launchers reach libvirt **read-only**, so every domain user launches apps with no local group. Off restores upstream WinApps' `usermod -aG libvirt,kvm` requirement. | `yes` |
+| `winapps_vm_autostart` | `virsh autostart` the guest so the host powers it. | `yes` |
+
+`winapps-vm-deploy` reads the same file and ignores these four.
 
 That is the whole vocabulary. Anything else is an error naming the file and
-line, not a setting quietly ignored. Apart from `libvirt_group`, **this file
-covers the VM build and nothing else**; the domain join, Duo, sudo and package
-selection stay on the flags and the menu where they were.
+line, not a setting quietly ignored. Apart from the WinApps access block, **this
+file covers the VM build and nothing else**; the domain join, Duo, sudo and
+package selection stay on the flags and the menu where they were.
 
 A few of these have sharp edges worth knowing:
 
@@ -1067,7 +1099,7 @@ Windows has to exist first:
 2. Run this script's WinApps step. It installs FreeRDP and the backend, writes
    the template, generator and login hooks, and seeds existing accounts. With
    the libvirt backend it also grants an AD group access to `qemu:///system`
-   ([above](#opening-the-vm-in-virt-manager)) and offers to **build the Windows
+   ([above](#who-can-launch-apps-and-who-can-drive-the-vm)) and offers to **build the Windows
    VM** ([above](#building-the-vm)); otherwise deploy Windows yourself
    (container or RDS host).
 3. **Join Windows to the domain.** The script never does this — not even for a
@@ -1145,8 +1177,9 @@ grep -rl pam_duo.so /etc/pam.d/     # which services require Duo
 | Duo denies every login | Wrong `ikey`/`skey`/`host`, or the account isn't enrolled under the username PAM sends. `journalctl -t pam_duo` shows which. |
 | Locked out after enabling Duo | Log in on a text console as a member of the bypass group, or from the greeter if `failmode = safe` and Duo is unreachable. Then `sudo sed -i '/pam_duo.so/d' /etc/pam.d/*`. |
 | Every `sudo` waits on a phone | `sudo` was among the protected services. Remove it: `sudo sed -i '/pam_duo.so/d' /etc/pam.d/sudo /etc/pam.d/sudo-i`. |
-| virt-manager: `Failed to connect socket to '/var/run/libvirt/libvirt-sock': Permission denied` | A domain user is in no local `libvirt` group. Re-run the WinApps step with `--winapps-libvirt-group '<AD group>'`, or add the one account with `sudo usermod -aG libvirt <user>`. Either way, log out and back in — group membership is read at login. |
-| virt-manager still asks for a password every time | The polkit rule's group name doesn't match what NSS returns. `id <user>` shows the exact form (`Linux Admins@corp.example.com`); put that in `/etc/polkit-1/rules.d/49-domain-join-libvirt.rules`. |
+| A WinApps app won't launch: "user … is not part of group 'libvirt' and/or group 'kvm'" | Upstream WinApps' own check, still firing. The read-only launcher block that removes it is missing from `~/.config/winapps/winapps.conf` — check `winapps_launcher_readonly` is on and re-run the WinApps step so `/etc/winapps/winapps.conf.template` is rewritten, then log out and back in. One-off workaround: `sudo usermod -aG libvirt,kvm <user>`. |
+| virt-manager: `Failed to connect socket to '/var/run/libvirt/libvirt-sock': Permission denied` | This user has no read-write libvirt — intended for everyone outside `libvirt_group`. To grant it, re-run the WinApps step with `--winapps-libvirt-group '<AD group>'` (and log out/in), or `sudo usermod -aG libvirt <user>`. |
+| virt-manager still asks for a password every time | The polkit rule lists the group's short, `@realm`, `DOMAIN\` and GID forms, but an unusual `case_sensitive`/`re_expression` in `sssd.conf` can still produce something else. `id <member>` shows the exact string; add it to the `groups` array in `/etc/polkit-1/rules.d/49-domain-join-libvirt.rules`. |
 
 A full log of every action is written to `/var/log/domain-join-setup.log`.
 

@@ -81,7 +81,14 @@ OPT_WINAPPS_DOMAIN=""    # RDP_DOMAIN (empty = derive from the joined realm)
 OPT_WINAPPS_CREDS=""     # askpass | kerberos | shared (empty = ask)
 OPT_WINAPPS_RDP_USER=""  # shared-credential mode only: the service account
 OPT_WINAPPS_RDP_PASS="${WINAPPS_RDP_PASS:-}"  # shared-credential mode only
-OPT_WINAPPS_LIBVIRT_GROUP=""  # AD group granted qemu:///system access (libvirt backend; empty = ask/derive)
+OPT_WINAPPS_LIBVIRT_GROUP=""  # AD group granted read-write qemu:///system (virt-manager); empty = ask/derive
+OPT_WINAPPS_LIBVIRT_RESTRICT=""  # yes|no|"" (auto): gate the RW libvirt socket through polkit so only
+                                 # OPT_WINAPPS_LIBVIRT_GROUP can manage the guest. "" = yes when a group is set.
+OPT_WINAPPS_LAUNCHER_RO=""       # yes|no|"" (auto): make the shared WinApps launchers reach libvirt
+                                 # read-only, so every domain user can launch apps with no libvirt group
+                                 # membership. "" = follows OPT_WINAPPS_LIBVIRT_RESTRICT.
+OPT_WINAPPS_VM_AUTOSTART=""      # yes|no|"" (auto): 'virsh autostart' the guest so the host powers it,
+                                 # not the user. "" = follows OPT_WINAPPS_LAUNCHER_RO.
 WINAPPS_REMOVE=0         # --winapps-remove: take the multi-user wiring back out
 
 # Building the Windows guest. libvirt backend only: the script can stand up a
@@ -235,11 +242,11 @@ fetch_url() {
 # to call the guest, the local administrator account it creates, and how big to
 # make it. They can be written down once in a file instead.
 #
-# This file covers the Windows VM build, plus the one WinApps wiring setting
-# that is otherwise only a prompt - 'libvirt_group', the AD group given
-# virt-manager access to the guest. Everything else the installer does - the
-# domain join, Duo, sudo, packages - stays on the flags and the menu where it
-# was.
+# This file covers the Windows VM build, plus the WinApps access settings that
+# are otherwise only prompts - 'libvirt_group' and friends, which decide who may
+# launch the Windows apps and who may drive the guest. Everything else the
+# installer does - the domain join, Duo, sudo, packages - stays on the flags and
+# the menu where it was.
 #
 # Precedence, highest first:
 #
@@ -293,6 +300,15 @@ vm_conf_int() {
     printf -v "$1" '%s' "$2"
 }
 
+# vm_conf_yesno <outvar> <value> <key> <where> - a yes/no answer file setting.
+vm_conf_yesno() {
+    case "${2,,}" in
+        y|yes|true|on|1)   printf -v "$1" '%s' "yes" ;;
+        n|no|false|off|0)  printf -v "$1" '%s' "no" ;;
+        *) die "$4: '$3' must be yes or no (got '$2')." ;;
+    esac
+}
+
 # vm_conf_product_key <value> <key> <where> - five groups of five.
 vm_conf_product_key() {
     [[ "$1" =~ ^[A-Za-z0-9]{5}(-[A-Za-z0-9]{5}){4}$ ]] \
@@ -344,6 +360,15 @@ vm_conf_set() {
         libvirt_group) VM_CONF_HAS_LIBVIRT_GROUP=1
                        OPT_WINAPPS_LIBVIRT_GROUP="$val" ;;
 
+        # The rest of the WinApps access model. 'libvirt_restrict' makes the
+        # 'libvirt_group' grant real on distros whose libvirt trusts the socket
+        # instead of polkit (Debian, Ubuntu); 'winapps_launcher_readonly' lets
+        # every other domain user launch apps without any libvirt group; and
+        # 'winapps_vm_autostart' has the host power the guest so they need not.
+        libvirt_restrict)          vm_conf_yesno OPT_WINAPPS_LIBVIRT_RESTRICT "$val" "$key" "$where" ;;
+        winapps_launcher_readonly) vm_conf_yesno OPT_WINAPPS_LAUNCHER_RO      "$val" "$key" "$where" ;;
+        winapps_vm_autostart)      vm_conf_yesno OPT_WINAPPS_VM_AUTOSTART     "$val" "$key" "$where" ;;
+
         edition)       OPT_VM_EDITION="$val" ;;
         product_key)   vm_conf_product_key "$val" "$key" "$where" ;;
         computer_name) vm_conf_computer_name "$val" "$key" "$where" ;;
@@ -362,7 +387,9 @@ vm_conf_set() {
            note "This file takes the VM's own settings - iso, vm_name, ram, cpus, disk -"
            note "the Windows answers: edition, product_key, computer_name, admin,"
            note "password, owner, organization, timezone, ui_language, system_locale,"
-           note "user_locale, input_locale - and libvirt_group. Nothing else."
+           note "user_locale, input_locale - and the WinApps access settings:"
+           note "libvirt_group, libvirt_restrict, winapps_launcher_readonly,"
+           note "winapps_vm_autostart. Nothing else."
            note "'--write-vm-config' writes a commented copy listing all of them."
            exit 2 ;;
     esac
@@ -462,12 +489,14 @@ vm_conf_write_sample() {
 # windows-vm.conf - answers for the unattended Windows install
 #
 # Read by domain-join-setup.sh when it builds the WinApps Windows VM, and by
-# the winapps-vm-deploy helper it installs. It covers the VM build, plus one
-# WinApps wiring setting - 'libvirt_group' - that is otherwise only a prompt.
-# The domain join, Duo and everything else stay on the flags and the menu.
+# the winapps-vm-deploy helper it installs. It covers the VM build, plus the
+# WinApps access settings (who may launch the apps, who may drive the guest)
+# that are otherwise only prompts. The domain join, Duo and everything else
+# stay on the flags and the menu.
 #
-# The settings between the sizing block and 'libvirt_group' go straight into
-# Autounattend.xml, and each one names the Windows unattend setting it becomes.
+# The settings between the sizing block and the "WinApps access" section go
+# straight into Autounattend.xml, each naming the Windows unattend setting it
+# becomes.
 #
 # Uncomment what you want to set. Anything left commented out keeps the default
 # shown, or is asked for during the build.
@@ -603,21 +632,47 @@ vm_conf_write_sample() {
 
 
 #=============================================================================
-# WinApps wiring (libvirt backend only)
+# WinApps access (libvirt backend only)
 #=============================================================================
+# These are not part of the VM build - they decide who, on this machine, may
+# launch the Windows apps and who may drive the guest in virt-manager. The
+# defaults are what a domain workstation wants: every domain user launches the
+# apps, only a named group manages the VM.
 
-# The Active Directory group whose members may open and control the Windows
-# guest in virt-manager. A domain account is in no local group, so it cannot
-# reach the system libvirt socket by default; naming a group here writes a
-# polkit rule granting it 'org.libvirt.*' with no password. This is the only
-# setting in this file that is not part of the VM build.
+# The Active Directory group whose members get READ-WRITE libvirt - the
+# start / stop / reconfigure that 'virt-manager' does. Members get it with no
+# password prompt. 'Domain Admins' is the usual answer. Spell it however you
+# like - short, 'Domain Admins@corp.example.com', or 'CORP\Domain Admins' - the
+# polkit rule is written to match every form (and the GID), so it works whether
+# or not SSSD uses fully-qualified names here. root is always allowed.
 #
-# Set but blank ('libvirt_group =') means "grant nobody, don't ask" - the same
-# as pressing Enter on a blank answer at the prompt. Leave the line commented
-# out entirely and the build asks, defaulting to the realm's permitted-groups.
-# Use the exact spelling 'realm list' shows (it may include an '@domain').
+# Set but blank ('libvirt_group =') means "grant nobody, don't ask". Leave the
+# line commented out and the build asks, defaulting to the realm's
+# permitted-groups. Ordinary domain users do not need this - they reach the
+# guest read-only through the shared launchers regardless (see below).
 #                                                flag: --winapps-libvirt-group
 #libvirt_group = Domain Admins
+
+# Enforce the line above. Debian and Ubuntu ship libvirt trusting the socket
+# rather than polkit, so without this the group grant is cosmetic and every
+# local user can manage the guest. 'yes' switches the read-write socket to
+# polkit so only 'libvirt_group' gets in; the read-only socket stays open.
+# Default: yes when 'libvirt_group' is set, no when it is not.
+#                                    flags: --winapps-libvirt-restrict / --no-
+#libvirt_restrict = yes
+
+# Let every domain user launch the Windows apps without being in any local
+# group, by having the shared launchers reach libvirt read-only (enough to see
+# the guest and find its address, not to control it). Turning this off restores
+# upstream WinApps' behaviour, where each user must be added to 'libvirt' and
+# 'kvm' by hand. Default: yes.
+#                              flags: --winapps-launcher-readonly / --no-
+#winapps_launcher_readonly = yes
+
+# Have libvirt start the guest when the host boots, so a user who only has
+# read-only libvirt never needs to start it. Default: yes.
+#                                    flags: --winapps-vm-autostart / --no-
+#winapps_vm_autostart = yes
 VM_CONF_SAMPLE_EOF
 
     if [[ ! -s "$target" ]]; then
@@ -3786,6 +3841,58 @@ winapps_write_template() {
     # one here would override that with something that goes stale on reboot.
     [[ "$backend" == "libvirt" ]] && ip_line='#RDP_IP=""   # libvirt: discovered from VM_NAME at runtime'
 
+    # Read-only libvirt for ordinary domain users. This file is 'source'd by the
+    # WinApps launcher after it has defined its own functions and before it calls
+    # them, so redefining the three libvirt helpers here overrides them for the
+    # run. Members of the AD group keep read-write libvirt (a polkit rule) and
+    # virt-manager; everyone else gets exactly enough to launch an app.
+    local ro_block=""
+    if [[ "$OPT_WINAPPS_LAUNCHER_RO" == "yes" && "$backend" == "libvirt" ]]; then
+        ro_block=$(cat <<'RO_BLOCK_EOF'
+
+
+# >>> domain-join-setup: read-only libvirt access >>>
+#
+# The WinApps launcher's stock libvirt helpers open a read-write connection to
+# qemu:///system (to start/stop the guest) and refuse to run unless the user is
+# in the local 'libvirt' and 'kvm' groups. On a domain-joined machine nobody is,
+# and read-write libvirt is reserved for one AD group. These overrides drop the
+# group check and use a read-only connection ('virsh -r'); the host starts the
+# guest itself (winapps_vm_autostart), so no one else needs to. Delete this
+# block (through the closing marker) to go back to the stock behaviour.
+if [ "${WAFLAVOR:-}" = "libvirt" ]; then
+    waCheckGroupMembership() { :; }
+
+    waCheckVMRunning() {
+        local _dj_waited=0
+        virsh -r -c qemu:///system list --all --name 2>/dev/null \
+            | grep -Fxq -- "$VM_NAME" || waThrowExit "${EC_NOT_EXIST:-10}"
+        while [ "$_dj_waited" -lt "${BOOT_TIMEOUT:-120}" ]; do
+            case "$(virsh -r -c qemu:///system domstate "$VM_NAME" 2>/dev/null)" in
+                running|idle) return 0 ;;
+            esac
+            sleep 5
+            _dj_waited=$((_dj_waited + 5))
+        done
+        notify-send --expire-time=8000 --icon="dialog-error" --app-name="WinApps" \
+            "WinApps" "The Windows VM '$VM_NAME' is not running yet. It starts with this computer - wait a moment and try again, or ask an administrator." 2>/dev/null
+        waThrowExit "${EC_FAIL_START:-4}"
+    }
+
+    waFindVMIP() {
+        local _dj_mac
+        _dj_mac=$(virsh -r -c qemu:///system domiflist "$VM_NAME" 2>/dev/null \
+                  | grep -oE '([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})')
+        [ -n "$_dj_mac" ] || return 0
+        ip neigh show | grep -F -- "$_dj_mac" \
+            | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n1
+    }
+fi
+# <<< domain-join-setup: read-only libvirt access <<<
+RO_BLOCK_EOF
+)
+    fi
+
     info "Writing the configuration template"
     winapps_install_file "$WINAPPS_TEMPLATE" 0644 <<WINAPPS_TEMPLATE_EOF
 ##############################################################################
@@ -3841,6 +3948,7 @@ RDP_FLAGS="$flags"
 
 # [DEBUG LOGGING] - writes ~/.local/share/winapps/winapps.log on each launch.
 DEBUG="false"
+$ro_block
 WINAPPS_TEMPLATE_EOF
 }
 
@@ -4982,12 +5090,15 @@ winapps_seed_scan_config() {
     # prompts - but the scan runs with no terminal, so it aborts at the TLS
     # handshake before authentication (ERRCONNECT_TLS_CONNECT_FAILED). The
     # per-user template keeps '/cert:tofu'; this is the scan's copy only.
+    # The read-only libvirt overrides are for ordinary domain users; the scan
+    # runs as root and manages the guest itself, so drop that block here.
     sed -e "s|^RDP_USER=.*|RDP_USER=\"$scan_user\"|" \
         -e 's|^RDP_DOMAIN=.*|RDP_DOMAIN=""|' \
         -e 's|^RDP_PASS=.*|RDP_PASS=""|' \
         -e "s|^RDP_ASKPASS=.*|RDP_ASKPASS=\"$askpass\"|" \
         -e 's| /sec:nla||' \
         -e 's|/cert:tofu|/cert:ignore|' \
+        -e '/^# >>> domain-join-setup: read-only libvirt access >>>/,/^# <<< domain-join-setup: read-only libvirt access <<</d' \
         "$WINAPPS_TEMPLATE" >"$HOME/.config/winapps/winapps.conf"
     chmod 600 "$HOME/.config/winapps/winapps.conf"
 
@@ -5251,10 +5362,18 @@ winapps_print_summary() {
         libvirt) printf '  libvirt VM     : %s%s\n' "${OPT_WINAPPS_VM:-RDPWindows}" \
                      "$( (( WINAPPS_VM_DEPLOYED )) && printf ' (installing now)' )"
                  if [[ -n "$OPT_WINAPPS_LIBVIRT_GROUP" ]]; then
-                     printf '  virt-manager   : qemu:///system open to %s\n' "$OPT_WINAPPS_LIBVIRT_GROUP"
+                     if [[ "$OPT_WINAPPS_LIBVIRT_RESTRICT" == "yes" ]]; then
+                         printf '  virt-manager   : %s only (qemu:///system read-write via polkit)\n' "$OPT_WINAPPS_LIBVIRT_GROUP"
+                     else
+                         printf '  virt-manager   : %s (plus every local user - libvirt_restrict off)\n' "$OPT_WINAPPS_LIBVIRT_GROUP"
+                     fi
                  else
                      printf '  virt-manager   : local '\''libvirt'\'' group only\n'
-                 fi ;;
+                 fi
+                 [[ "$OPT_WINAPPS_LAUNCHER_RO" == "yes" ]] && \
+                     printf '  app launchers   : every domain user (libvirt read-only)\n'
+                 [[ "$OPT_WINAPPS_VM_AUTOSTART" == "yes" ]] && \
+                     printf '  guest autostart : on (starts with this computer)\n' ;;
     esac
     if [[ -n "$freerdp" ]]; then
         printf '  FreeRDP        : %s\n' "$freerdp"
@@ -5296,6 +5415,99 @@ winapps_default_libvirt_group() {
     realm list 2>/dev/null | awk -F': *' '/^[[:space:]]*permitted-groups:/ {print $2; exit}'
 }
 
+# winapps_group_candidates <name> - every string form an AD group might take in
+# NSS, so the polkit rule can match whichever one this machine actually uses.
+# polkit's isInGroup() is an exact, case-sensitive match, and:
+#   - SSSD with use_fully_qualified_names=False returns 'domain admins'
+#   - SSSD with it True returns             'domain admins@corp.example.com'
+#   - SSSD case_sensitive=preserving keeps  'Domain Admins'
+#   - Winbind returns                       'CORP\domain admins'
+# So a user who types 'Domain Admins' and one who types the qualified form both
+# get a rule that works. Any leading 'DOMAIN\' or trailing '@realm' the caller
+# already supplied is kept as-is and also reduced to the bare name.
+winapps_group_candidates() {
+    local g="$1" realm nb bare
+    bare="${g##*\\}"; bare="${bare%%@*}"
+    realm="$(winapps_default_domain)"; realm="${realm,,}"
+    nb="${realm%%.*}"
+    {
+        printf '%s\n' "$g" "$bare" "${bare,,}"
+        [[ -n "$realm" ]] && printf '%s\n' "$bare@$realm" "${bare,,}@$realm"
+        [[ -n "$nb" ]]    && printf '%s\n' "${nb^^}\\$bare" "${nb^^}\\${bare,,}"
+    } | awk 'NF && !seen[$0]++'
+}
+
+# winapps_access_resolve - turn the three "" (auto) access settings into a
+# definite yes/no each, once, before anything acts on them. Called only for the
+# libvirt backend.
+#
+# The default is what a domain-joined workstation actually needs: every domain
+# user can launch the Windows apps (Outlook, Word, ...) without being added to
+# any local group, and the host powers the guest so they never have to. Naming
+# an AD group in 'libvirt_group' additionally locks read-write libvirt - the
+# start/stop/reconfigure that virt-manager does - to that group.
+#
+#   winapps_launcher_readonly -> yes   (every user launches apps, libvirt RO)
+#   winapps_vm_autostart      -> yes   (host starts the guest)
+#   libvirt_restrict          -> yes when an AD group is named, else no
+winapps_access_resolve() {
+    [[ -z "$OPT_WINAPPS_LAUNCHER_RO"  ]] && OPT_WINAPPS_LAUNCHER_RO="yes"
+    [[ -z "$OPT_WINAPPS_VM_AUTOSTART" ]] && OPT_WINAPPS_VM_AUTOSTART="yes"
+    if [[ -z "$OPT_WINAPPS_LIBVIRT_RESTRICT" ]]; then
+        [[ -n "$OPT_WINAPPS_LIBVIRT_GROUP" ]] \
+            && OPT_WINAPPS_LIBVIRT_RESTRICT="yes" || OPT_WINAPPS_LIBVIRT_RESTRICT="no"
+    fi
+}
+
+# winapps_polkit_js_ok - does this machine have a polkit that reads JS rules
+# (0.106+)? If not, flipping auth_unix_rw to "polkit" would lock qemu:///system
+# to root alone, so the restrict step must be skipped with a warning.
+winapps_polkit_js_ok() {
+    [[ -d /etc/polkit-1/rules.d || -d /usr/share/polkit-1/rules.d ]]
+}
+
+# winapps_template_vm_name - the guest name the launchers use, from the option
+# or, failing that, the VM_NAME line already in the template.
+winapps_template_vm_name() {
+    if [[ -n "$OPT_WINAPPS_VM" ]]; then
+        printf '%s\n' "$OPT_WINAPPS_VM"
+    elif [[ -r "$WINAPPS_TEMPLATE" ]]; then
+        sed -n 's/^VM_NAME="\(.*\)"$/\1/p' "$WINAPPS_TEMPLATE" | head -n1
+    fi
+}
+
+# winapps_vm_autostart_apply - have libvirt start the guest at host boot, so an
+# ordinary domain user (who now reaches libvirt read-only) never needs to.
+winapps_vm_autostart_apply() {
+    [[ "$OPT_WINAPPS_VM_AUTOSTART" == "yes" ]] || return 0
+    have virsh || return 0
+    local vm
+    vm="$(winapps_template_vm_name)"
+    [[ -n "$vm" ]] || { note "No VM name known yet; skipping the autostart setting."; return 0; }
+    if [[ $DRY_RUN -eq 1 ]]; then
+        printf '%s  [dry-run]%s virsh -c qemu:///system autostart %s\n' "$C_CYAN" "$C_RESET" "$vm"
+        return 0
+    fi
+    virsh -c qemu:///system dominfo "$vm" >/dev/null 2>&1 || {
+        note "The guest '$vm' is not defined yet; it will be set to autostart once built."
+        return 0
+    }
+    run_quiet virsh -c qemu:///system autostart "$vm" \
+        && ok "'$vm' will start with this computer" \
+        || warn "Could not set '$vm' to autostart."
+}
+
+# winapps_enable_ro_sockets - the read-only libvirt socket is what the shared
+# WinApps launchers use; make sure it is running.
+winapps_enable_ro_sockets() {
+    have systemctl && [[ $DRY_RUN -eq 0 ]] || return 0
+    local ro
+    for ro in libvirtd-ro.socket virtqemud-ro.socket; do
+        unit_exists "$ro" || continue
+        run_quiet systemctl enable --now "$ro"
+    done
+}
+
 # ---------------------------------------------------------------------------
 # virt-manager / qemu:///system access for domain users
 #
@@ -5306,25 +5518,35 @@ winapps_default_libvirt_group() {
 # 'usermod -aG libvirt' does not scale to a directory.
 #
 # The fix, applied once:
-#   - open the RW socket to every local user; authorisation still runs through
-#     polkit. Both the libvirtd.conf key and a drop-in on the .socket units are
-#     written, because whichever of the two is in force depends on whether the
-#     build is socket-activated (Fedora, recent Debian) or not.
-#   - a polkit rule granting org.libvirt.* to one AD group with no password.
+#   - open the RW socket to every local user, so the request reaches polkit
+#   - a polkit rule granting org.libvirt.* to one AD group with no password
+#   - when libvirt_restrict is on, set auth_unix_rw = "polkit" so that rule is
+#     actually consulted. Debian and Ubuntu ship auth_unix_rw = "none", which
+#     trusts the socket alone - the 0777 above would then hand every local user
+#     full control and the polkit rule would do nothing. The read-only socket
+#     stays open (auth_unix_ro = "none"): that is what the shared launchers use.
 #
 # libvirt backend only - docker/podman/manual never touch the system libvirt.
+
 winapps_grant_libvirt_access() {
     local grp="$1"
     if [[ -z "$grp" ]]; then
         printf '\n'
-        note "No libvirt access group set: virt-manager will reach qemu:///system"
-        note "only for members of the local 'libvirt' group. Add a domain user with"
-        note "'sudo usermod -aG libvirt <user>', or re-run with --winapps-libvirt-group."
+        if [[ "$OPT_WINAPPS_LAUNCHER_RO" == "yes" ]]; then
+            note "No AD group named for read-write libvirt: virt-manager stays with the"
+            note "local 'libvirt' group only. The shared launchers still work for every"
+            note "domain user - they reach the guest read-only."
+            winapps_enable_ro_sockets
+        else
+            note "No libvirt access group set: virt-manager will reach qemu:///system"
+            note "only for members of the local 'libvirt' group. Add a domain user with"
+            note "'sudo usermod -aG libvirt <user>', or re-run with --winapps-libvirt-group."
+        fi
         return 0
     fi
 
     printf '\n'
-    info "Granting '$grp' access to the local Windows VM (qemu:///system)"
+    info "Granting '$grp' read-write access to the local Windows VM (qemu:///system)"
 
     # --- socket permissions: the non-socket-activated path -----------------
     local c hit=0
@@ -5357,20 +5579,89 @@ SOCK_EOF
     done
 
     # --- polkit rule -----------------------------------------------------
-    local esc="$grp"
-    esc="${esc//\\/\\\\}"
-    esc="${esc//\"/\\\"}"
+    # Match the group by every name form it might have in NSS, plus its GID if
+    # it resolves now, so the operator need not know whether this machine uses
+    # short or fully-qualified names.
+    local -a cands=()
+    mapfile -t cands < <(winapps_group_candidates "$grp")
+    local gid="" c
+    for c in "${cands[@]}"; do
+        gid="$(getent group "$c" 2>/dev/null | awk -F: 'NR==1 {print $3}')"
+        [[ -n "$gid" ]] && break
+    done
+    [[ -n "$gid" ]] && cands+=("$gid")
+
+    local js_names="" c_esc
+    for c in "${cands[@]}"; do
+        c_esc="${c//\\/\\\\}"; c_esc="${c_esc//\"/\\\"}"
+        js_names+="${js_names:+, }\"$c_esc\""
+    done
+
+    if [[ -n "$gid" ]]; then
+        ok "'$grp' resolves (gid $gid); the rule matches every name form."
+    else
+        note "'$grp' does not resolve on this machine yet - normal before SSSD is"
+        note "fully up. The rule already lists every likely name form; check it"
+        note "against 'id <a member>' if virt-manager still prompts."
+    fi
+
     winapps_install_file /etc/polkit-1/rules.d/49-domain-join-libvirt.rules 0644 <<POLKIT_EOF
 // Written by domain-join-setup.
-// Members of "$grp" manage qemu:///system with no password prompt.
-// Delete this file to revoke it. Needs polkit with JS rules (0.106+).
+// root, and members of "$grp" by any of the name forms below, manage
+// qemu:///system with no password prompt. Delete this file to revoke it.
+// Needs polkit with JS rules (0.106+).
 polkit.addRule(function(action, subject) {
-    if (action.id.indexOf("org.libvirt.") === 0 &&
-        subject.isInGroup("$esc")) {
-        return polkit.Result.YES;
+    if (action.id.indexOf("org.libvirt.") !== 0) { return; }
+    if (subject.user == "root") { return polkit.Result.YES; }
+    var groups = [$js_names];
+    for (var i = 0; i < groups.length; i++) {
+        try {
+            if (subject.isInGroup(groups[i])) { return polkit.Result.YES; }
+        } catch (e) {}
     }
+    return;
 });
 POLKIT_EOF
+
+    # polkitd reloads rules.d on its own via inotify, but nudge it so the rule
+    # is live before the libvirtd restart below re-opens the socket. Best effort:
+    # not every polkit build supports 'reload'.
+    [[ $DRY_RUN -eq 0 ]] && have systemctl && \
+        systemctl reload polkit.service >/dev/null 2>&1 || true
+
+    # --- make the rule bite: auth_unix_rw = "polkit" ---------------------
+    # Without this, Debian/Ubuntu (auth_unix_rw = "none") ignore polkit for the
+    # RW socket and the 0777 above would grant every local user full control.
+    if [[ "$OPT_WINAPPS_LIBVIRT_RESTRICT" == "yes" ]]; then
+        if ! winapps_polkit_js_ok; then
+            warn "This machine's polkit does not read JS rules, so restricting the"
+            warn "RW socket to '$grp' would lock qemu:///system to root. Skipping."
+            note "qemu:///system stays open to every local user. Install a polkit"
+            note "with rules.d support (0.106+) and re-run to enforce the group."
+        else
+            local n=0 kv k v
+            for c in /etc/libvirt/libvirtd.conf /etc/libvirt/virtqemud.conf /etc/libvirt/virtproxyd.conf; do
+                [[ -f "$c" ]] || continue
+                n=1
+                for kv in 'auth_unix_rw=polkit' 'auth_unix_ro=none' 'unix_sock_ro_perms=0777'; do
+                    k="${kv%%=*}"; v="${kv#*=}"
+                    if grep -Eq "^[[:space:]]*#?[[:space:]]*${k}[[:space:]]*=" "$c"; then
+                        run_quiet sed -ri "s|^[[:space:]]*#?[[:space:]]*${k}[[:space:]]*=.*|${k} = \"${v}\"|" "$c"
+                    elif [[ $DRY_RUN -eq 0 ]]; then
+                        printf '%s = "%s"\n' "$k" "$v" >>"$c"
+                    fi
+                done
+                ok "$c: auth_unix_rw = \"polkit\" (RW gated on '$grp'; RO stays open)"
+            done
+            (( n )) || note "No libvirt daemon config to adjust for the polkit switch."
+        fi
+    else
+        note "libvirt_restrict is off: qemu:///system stays reachable by every local"
+        note "user. The polkit rule only matters where auth_unix_rw is 'polkit'."
+    fi
+
+    # --- read-only socket stays available for the shared launchers ------
+    winapps_enable_ro_sockets
 
     # --- reload and restart so the socket is recreated with the new mode --
     if have systemctl && [[ $DRY_RUN -eq 0 ]]; then
@@ -5387,6 +5678,10 @@ POLKIT_EOF
 
     note "Group membership is read at login: a user already signed in must log"
     note "out and back in before virt-manager will connect."
+    if [[ "$OPT_WINAPPS_LAUNCHER_RO" == "yes" ]]; then
+        note "Everyone else reaches the guest read-only through the shared WinApps"
+        note "launchers - enough to launch an app, not to manage the VM."
+    fi
 }
 
 # The whole WinApps step.
@@ -5430,6 +5725,23 @@ configure_winapps() {
     fi
     [[ "$OPT_WINAPPS_BACKEND" == "libvirt" && -z "$OPT_WINAPPS_VM" ]] && \
         ask_value OPT_WINAPPS_VM "libvirt VM name" "RDPWindows"
+
+    # Who may drive virt-manager. Asked here, before the template is written, so
+    # winapps_access_resolve knows whether the read-only launcher path applies.
+    if [[ "$OPT_WINAPPS_BACKEND" == "libvirt" ]]; then
+        if [[ -z "$OPT_WINAPPS_LIBVIRT_GROUP" && $ASSUME_YES -ne 1 \
+              && $VM_CONF_HAS_LIBVIRT_GROUP -ne 1 ]]; then
+            local dflt
+            dflt="$(winapps_default_libvirt_group)"
+            printf '\n'
+            note "virt-manager talks to the system libvirt, which a domain account"
+            note "cannot reach by default. Name the AD group whose members should be"
+            note "able to open and control the Windows VM (blank to skip)."
+            note "Everyone else still launches the Windows apps - read-only."
+            ask_value OPT_WINAPPS_LIBVIRT_GROUP "AD group for libvirt/virt-manager access" "$dflt"
+        fi
+        winapps_access_resolve
+    fi
 
     if [[ "$OPT_WINAPPS_CREDS" == "shared" ]]; then
         warn "Every user will connect to Windows as the same account."
@@ -5492,17 +5804,8 @@ configure_winapps() {
 
     # --- Domain-user access to qemu:///system (libvirt backend only) ------
     if [[ "$OPT_WINAPPS_BACKEND" == "libvirt" ]]; then
-        if [[ -z "$OPT_WINAPPS_LIBVIRT_GROUP" && $ASSUME_YES -ne 1 \
-              && $VM_CONF_HAS_LIBVIRT_GROUP -ne 1 ]]; then
-            local dflt
-            dflt="$(winapps_default_libvirt_group)"
-            printf '\n'
-            note "virt-manager talks to the system libvirt, which a domain account"
-            note "cannot reach by default. Name the AD group whose members should be"
-            note "able to open and control the Windows VM (blank to skip)."
-            ask_value OPT_WINAPPS_LIBVIRT_GROUP "AD group for libvirt/virt-manager access" "$dflt"
-        fi
         winapps_grant_libvirt_access "$OPT_WINAPPS_LIBVIRT_GROUP"
+        winapps_vm_autostart_apply
     fi
 
     # --- Build the Windows guest (libvirt backend only) --------------------
@@ -5532,6 +5835,7 @@ configure_winapps() {
             fi
             winapps_write_vm_deployer || return 1
             winapps_deploy_vm || true
+            winapps_vm_autostart_apply   # the guest exists now; the deployer also sets this
         else
             winapps_write_vm_deployer || true
             note "Skipping the VM build. When you want it:  sudo $WINAPPS_VM_DEPLOYER"
@@ -7118,10 +7422,23 @@ ${C_BOLD}WINDOWS APPLICATIONS (WINAPPS)${C_RESET}
       --winapps-port PORT RDP port (default 3389).
       --winapps-vm NAME   libvirt VM name (default RDPWindows).
       --winapps-libvirt-group G
-                          AD group whose members may open the local Windows VM
-                          in virt-manager (qemu:///system). Defaults to the
-                          realm's permitted-logins group; blank skips it. Also
-                          settable as 'libvirt_group' in windows-vm.conf.
+                          AD group whose members get read-write libvirt - the
+                          start/stop/reconfigure virt-manager does. Defaults to
+                          the realm's permitted-logins group; blank skips it.
+                          Also 'libvirt_group' in windows-vm.conf.
+      --winapps-libvirt-restrict, --no-winapps-libvirt-restrict
+                          Whether to gate read-write qemu:///system through
+                          polkit so only the group above gets in (Debian/Ubuntu
+                          otherwise trust the socket and the grant is cosmetic).
+                          Default: on when a group is named. 'libvirt_restrict'.
+      --winapps-launcher-readonly, --no-winapps-launcher-readonly
+                          Whether the shared launchers reach libvirt read-only,
+                          so every domain user launches the Windows apps with no
+                          local group membership. Default: on.
+                          'winapps_launcher_readonly'.
+      --winapps-vm-autostart, --no-winapps-vm-autostart
+                          Whether to 'virsh autostart' the guest so the host
+                          powers it. Default: on. 'winapps_vm_autostart'.
       --winapps-domain D  RDP_DOMAIN (default: the realm this machine joined).
       --winapps-creds M   askpass  - prompt each user for their own AD password
                           kerberos - single sign-on from the user's ticket
@@ -7239,6 +7556,12 @@ parse_args() {
             --winapps-port)     OPT_WINAPPS_PORT="${2:-}"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift 2 ;;
             --winapps-vm)       OPT_WINAPPS_VM="${2:-}"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift 2 ;;
             --winapps-libvirt-group) OPT_WINAPPS_LIBVIRT_GROUP="${2:-}"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift 2 ;;
+            --winapps-libvirt-restrict)    OPT_WINAPPS_LIBVIRT_RESTRICT="yes"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift ;;
+            --no-winapps-libvirt-restrict) OPT_WINAPPS_LIBVIRT_RESTRICT="no";  CLI_DIRECTED=1; shift ;;
+            --winapps-launcher-readonly)    OPT_WINAPPS_LAUNCHER_RO="yes"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift ;;
+            --no-winapps-launcher-readonly) OPT_WINAPPS_LAUNCHER_RO="no";  CLI_DIRECTED=1; shift ;;
+            --winapps-vm-autostart)    OPT_WINAPPS_VM_AUTOSTART="yes"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift ;;
+            --no-winapps-vm-autostart) OPT_WINAPPS_VM_AUTOSTART="no";  CLI_DIRECTED=1; shift ;;
             --winapps-domain)   OPT_WINAPPS_DOMAIN="${2:-}"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift 2 ;;
             --winapps-creds)    OPT_WINAPPS_CREDS="${2:-}"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift 2 ;;
             --winapps-user)     OPT_WINAPPS_RDP_USER="${2:-}"; OPT_WINAPPS=1; CLI_DIRECTED=1; shift 2 ;;

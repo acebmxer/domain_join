@@ -16,6 +16,44 @@ changed — not that an artefact was published anywhere.
 
 ## [Unreleased]
 
+### Changed
+
+- **Every domain user can launch the Windows apps out of the box.** The libvirt
+  backend now assumes what a domain workstation actually needs: Outlook, Word
+  and the rest are for everyone who logs in, and read-write libvirt — the
+  start/stop/reconfigure that `virt-manager` does — is the restricted thing.
+
+  Three settings, all in `windows-vm.conf` (and as flags), each on by default:
+
+  - **`winapps_launcher_readonly`** — the shared launchers now reach libvirt
+    **read-only**. A block appended to the WinApps config template (which the
+    launcher `source`s) overrides its three libvirt helpers: the
+    `libvirt`/`kvm` group check is dropped, and status and IP-discovery calls
+    use `virsh -r` against the always-open read-only socket. No domain user
+    needs `usermod -aG libvirt,kvm` any more. Turn it off to get upstream
+    WinApps' behaviour back.
+  - **`libvirt_restrict`** — on Debian and Ubuntu, libvirt trusts the socket
+    rather than polkit (`auth_unix_rw = "none"`), so the `libvirt_group` polkit
+    rule was never consulted and *every* local user could drive the guest. When
+    a group is named this now sets `auth_unix_rw = "polkit"` so the rule bites;
+    the read-only socket stays open. Skipped, with a warning, on a polkit too
+    old for JS rules (it would lock `qemu:///system` to root).
+  - **`winapps_vm_autostart`** — `virsh autostart` the guest, so a user who
+    only has read-only libvirt never needs to start it.
+
+  New flags: `--winapps-libvirt-restrict` / `--no-`,
+  `--winapps-launcher-readonly` / `--no-`, `--winapps-vm-autostart` / `--no-`.
+  `--winapps-libvirt-group` and `libvirt_group` are unchanged in spelling but
+  now grant read-write access specifically.
+
+- **The `libvirt_group` polkit rule matches every name form.** It used to be a
+  single exact `isInGroup("Domain Admins")`, which failed where NSS returns
+  `domain admins@corp.example.com` (SSSD fully-qualified names), `domain admins`
+  (lower-cased), or `CORP\domain admins` (Winbind). The rule now tries all of
+  them plus the group's numeric GID, so the operator does not need to know which
+  form this machine uses. `root` is always allowed. The setup step reports
+  whether the group resolves and at which GID.
+
 ## [1.5.0] — 2026-08-30
 
 A dedicated menu entry for re-scanning the Windows guest for installed apps,

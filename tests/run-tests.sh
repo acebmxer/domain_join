@@ -1127,6 +1127,39 @@ else
     printf '  %s libvirt leaves RDP_IP for runtime discovery\n' "$(green PASS)"; ((PASS++))
 fi
 
+# Read-only launcher block: appended for libvirt when winapps_launcher_readonly
+# is on, and it must be valid shell (the WinApps launcher sources this file).
+( OPT_WINAPPS_LAUNCHER_RO="yes"
+  winapps_write_template "CORP" "libvirt" "askpass" "" "" "RDPWindows" ) >/dev/null 2>&1
+check_line "the RO block is appended for libvirt"      '>>> domain-join-setup: read-only libvirt access >>>' "$WINAPPS_TEMPLATE"
+check_line "it overrides the launcher group check"     'waCheckGroupMembership() { :; }'                     "$WINAPPS_TEMPLATE"
+check_line "its libvirt calls are read-only"           'virsh -r -c qemu:///system'                          "$WINAPPS_TEMPLATE"
+if bash -n "$WINAPPS_TEMPLATE" 2>/dev/null; then
+    printf '  %s the template with the RO block is valid shell\n' "$(green PASS)"; ((PASS++))
+else
+    printf '  %s the RO block breaks the template syntax\n' "$(red FAIL)"; ((FAIL++))
+fi
+if grep -qE '^RDP_IP=' "$WINAPPS_TEMPLATE"; then
+    printf '  %s the RO block pinned RDP_IP\n' "$(red FAIL)"; ((FAIL++))
+else
+    printf '  %s the RO block still leaves RDP_IP dynamic\n' "$(green PASS)"; ((PASS++))
+fi
+( OPT_WINAPPS_LAUNCHER_RO="no"
+  winapps_write_template "CORP" "libvirt" "askpass" "" "" "RDPWindows" ) >/dev/null 2>&1
+if grep -qF 'domain-join-setup: read-only libvirt access' "$WINAPPS_TEMPLATE"; then
+    printf '  %s the RO block is written even when turned off\n' "$(red FAIL)"; ((FAIL++))
+else
+    printf '  %s winapps_launcher_readonly=no omits the RO block\n' "$(green PASS)"; ((PASS++))
+fi
+( OPT_WINAPPS_LAUNCHER_RO="yes"
+  winapps_write_template "CORP" "manual" "askpass" "10.0.0.9" "3390" "" ) >/dev/null 2>&1
+if grep -qF 'domain-join-setup: read-only libvirt access' "$WINAPPS_TEMPLATE"; then
+    printf '  %s a non-libvirt backend got the libvirt RO block\n' "$(red FAIL)"; ((FAIL++))
+else
+    printf '  %s the RO block is libvirt-only\n' "$(green PASS)"; ((PASS++))
+fi
+winapps_write_template "CORP.EXAMPLE.COM" "libvirt" "askpass" "" "" "RDPWindows" >/dev/null 2>&1
+
 winapps_write_template "CORP" "manual" "askpass" "10.0.0.9" "3390" "" >/dev/null 2>&1
 check_line "manual pins the host"    'RDP_IP="10.0.0.9"' "$WINAPPS_TEMPLATE"
 check_line "manual honours the port" 'RDP_PORT="3390"'   "$WINAPPS_TEMPLATE"
@@ -1184,12 +1217,23 @@ section "WinApps: the root program-scan config"
 # that account is all a fresh (or later domain-joined) guest has.
 SCAN_HOME="$WA_TMP/scanroot"; mkdir -p "$SCAN_HOME"
 WINAPPS_TEMPLATE="$WA_TMP/scan.template"
-winapps_write_template "CORP.EXAMPLE.COM" "libvirt" "kerberos" "" "" "IT-VM" >/dev/null 2>&1
+( OPT_WINAPPS_LAUNCHER_RO="yes"
+  winapps_write_template "CORP.EXAMPLE.COM" "libvirt" "kerberos" "" "" "IT-VM" ) >/dev/null 2>&1
 ( HOME="$SCAN_HOME"; OPT_WINAPPS_VM_ADMIN="admin"; OPT_WINAPPS_VM_PASS="p'wd"
   winapps_seed_scan_config /etc/winapps/setup.sh ) >/dev/null 2>&1
 SCAN_CONF="$SCAN_HOME/.config/winapps/winapps.conf"
 SCAN_PASS="$SCAN_HOME/.config/winapps/scan-askpass"
 check_line "it connects as the local admin from the config" 'RDP_USER="admin"' "$SCAN_CONF"
+if grep -qF 'domain-join-setup: read-only libvirt access' "$SCAN_CONF"; then
+    printf '  %s the scan config kept the read-only launcher block\n' "$(red FAIL)"; ((FAIL++))
+else
+    printf '  %s the scan config drops the read-only launcher block (runs as root)\n' "$(green PASS)"; ((PASS++))
+fi
+if bash -n "$SCAN_CONF" 2>/dev/null; then
+    printf '  %s the scan config is valid shell\n' "$(green PASS)"; ((PASS++))
+else
+    printf '  %s the scan config has a syntax error\n' "$(red FAIL)"; ((FAIL++))
+fi
 check_line "it blanks the RDP domain"                       'RDP_DOMAIN=""'    "$SCAN_CONF"
 check_line "it keeps the libvirt VM name for IP discovery"  'VM_NAME="IT-VM"'  "$SCAN_CONF"
 check_line "it points RDP_ASKPASS at the scan helper"       'scan-askpass'     "$SCAN_CONF"
@@ -1396,6 +1440,8 @@ vmc_read() {
       OPT_WINAPPS_VM_PASS=""; OPT_WINAPPS_VM_RAM=""; OPT_WINAPPS_VM_CPUS=""
       OPT_WINAPPS_VM_DISK=""
       OPT_WINAPPS_LIBVIRT_GROUP=""; VM_CONF_HAS_LIBVIRT_GROUP=0
+      OPT_WINAPPS_LIBVIRT_RESTRICT=""; OPT_WINAPPS_LAUNCHER_RO=""
+      OPT_WINAPPS_VM_AUTOSTART=""
       vm_conf_load >/dev/null 2>&1 || exit 1
       local out="" v
       for v in "$@"; do out+="${!v}|"; done
@@ -1428,6 +1474,49 @@ check "libvirt-group with a hyphen is the same key" "Domain Admins" \
 # key must still be recorded as seen so configure_winapps skips the prompt.
 check "a blank libvirt_group is still recorded" "|1" \
       "$(vmc_read 'libvirt_group =' OPT_WINAPPS_LIBVIRT_GROUP VM_CONF_HAS_LIBVIRT_GROUP)"
+
+# The WinApps access yes/no settings.
+check "libvirt_restrict is read as yes" "yes" \
+      "$(vmc_read 'libvirt_restrict = yes' OPT_WINAPPS_LIBVIRT_RESTRICT)"
+check "winapps_launcher_readonly accepts 'no'" "no" \
+      "$(vmc_read 'winapps_launcher_readonly = no' OPT_WINAPPS_LAUNCHER_RO)"
+check "winapps_vm_autostart normalises 'true'" "yes" \
+      "$(vmc_read 'winapps_vm_autostart = true' OPT_WINAPPS_VM_AUTOSTART)"
+check "a hyphen in the access key is the same setting" "no" \
+      "$(vmc_read 'winapps-launcher-readonly = off' OPT_WINAPPS_LAUNCHER_RO)"
+vmc_rejects "a non-boolean libvirt_restrict" 'libvirt_restrict = maybe'
+
+# winapps_access_resolve fills the blanks: apps for everyone, host powers the
+# guest, and RW libvirt locked down only when a group is named.
+check "resolve defaults: no group" "yes|yes|no" \
+      "$( OPT_WINAPPS_LIBVIRT_GROUP=""; OPT_WINAPPS_LIBVIRT_RESTRICT=""
+          OPT_WINAPPS_LAUNCHER_RO=""; OPT_WINAPPS_VM_AUTOSTART=""
+          winapps_access_resolve
+          printf '%s|%s|%s' "$OPT_WINAPPS_LAUNCHER_RO" "$OPT_WINAPPS_VM_AUTOSTART" "$OPT_WINAPPS_LIBVIRT_RESTRICT" )"
+check "resolve defaults: group named" "yes|yes|yes" \
+      "$( OPT_WINAPPS_LIBVIRT_GROUP="Domain Admins"; OPT_WINAPPS_LIBVIRT_RESTRICT=""
+          OPT_WINAPPS_LAUNCHER_RO=""; OPT_WINAPPS_VM_AUTOSTART=""
+          winapps_access_resolve
+          printf '%s|%s|%s' "$OPT_WINAPPS_LAUNCHER_RO" "$OPT_WINAPPS_VM_AUTOSTART" "$OPT_WINAPPS_LIBVIRT_RESTRICT" )"
+check "resolve leaves an explicit 'no' alone" "no" \
+      "$( OPT_WINAPPS_LIBVIRT_GROUP="Domain Admins"
+          OPT_WINAPPS_LAUNCHER_RO="no"; OPT_WINAPPS_VM_AUTOSTART=""; OPT_WINAPPS_LIBVIRT_RESTRICT=""
+          winapps_access_resolve
+          printf '%s' "$OPT_WINAPPS_LAUNCHER_RO" )"
+
+# The polkit rule has to match the group whichever way NSS spells it, so the
+# candidate list must cover short, fully-qualified, Winbind and case forms.
+GC="$( winapps_default_domain() { printf 'CORP.EXAMPLE.COM'; }
+       winapps_group_candidates 'Domain Admins' | tr '\n' '|' )"
+check "candidates include the name as given"      "yes" "$(case "$GC" in *'Domain Admins|'*) echo yes;; *) echo no;; esac)"
+check "candidates include the lower-cased name"   "yes" "$(case "$GC" in *'domain admins|'*) echo yes;; *) echo no;; esac)"
+check "candidates include the realm-qualified form" "yes" \
+      "$(case "$GC" in *'domain admins@corp.example.com|'*) echo yes;; *) echo no;; esac)"
+check "candidates include the Winbind form"       "yes" "$(case "$GC" in *'CORP\Domain Admins|'*) echo yes;; *) echo no;; esac)"
+check "a qualified name given is reduced to bare too" "yes" \
+      "$( winapps_default_domain() { printf 'CORP.EXAMPLE.COM'; }
+          winapps_group_candidates 'Domain Admins@corp.example.com' \
+            | grep -Fxq 'Domain Admins' && echo yes || echo no )"
 
 # Bad input must stop the run, naming the file and line.
 vmc_rejects() {
@@ -1730,6 +1819,18 @@ check "--winapps-libvirt-group is stored" "Linux Admins@corp.example.com" \
       "$( OPT_WINAPPS_LIBVIRT_GROUP=""
           parse_args --winapps-libvirt-group "Linux Admins@corp.example.com" >/dev/null 2>&1
           printf '%s' "$OPT_WINAPPS_LIBVIRT_GROUP" )"
+check "--no-winapps-launcher-readonly is stored" "no" \
+      "$( OPT_WINAPPS_LAUNCHER_RO=""
+          parse_args --no-winapps-launcher-readonly >/dev/null 2>&1
+          printf '%s' "$OPT_WINAPPS_LAUNCHER_RO" )"
+check "--winapps-libvirt-restrict is stored" "yes" \
+      "$( OPT_WINAPPS_LIBVIRT_RESTRICT=""
+          parse_args --winapps-libvirt-restrict >/dev/null 2>&1
+          printf '%s' "$OPT_WINAPPS_LIBVIRT_RESTRICT" )"
+check "--no-winapps-vm-autostart is stored" "no" \
+      "$( OPT_WINAPPS_VM_AUTOSTART=""
+          parse_args --no-winapps-vm-autostart >/dev/null 2>&1
+          printf '%s' "$OPT_WINAPPS_VM_AUTOSTART" )"
 # A name the config file supplies has to be checked too, not just a flag.
 if ( printf 'admin = Bad Name\n' > "$VMC_TMP/t.conf"
      VM_CONF_FILE="$VMC_TMP/t.conf"; vm_conf_load >/dev/null 2>&1
