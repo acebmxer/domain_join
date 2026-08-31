@@ -1253,42 +1253,39 @@ else
     printf '  %s it writes no askpass helper without a password\n' "$(green PASS)"; ((PASS++))
 fi
 
-# Joined guest, someone at a terminal: seed a domain login for the sudo invoker,
-# still keeping the password out of the config and in the askpass helper.
+# At a terminal, accepting the prompts: the local admin, signed in locally.
+# 'admin' from windows-vm.conf is the account default.
 SCAN_HOME4="$WA_TMP/scanroot4"; mkdir -p "$SCAN_HOME4"
-( HOME="$SCAN_HOME4"; OPT_WINAPPS_VM_ADMIN="winadmin"; OPT_WINAPPS_VM_PASS=""
-  SUDO_USER="alice"
+( HOME="$SCAN_HOME4"; OPT_WINAPPS_VM_ADMIN="Localuser"; OPT_WINAPPS_VM_PASS=""
   stdin_is_tty() { return 0; }
-  have() { [[ "$1" == realm ]]; }
-  realm() { [[ "$1 $2" == "list --name-only" ]] && echo CORP.EXAMPLE.COM; }
   winapps_default_domain() { echo CORP.EXAMPLE.COM; }
   ask_value() { printf -v "$1" '%s' "$3"; }          # accept every default
   ask_secret() { printf -v "$1" '%s' "s3cret"; }
-  winapps_seed_scan_config /etc/winapps/setup.sh 1 ) >/dev/null 2>&1 </dev/null
+  winapps_seed_scan_config /etc/winapps/setup.sh ) >/dev/null 2>&1 </dev/null
 SCAN_CONF4="$SCAN_HOME4/.config/winapps/winapps.conf"
-check_line "a joined guest defaults the scan to the sudo user"  'RDP_USER="alice"'              "$SCAN_CONF4"
-check_line "and to the joined realm as the RDP domain"          'RDP_DOMAIN="CORP.EXAMPLE.COM"' "$SCAN_CONF4"
-if grep -qE '^RDP_PASS=""' "$SCAN_CONF4" && [ "$("$SCAN_HOME4/.config/winapps/scan-askpass")" = "s3cret" ]; then
-    printf '  %s the domain password goes only into the askpass helper\n' "$(green PASS)"; ((PASS++))
-else
-    printf '  %s the domain password was mishandled\n' "$(red FAIL)"; ((FAIL++))
-fi
+check_line "the account defaults to 'admin' from windows-vm.conf" 'RDP_USER="Localuser"' "$SCAN_CONF4"
+check_line "accepting that default keeps the domain blank (local)" 'RDP_DOMAIN=""'       "$SCAN_CONF4"
 
-# The *first* scan (rescan flag unset) stays on the local admin even on a joined
-# host - the guest may not be joined yet.
+# Typing a name other than the local admin makes it an AD account, and the
+# domain prompt defaults to the joined realm.
 SCAN_HOME5="$WA_TMP/scanroot5"; mkdir -p "$SCAN_HOME5"
-( HOME="$SCAN_HOME5"; OPT_WINAPPS_VM_ADMIN="winadmin"; OPT_WINAPPS_VM_PASS=""
-  SUDO_USER="alice"
+( HOME="$SCAN_HOME5"; OPT_WINAPPS_VM_ADMIN="Localuser"; OPT_WINAPPS_VM_PASS=""
   stdin_is_tty() { return 0; }
-  have() { [[ "$1" == realm ]]; }
-  realm() { [[ "$1 $2" == "list --name-only" ]] && echo CORP.EXAMPLE.COM; }
   winapps_default_domain() { echo CORP.EXAMPLE.COM; }
-  ask_value() { printf -v "$1" '%s' "$3"; }
+  ask_value() { case "$2" in
+                  *"account for the program scan"*) printf -v "$1" '%s' "jsmith" ;;
+                  *) printf -v "$1" '%s' "$3" ;;
+                esac; }
   ask_secret() { printf -v "$1" '%s' "s3cret"; }
-  winapps_seed_scan_config /etc/winapps/setup.sh 0 ) >/dev/null 2>&1 </dev/null
+  winapps_seed_scan_config /etc/winapps/setup.sh ) >/dev/null 2>&1 </dev/null
 SCAN_CONF5="$SCAN_HOME5/.config/winapps/winapps.conf"
-check_line "the first scan stays on the local admin"  'RDP_USER="winadmin"' "$SCAN_CONF5"
-check_line "the first scan leaves the RDP domain blank" 'RDP_DOMAIN=""'     "$SCAN_CONF5"
+check_line "a non-local name is treated as an AD account"      'RDP_USER="jsmith"'            "$SCAN_CONF5"
+check_line "the AD domain defaults to the joined realm"        'RDP_DOMAIN="CORP.EXAMPLE.COM"' "$SCAN_CONF5"
+if grep -qE '^RDP_PASS=""' "$SCAN_CONF5" && [ "$("$SCAN_HOME5/.config/winapps/scan-askpass")" = "s3cret" ]; then
+    printf '  %s the password stays out of the config either way\n' "$(green PASS)"; ((PASS++))
+else
+    printf '  %s the password was mishandled\n' "$(red FAIL)"; ((FAIL++))
+fi
 
 section "WinApps: stripping the install CD drives"
 # After the operator says Windows is up, the three install CDs have done their

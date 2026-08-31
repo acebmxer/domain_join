@@ -656,11 +656,11 @@ vm_conf_write_sample() {
 # guest read-only through the shared launchers regardless (see below).
 #
 # One thing AD does not do for you: the WinApps program scan (setup.sh, run as
-# root) can sign into the guest as a domain account rather than its local
+# root) can sign into the guest as an AD account instead of its local
 # administrator, but only if that account has local Administrator rights ON THE
 # GUEST. Putting this group into the guest's local Administrators - e.g. with a
-# GPO - is what grants that. Without it, answer the scan's domain prompt blank
-# and use the guest's local admin account.
+# GPO - is what grants that. Otherwise the scan uses the guest's local admin
+# (the 'admin' account above), which is also its default.
 #                                                flag: --winapps-libvirt-group
 #libvirt_group = Domain Admins
 
@@ -5044,46 +5044,47 @@ winapps_deploy_vm() {
 # 'setup.sh' reads its RDP settings from $HOME/.config/winapps, and $HOME here
 # is root's. Seed it for the program scan.
 #
-# The first scan defaults to the guest's *local* administrator - the 'admin' /
-# 'password' from windows-vm.conf - because it can run before the guest is
-# domain-joined, when no domain login would work. A re-scan defaults instead to
-# the sudo invoker's domain account in the joined realm, which is usually
-# handier. Either way the account must have local Administrator rights on the
-# guest: a domain account gets them only if an AD group it belongs to is in the
-# guest's local Administrators (e.g. via a GPO - the group named in
-# 'libvirt_group' is the obvious one). The prompt always allows overriding both.
+# The account defaults to the guest's *local* administrator - 'admin' from
+# windows-vm.conf, or the build default 'winadmin' if that file was not read.
+# Entering exactly that name signs in locally, with no domain. Entering any
+# other name is taken as an Active Directory account, and the next prompt asks
+# for its domain (defaulting to the realm this host is joined to). An AD account
+# must have local Administrator rights on the guest - AD does not grant those by
+# itself; the usual way is an AD group placed in the guest's local
+# Administrators (the one named in 'libvirt_group' is the obvious candidate).
 #
 # The password goes into a root-only askpass helper, never RDP_PASS, so it is
 # not a '/p:' argument visible in 'ps' or the WinApps log. With no password
 # available (a build-generated random one) it asks, or warns and moves on.
 winapps_seed_scan_config() {
     local installer="${1:-$WINAPPS_ETC_DIR/setup.sh}"
-    local rescan="${2:-0}"
     [[ -n "${HOME:-}" && -r "$WINAPPS_TEMPLATE" ]] || return 0
 
-    local scan_user="${OPT_WINAPPS_VM_ADMIN:-winadmin}"
+    local local_admin="${OPT_WINAPPS_VM_ADMIN:-winadmin}"
+    local scan_user="$local_admin"
     local scan_domain="" scan_pass="$OPT_WINAPPS_VM_PASS"
+
     if [[ -z "$scan_pass" ]] && stdin_is_tty; then
-        # A re-scan means WinApps is already installed, so the first scan
-        # succeeded and the guest is reachable - and by now usually domain-
-        # joined. Default to a domain login by whoever ran sudo. The first scan
-        # keeps the local-admin default: it may run before either side is
-        # joined, when no domain login works.
-        if [[ "$rescan" == 1 ]] \
-           && have realm && realm list --name-only 2>/dev/null | grep -q . \
-           && [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
-            scan_user="$SUDO_USER"
-            scan_domain="$(winapps_default_domain)"
-        fi
         printf '\n'
-        note "The program scan signs into Windows to list what is installed. Use"
-        note "the guest's local administrator (domain left blank), or a domain"
-        note "account with local Administrator rights on the guest - AD grants"
-        note "those only if a group the account is in (e.g. 'libvirt_group') is"
-        note "in the guest's local Administrators, typically via a GPO."
-        ask_value  scan_user   "Windows account for the program scan" "$scan_user"
-        ask_value  scan_domain "Its AD domain (blank for a local account)" "$scan_domain"
-        ask_secret scan_pass   "Password for ${scan_domain:+${scan_domain}\\}${scan_user}"
+        note "The program scan signs into Windows to list what is installed."
+        note "Enter the guest's local administrator to sign in locally, or an"
+        note "Active Directory account - which needs local Administrator rights"
+        note "on the guest (usually via an AD group in its local Administrators)."
+        if [[ -z "$OPT_WINAPPS_VM_ADMIN" ]]; then
+            note "No windows-vm.conf was read, so the local admin is assumed to"
+            note "be '$local_admin'; set 'admin =' there if it is named otherwise."
+        elif [[ -n "$OPT_WINAPPS_LIBVIRT_GROUP" ]]; then
+            note "windows-vm.conf names AD group '$OPT_WINAPPS_LIBVIRT_GROUP' -"
+            note "its members can be used here given that guest right."
+        fi
+
+        ask_value scan_user "Windows account for the program scan" "$local_admin"
+
+        if [[ "$scan_user" != "$local_admin" ]]; then
+            ask_value scan_domain "Active Directory domain for '$scan_user'" \
+                      "$(winapps_default_domain)"
+        fi
+        ask_secret scan_pass "Password for ${scan_domain:+${scan_domain}\\}${scan_user}"
     fi
 
     mkdir -p "$HOME/.config/winapps"
@@ -5271,11 +5272,10 @@ winapps_offer_cdrom_powercycle() {
 winapps_install_upstream() {
     local installer="$WINAPPS_ETC_DIR/setup.sh" rc=0
     local -a mode=(--system)
-    local label="system-wide" rescan=0
+    local label="system-wide"
     if [[ -e "$WINAPPS_SYS_LAUNCHER" ]]; then
         mode=(--system --add-apps)
         label="refresh installed apps"
-        rescan=1
     fi
 
     if ! confirm "Is the Windows side already installed, domain-joined and reachable over RDP?" "n"; then
@@ -5318,7 +5318,7 @@ winapps_install_upstream() {
             "$installer"
     fi
 
-    winapps_seed_scan_config "$installer" "$rescan"
+    winapps_seed_scan_config "$installer"
 
     info "Running the WinApps installer ($label)"
     run "$installer" "${mode[@]}" || rc=$?

@@ -166,11 +166,11 @@
 # guest read-only through the shared launchers regardless (see below).
 #
 # One thing AD does not do for you: the WinApps program scan (setup.sh, run as
-# root) can sign into the guest as a domain account rather than its local
+# root) can sign into the guest as an AD account instead of its local
 # administrator, but only if that account has local Administrator rights ON THE
 # GUEST. Putting this group into the guest's local Administrators - e.g. with a
-# GPO - is what grants that. Without it, answer the scan's domain prompt blank
-# and use the guest's local admin account.
+# GPO - is what grants that. Otherwise the scan uses the guest's local admin
+# (the 'admin' account above), which is also its default.
 #                                                flag: --winapps-libvirt-group
 #libvirt_group = Domain Admins
 

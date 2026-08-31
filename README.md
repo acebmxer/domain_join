@@ -1112,16 +1112,15 @@ Windows has to exist first:
    installed apps** menu entry, which picks the right one). Plain `--system`
    aborts once WinApps is installed.
 
-   The scan runs as root and, by default, signs into Windows as the guest's
-   **local** administrator (the `admin` / `password` in `windows-vm.conf`) —
-   that account works whether or not Windows is domain-joined, and if the build
-   generated a random password it asks for one. Once the guest is joined it
-   offers a **domain** account instead (defaulting to the realm and the person
-   running `sudo`), which is usually handier for re-scans. Either account must
-   have local Administrator rights on the guest; AD does not grant a domain
-   account those on its own — put an AD group (for example the one in
-   `libvirt_group`) into the guest's local Administrators, e.g. with a GPO, or
-   answer the domain prompt blank and use the local admin. It connects with
+   The scan runs as root. The account prompt defaults to the guest's **local**
+   administrator (`admin` in `windows-vm.conf`, or `winadmin` if that file was
+   not read); accepting that default signs in locally, and if the build
+   generated a random password it asks for one. Typing **any other name** makes
+   it an **Active Directory** account, and the next prompt asks for its domain,
+   defaulting to the realm this host is joined to. An AD account must have local
+   Administrator rights on the guest — AD does not grant those on its own; put
+   an AD group (for example the one in `libvirt_group`) into the guest's local
+   Administrators, e.g. with a GPO. It connects with
    `/cert:ignore` — the guest's self-signed RDP certificate is regenerated when
    it joins the domain, and `/cert:tofu` would refuse the changed key at a
    prompt the scan cannot answer. The domain users who log in later authenticate
