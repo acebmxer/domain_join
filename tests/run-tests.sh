@@ -1196,9 +1196,9 @@ check "a copy without the marker is left alone" 'RDP_USER="hand-edited"' \
       "$(grep '^RDP_USER=' "$OWN")"
 
 section "WinApps: the root program-scan config"
-# winapps_seed_scan_config writes root's ~/.config/winapps for 'setup.sh
-# --system'. It must connect as the guest's local admin, not a domain identity:
-# that account is all a fresh (or later domain-joined) guest has.
+# winapps_seed_scan_config writes root's ~/.config/winapps for the program scan.
+# The default is the guest's local admin (all a fresh or not-yet-joined guest
+# has); on a joined guest it can seed a domain login instead (see below).
 SCAN_HOME="$WA_TMP/scanroot"; mkdir -p "$SCAN_HOME"
 WINAPPS_TEMPLATE="$WA_TMP/scan.template"
 ( OPT_WINAPPS_LAUNCHER_RO="yes"
@@ -1252,6 +1252,43 @@ if [ -e "$SCAN_HOME2/.config/winapps/scan-askpass" ]; then
 else
     printf '  %s it writes no askpass helper without a password\n' "$(green PASS)"; ((PASS++))
 fi
+
+# Joined guest, someone at a terminal: seed a domain login for the sudo invoker,
+# still keeping the password out of the config and in the askpass helper.
+SCAN_HOME4="$WA_TMP/scanroot4"; mkdir -p "$SCAN_HOME4"
+( HOME="$SCAN_HOME4"; OPT_WINAPPS_VM_ADMIN="winadmin"; OPT_WINAPPS_VM_PASS=""
+  SUDO_USER="alice"
+  stdin_is_tty() { return 0; }
+  have() { [[ "$1" == realm ]]; }
+  realm() { [[ "$1 $2" == "list --name-only" ]] && echo CORP.EXAMPLE.COM; }
+  winapps_default_domain() { echo CORP.EXAMPLE.COM; }
+  ask_value() { printf -v "$1" '%s' "$3"; }          # accept every default
+  ask_secret() { printf -v "$1" '%s' "s3cret"; }
+  winapps_seed_scan_config /etc/winapps/setup.sh 1 ) >/dev/null 2>&1 </dev/null
+SCAN_CONF4="$SCAN_HOME4/.config/winapps/winapps.conf"
+check_line "a joined guest defaults the scan to the sudo user"  'RDP_USER="alice"'              "$SCAN_CONF4"
+check_line "and to the joined realm as the RDP domain"          'RDP_DOMAIN="CORP.EXAMPLE.COM"' "$SCAN_CONF4"
+if grep -qE '^RDP_PASS=""' "$SCAN_CONF4" && [ "$("$SCAN_HOME4/.config/winapps/scan-askpass")" = "s3cret" ]; then
+    printf '  %s the domain password goes only into the askpass helper\n' "$(green PASS)"; ((PASS++))
+else
+    printf '  %s the domain password was mishandled\n' "$(red FAIL)"; ((FAIL++))
+fi
+
+# The *first* scan (rescan flag unset) stays on the local admin even on a joined
+# host - the guest may not be joined yet.
+SCAN_HOME5="$WA_TMP/scanroot5"; mkdir -p "$SCAN_HOME5"
+( HOME="$SCAN_HOME5"; OPT_WINAPPS_VM_ADMIN="winadmin"; OPT_WINAPPS_VM_PASS=""
+  SUDO_USER="alice"
+  stdin_is_tty() { return 0; }
+  have() { [[ "$1" == realm ]]; }
+  realm() { [[ "$1 $2" == "list --name-only" ]] && echo CORP.EXAMPLE.COM; }
+  winapps_default_domain() { echo CORP.EXAMPLE.COM; }
+  ask_value() { printf -v "$1" '%s' "$3"; }
+  ask_secret() { printf -v "$1" '%s' "s3cret"; }
+  winapps_seed_scan_config /etc/winapps/setup.sh 0 ) >/dev/null 2>&1 </dev/null
+SCAN_CONF5="$SCAN_HOME5/.config/winapps/winapps.conf"
+check_line "the first scan stays on the local admin"  'RDP_USER="winadmin"' "$SCAN_CONF5"
+check_line "the first scan leaves the RDP domain blank" 'RDP_DOMAIN=""'     "$SCAN_CONF5"
 
 section "WinApps: stripping the install CD drives"
 # After the operator says Windows is up, the three install CDs have done their

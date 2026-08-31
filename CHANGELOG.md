@@ -71,6 +71,17 @@ changed — not that an artefact was published anywhere.
   form this machine uses. `root` is always allowed. The setup step reports
   whether the group resolves and at which GID.
 
+- **The program scan can sign in as a domain account, not only the guest's
+  local admin.** On a domain-joined guest `winapps_seed_scan_config` now offers
+  an account *and* an AD domain, defaulting to the realm and whoever ran `sudo`;
+  a blank domain still means the local administrator, and a preset
+  `windows-vm.conf` password still runs non-interactively as the local admin.
+  The password continues to go only into the root-only askpass helper. Either
+  account needs local Administrator rights on the guest — AD does not grant a
+  domain account those by itself; the `libvirt_group` documentation now notes
+  that putting that group (or another) into the guest's local Administrators,
+  e.g. by GPO, is what enables the domain-account path.
+
 ### Fixed
 
 - **Re-scanning Windows for installed apps works.** The scan re-ran the upstream

@@ -654,6 +654,13 @@ vm_conf_write_sample() {
 # line commented out and the build asks, defaulting to the realm's
 # permitted-groups. Ordinary domain users do not need this - they reach the
 # guest read-only through the shared launchers regardless (see below).
+#
+# One thing AD does not do for you: the WinApps program scan (setup.sh, run as
+# root) can sign into the guest as a domain account rather than its local
+# administrator, but only if that account has local Administrator rights ON THE
+# GUEST. Putting this group into the guest's local Administrators - e.g. with a
+# GPO - is what grants that. Without it, answer the scan's domain prompt blank
+# and use the guest's local admin account.
 #                                                flag: --winapps-libvirt-group
 #libvirt_group = Domain Admins
 
@@ -845,6 +852,10 @@ menu_multi() {
         fi
     done
 }
+
+# True when stdin is a terminal we can prompt at. A named seam so tests can
+# exercise the prompt paths without a real tty.
+stdin_is_tty() { [[ -t 0 ]]; }
 
 ask_value() {
     local outvar="$1" prompt="$2" default="${3:-}" reply
@@ -5030,30 +5041,49 @@ winapps_deploy_vm() {
     return 0
 }
 
-# 'setup.sh --system' reads its RDP settings from $HOME/.config/winapps, and
-# $HOME here is root's. Seed it so the program scan connects to Windows as the
-# guest's *local* administrator - the 'admin' / 'password' from windows-vm.conf.
-# That account exists whether or not the guest is domain-joined, which a domain
-# identity here would not: it cannot authenticate before the join and is not
-# needed after it. The per-user template and its Kerberos/askpass wiring are for
-# the domain users who log into this machine later, and are not used here.
+# 'setup.sh' reads its RDP settings from $HOME/.config/winapps, and $HOME here
+# is root's. Seed it for the program scan.
+#
+# The first scan defaults to the guest's *local* administrator - the 'admin' /
+# 'password' from windows-vm.conf - because it can run before the guest is
+# domain-joined, when no domain login would work. A re-scan defaults instead to
+# the sudo invoker's domain account in the joined realm, which is usually
+# handier. Either way the account must have local Administrator rights on the
+# guest: a domain account gets them only if an AD group it belongs to is in the
+# guest's local Administrators (e.g. via a GPO - the group named in
+# 'libvirt_group' is the obvious one). The prompt always allows overriding both.
 #
 # The password goes into a root-only askpass helper, never RDP_PASS, so it is
 # not a '/p:' argument visible in 'ps' or the WinApps log. With no password
 # available (a build-generated random one) it asks, or warns and moves on.
 winapps_seed_scan_config() {
     local installer="${1:-$WINAPPS_ETC_DIR/setup.sh}"
+    local rescan="${2:-0}"
     [[ -n "${HOME:-}" && -r "$WINAPPS_TEMPLATE" ]] || return 0
 
     local scan_user="${OPT_WINAPPS_VM_ADMIN:-winadmin}"
-    local scan_pass="$OPT_WINAPPS_VM_PASS"
-    if [[ -z "$scan_pass" && -t 0 ]]; then
+    local scan_domain="" scan_pass="$OPT_WINAPPS_VM_PASS"
+    if [[ -z "$scan_pass" ]] && stdin_is_tty; then
+        # A re-scan means WinApps is already installed, so the first scan
+        # succeeded and the guest is reachable - and by now usually domain-
+        # joined. Default to a domain login by whoever ran sudo. The first scan
+        # keeps the local-admin default: it may run before either side is
+        # joined, when no domain login works.
+        if [[ "$rescan" == 1 ]] \
+           && have realm && realm list --name-only 2>/dev/null | grep -q . \
+           && [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+            scan_user="$SUDO_USER"
+            scan_domain="$(winapps_default_domain)"
+        fi
         printf '\n'
-        note "The one-time program scan signs into Windows as its local"
-        note "administrator to list what is installed. windows-vm.conf did not"
-        note "carry a password (the build generated a random one), so:"
-        ask_value  scan_user "Windows account for the program scan" "$scan_user"
-        ask_secret scan_pass "Password for $scan_user"
+        note "The program scan signs into Windows to list what is installed. Use"
+        note "the guest's local administrator (domain left blank), or a domain"
+        note "account with local Administrator rights on the guest - AD grants"
+        note "those only if a group the account is in (e.g. 'libvirt_group') is"
+        note "in the guest's local Administrators, typically via a GPO."
+        ask_value  scan_user   "Windows account for the program scan" "$scan_user"
+        ask_value  scan_domain "Its AD domain (blank for a local account)" "$scan_domain"
+        ask_secret scan_pass   "Password for ${scan_domain:+${scan_domain}\\}${scan_user}"
     fi
 
     mkdir -p "$HOME/.config/winapps"
@@ -5067,7 +5097,9 @@ winapps_seed_scan_config() {
     fi
 
     # Start from the template so libvirt IP discovery (VM_NAME) is preserved,
-    # then override: connect as a local account, no domain, no Kerberos NLA.
+    # then override: the scan account, its domain (blank = local), no forced
+    # Kerberos NLA (FreeRDP still negotiates NLA over NTLM, which needs no
+    # ticket - root has none).
     #
     # '/cert:tofu' becomes '/cert:ignore' for this one connection. The guest's
     # self-signed RDP certificate is regenerated whenever its hostname changes -
@@ -5079,7 +5111,7 @@ winapps_seed_scan_config() {
     # The read-only libvirt overrides are for ordinary domain users; the scan
     # runs as root and manages the guest itself, so drop that block here.
     sed -e "s|^RDP_USER=.*|RDP_USER=\"$scan_user\"|" \
-        -e 's|^RDP_DOMAIN=.*|RDP_DOMAIN=""|' \
+        -e "s|^RDP_DOMAIN=.*|RDP_DOMAIN=\"$scan_domain\"|" \
         -e 's|^RDP_PASS=.*|RDP_PASS=""|' \
         -e "s|^RDP_ASKPASS=.*|RDP_ASKPASS=\"$askpass\"|" \
         -e 's| /sec:nla||' \
@@ -5095,7 +5127,7 @@ winapps_seed_scan_config() {
 
     if [[ -z "$scan_pass" ]]; then
         warn "No password available for the program scan; it will likely fail."
-        note "Add 'password' to windows-vm.conf, then:  sudo $installer --system"
+        note "Add 'password' to windows-vm.conf, or re-run and give one when asked."
     fi
     return 0
 }
@@ -5239,10 +5271,11 @@ winapps_offer_cdrom_powercycle() {
 winapps_install_upstream() {
     local installer="$WINAPPS_ETC_DIR/setup.sh" rc=0
     local -a mode=(--system)
-    local label="system-wide"
+    local label="system-wide" rescan=0
     if [[ -e "$WINAPPS_SYS_LAUNCHER" ]]; then
         mode=(--system --add-apps)
         label="refresh installed apps"
+        rescan=1
     fi
 
     if ! confirm "Is the Windows side already installed, domain-joined and reachable over RDP?" "n"; then
@@ -5285,7 +5318,7 @@ winapps_install_upstream() {
             "$installer"
     fi
 
-    winapps_seed_scan_config "$installer"
+    winapps_seed_scan_config "$installer" "$rescan"
 
     info "Running the WinApps installer ($label)"
     run "$installer" "${mode[@]}" || rc=$?
