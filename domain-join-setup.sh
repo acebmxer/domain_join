@@ -3665,6 +3665,10 @@ WINAPPS_MIDO_URL="https://raw.githubusercontent.com/ElliotKillick/Mido/main/Mido
 WINAPPS_RDPAPPS_URL="https://raw.githubusercontent.com/winapps-org/winapps/main/install/RDPApps.reg"
 WINAPPS_VM_DEPLOYED=0
 
+# Re-applied on every boot and every 'systemctl restart docker' - see
+# winapps_fix_docker_libvirt_forward.
+WINAPPS_DOCKER_FWD_UNIT="/etc/systemd/system/libvirt-docker-forward.service"
+
 # winapps_install_file <dest> <mode> - content arrives on stdin.
 #
 # Written through a temporary file in the destination directory and moved into
@@ -5377,6 +5381,30 @@ winapps_remove() {
         fi
     done
 
+    # The Docker/libvirt forwarding unit and its firewalld direct rules.
+    if [[ -e "$WINAPPS_DOCKER_FWD_UNIT" ]]; then
+        local dfu; dfu="$(basename "$WINAPPS_DOCKER_FWD_UNIT")"
+        if [[ $DRY_RUN -eq 1 ]]; then
+            printf '%s  [dry-run]%s disable and remove %s\n' "$C_CYAN" "$C_RESET" "$WINAPPS_DOCKER_FWD_UNIT"
+        else
+            have systemctl && run_quiet systemctl disable --now "$dfu"
+            backup_file "$WINAPPS_DOCKER_FWD_UNIT" "$OUT_OF_TREE_BACKUP_DIR"
+            rm -f "$WINAPPS_DOCKER_FWD_UNIT" && ok "Removed $WINAPPS_DOCKER_FWD_UNIT"
+            have systemctl && run_quiet systemctl daemon-reload
+            if have firewall-cmd; then
+                local br dir; br="$(winapps_docker_bridge)"
+                for dir in "-i $br" "-o $br"; do
+                    # shellcheck disable=SC2086
+                    firewall-cmd --permanent --direct --query-rule \
+                        ipv4 filter DOCKER-USER 0 $dir -j ACCEPT >/dev/null 2>&1 || continue
+                    # shellcheck disable=SC2086
+                    run_quiet firewall-cmd --permanent --direct --remove-rule \
+                        ipv4 filter DOCKER-USER 0 $dir -j ACCEPT
+                done
+            fi
+        fi
+    fi
+
     # The program-scan password helper (root only), if a scan ever wrote one.
     if [[ -n "${HOME:-}" && -e "$HOME/.config/winapps/scan-askpass" ]]; then
         if [[ $DRY_RUN -eq 1 ]]; then
@@ -5573,6 +5601,106 @@ winapps_enable_ro_sockets() {
         unit_exists "$ro" || continue
         run_quiet systemctl enable --now "$ro"
     done
+}
+
+# ---------------------------------------------------------------------------
+# Docker and the libvirt NAT bridge
+#
+# Docker's default iptables setup sets the FORWARD chain policy to DROP and adds
+# no exception for a libvirt NAT network. A Windows guest on 'virbr0' then gets
+# a DHCP lease from dnsmasq - that traffic is host-directed and never forwarded
+# - but no routed packet reaches the internet: libvirt's own accept and
+# masquerade rules live in a separate nftables table and cannot undo another
+# table's DROP verdict.
+#
+# The fix is an ACCEPT for the bridge in Docker's DOCKER-USER chain, the
+# injection point Docker documents and never flushes. Docker recreates that
+# chain empty on every daemon start, so the rule goes in a systemd unit ordered
+# after (and PartOf) docker.service; a permanent firewalld direct rule covers
+# 'firewall-cmd --reload', which makes Docker rebuild its chains too.
+#
+# Only touched when Docker is actually present with its iptables driver active
+# (the DOCKER-USER chain exists) - a host without Docker needs none of it.
+
+# winapps_docker_bridge - the bridge of the libvirt 'default' network, which is
+# where winapps_deploy_vm attaches the guest. virbr0 unless it was renamed.
+winapps_docker_bridge() {
+    local br=""
+    have virsh && br="$(virsh -c qemu:///system net-info default 2>/dev/null \
+                        | awk '/^Bridge:/ { print $2 }')"
+    printf '%s' "${br:-virbr0}"
+}
+
+winapps_fix_docker_libvirt_forward() {
+    have docker    || return 0
+    have iptables  || return 0
+    have systemctl || return 0
+
+    # Docker only breaks forwarding when its iptables driver is running, which
+    # is exactly when the DOCKER-USER chain is present.
+    iptables -nL DOCKER-USER >/dev/null 2>&1 || return 0
+
+    local bridge unit
+    bridge="$(winapps_docker_bridge)"
+    unit="$(basename "$WINAPPS_DOCKER_FWD_UNIT")"
+
+    if [[ $DRY_RUN -eq 0 ]] && systemctl is-enabled --quiet "$unit" >/dev/null 2>&1; then
+        ok "Docker/libvirt forwarding rule already in place ($unit)"
+        return 0
+    fi
+
+    printf '\n'
+    note "Docker is installed. When it runs it filters the FORWARD firewall"
+    note "chain, which stops the Windows VM on '$bridge' reaching the internet"
+    note "(it still gets a DHCP address, so the fault looks like DNS)."
+    confirm "Add a permanent rule letting the '$bridge' bridge through Docker's chain?" "y" || {
+        note "Left the firewall alone. Re-run this step to add the rule later,"
+        note "or the VM will have no outbound network while Docker is running."
+        return 0
+    }
+
+    winapps_install_file "$WINAPPS_DOCKER_FWD_UNIT" 0644 <<UNIT
+[Unit]
+Description=Allow the libvirt NAT bridge ($bridge) through Docker's DOCKER-USER chain
+After=docker.service
+Wants=docker.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'iptables -C DOCKER-USER -i $bridge -j ACCEPT 2>/dev/null || iptables -I DOCKER-USER -i $bridge -j ACCEPT'
+ExecStart=/bin/sh -c 'iptables -C DOCKER-USER -o $bridge -j ACCEPT 2>/dev/null || iptables -I DOCKER-USER -o $bridge -j ACCEPT'
+ExecStop=/bin/sh -c 'iptables -D DOCKER-USER -i $bridge -j ACCEPT 2>/dev/null || true'
+ExecStop=/bin/sh -c 'iptables -D DOCKER-USER -o $bridge -j ACCEPT 2>/dev/null || true'
+
+[Install]
+WantedBy=multi-user.target docker.service
+UNIT
+
+    [[ $DRY_RUN -eq 1 ]] && return 0
+
+    run_quiet systemctl daemon-reload
+    if run_quiet systemctl enable --now "$unit"; then
+        ok "The '$bridge' bridge is now allowed through Docker's FORWARD chain"
+    else
+        warn "Could not start $unit (see log)."
+    fi
+
+    # firewalld re-applies its direct rules on every reload, including the one
+    # that makes Docker rebuild DOCKER-USER.
+    if have firewall-cmd && systemctl is-active --quiet firewalld 2>/dev/null; then
+        local dir
+        for dir in "-i $bridge" "-o $bridge"; do
+            # shellcheck disable=SC2086
+            firewall-cmd --permanent --direct --query-rule \
+                ipv4 filter DOCKER-USER 0 $dir -j ACCEPT >/dev/null 2>&1 && continue
+            # shellcheck disable=SC2086
+            run_quiet firewall-cmd --permanent --direct --add-rule \
+                ipv4 filter DOCKER-USER 0 $dir -j ACCEPT
+        done
+        ok "firewalld: direct rule stored for '$bridge' (applied on the next reload)"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -5848,6 +5976,9 @@ configure_winapps() {
     # --- Domain-user access to qemu:///system -----------------------------
     winapps_grant_libvirt_access "$OPT_WINAPPS_LIBVIRT_GROUP"
     winapps_vm_autostart_apply
+
+    # --- Docker / libvirt bridge coexistence ------------------------------
+    winapps_fix_docker_libvirt_forward
 
     # --- Build the Windows guest -----------------------------------------
     local do_deploy=0

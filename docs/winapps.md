@@ -140,6 +140,26 @@ freshly installed libvirt that has not been rebooted, `virt-install` fails with
 sockets (or the monolithic `libvirtd`) and checks the storage and network
 drivers answer before doing any multi-GB ISO work.
 
+### Docker on the same host
+
+Docker's default firewall setup sets the `FORWARD` chain policy to `DROP` and
+adds no exception for a libvirt NAT network. The Windows guest then gets a DHCP
+lease (that traffic goes to the host and is never forwarded) but no routed
+packet reaches the internet — the fault looks like broken DNS. libvirt's own
+accept and masquerade rules live in a separate nftables table and cannot undo
+Docker's `DROP`.
+
+When it sees Docker installed with its iptables driver active, the WinApps step
+offers to install `libvirt-docker-forward.service` — a one-shot unit, ordered
+`After=` and `PartOf=` `docker.service`, that adds an `ACCEPT` for the libvirt
+bridge (`virbr0` unless renamed) to Docker's `DOCKER-USER` chain. Docker
+recreates that chain empty on every daemon start, so the unit re-applies the
+rule each time; a matching permanent firewalld direct rule covers
+`firewall-cmd --reload`, which makes Docker rebuild its chains too. Declining
+the prompt leaves the firewall untouched — the guest just has no outbound
+network while Docker is running. `--winapps-remove` disables the unit and drops
+the firewalld rule.
+
 Supply the install media with `--winapps-iso FILE`. This has to be the full
 path to the `.iso` file itself — filename included, e.g.
 `/srv/iso/Win11_24H2_English_x64.iso`, not the directory that holds it. A
@@ -376,7 +396,9 @@ Windows has to exist first:
 2. Run this script's WinApps step. It installs FreeRDP and the virtualisation
    stack, writes the template, generator and login hooks, seeds existing
    accounts, grants an AD group access to `qemu:///system`
-   ([above](#who-can-launch-apps-and-who-can-drive-the-vm)), and offers to
+   ([above](#who-can-launch-apps-and-who-can-drive-the-vm)), fixes libvirt
+   forwarding if Docker is in the way
+   ([above](#docker-on-the-same-host)), and offers to
    **build the Windows VM** ([above](#building-the-vm)).
 3. **Join Windows to the domain.** The script never does this — not even for a
    VM it built.

@@ -1379,6 +1379,73 @@ check "accepting the power cycle shuts down then starts" "1|1" \
           printf '%s|%s' "$(grep -c 'shutdown IT-VM' "$WA_TMP/pc.log")" \
                          "$(grep -c 'start IT-VM' "$WA_TMP/pc.log")" )"
 
+section "WinApps: Docker / libvirt bridge coexistence"
+# winapps_fix_docker_libvirt_forward installs a systemd unit (and a firewalld
+# direct rule) so a guest on virbr0 still reaches the internet when Docker has
+# taken over the FORWARD chain. It must stay out of the way when Docker is
+# absent, when Docker's iptables driver is off, or when the operator declines.
+FWD_UNIT="$WA_TMP/libvirt-docker-forward.service"
+FWD_FWLOG="$WA_TMP/fw.log"
+
+run_fix() { (
+    DRY_RUN=0; ASSUME_YES=0
+    WINAPPS_DOCKER_FWD_UNIT="$FWD_UNIT"
+    have() { case "$1" in
+        docker)       [[ "${HAS_DOCKER:-1}" == 1 ]] ;;
+        firewall-cmd) [[ "${HAS_FWD:-1}" == 1 ]] ;;
+        iptables|systemctl|virsh) return 0 ;;
+        *) return 1 ;; esac; }
+    iptables() { case "$*" in
+        *"-nL DOCKER-USER"*) return "${NO_CHAIN:-0}" ;;   # 0 = chain present
+        *) return 0 ;; esac; }
+    systemctl() { case "$*" in
+        *is-enabled*) return "${UNIT_ENABLED:-1}" ;;      # 1 = not enabled yet
+        *) return 0 ;; esac; }
+    virsh() { printf 'Bridge:          virbr9\n'; }
+    firewall-cmd() { echo "$*" >>"$FWD_FWLOG"
+                     case "$*" in *--query-rule*) return 1 ;; *) return 0 ;; esac; }
+    confirm() { return "${FIX_CONFIRM:-0}"; }             # 0 = operator says yes
+    run_quiet() { "$@" >/dev/null 2>&1; }
+    winapps_install_file() { local d="$1"; shift; cat > "$d"; }
+    ok() { :; }; warn() { :; }; note() { :; }; info() { :; }
+    winapps_fix_docker_libvirt_forward
+) >/dev/null 2>&1; }
+
+rm -f "$FWD_UNIT"; : >"$FWD_FWLOG"
+HAS_DOCKER=1 NO_CHAIN=0 UNIT_ENABLED=1 FIX_CONFIRM=0 run_fix
+check_line "the unit names the discovered bridge" 'Description=Allow the libvirt NAT bridge (virbr9)' "$FWD_UNIT"
+check_line "the unit is ordered after docker"     'After=docker.service'  "$FWD_UNIT"
+check_line "the unit is PartOf docker"            'PartOf=docker.service' "$FWD_UNIT"
+check_line "it accepts inbound bridge traffic"    'iptables -I DOCKER-USER -i virbr9 -j ACCEPT' "$FWD_UNIT"
+check_line "it accepts outbound bridge traffic"   'iptables -I DOCKER-USER -o virbr9 -j ACCEPT' "$FWD_UNIT"
+check_line "it checks the rule before inserting"  'iptables -C DOCKER-USER -i virbr9 -j ACCEPT 2>/dev/null ||' "$FWD_UNIT"
+check "it also stores a permanent firewalld rule" "2" \
+      "$(grep -c -- '--add-rule ipv4 filter DOCKER-USER 0' "$FWD_FWLOG")"
+
+rm -f "$FWD_UNIT"; : >"$FWD_FWLOG"
+HAS_DOCKER=0 run_fix
+check "no Docker: nothing installed" "no|0" \
+      "$([[ -e "$FWD_UNIT" ]] && echo yes || echo no)|$(grep -c . "$FWD_FWLOG")"
+
+rm -f "$FWD_UNIT"; : >"$FWD_FWLOG"
+HAS_DOCKER=1 NO_CHAIN=1 run_fix
+check "Docker with no DOCKER-USER chain: nothing installed" "no" \
+      "$([[ -e "$FWD_UNIT" ]] && echo yes || echo no)"
+
+rm -f "$FWD_UNIT"; : >"$FWD_FWLOG"
+HAS_DOCKER=1 NO_CHAIN=0 UNIT_ENABLED=1 FIX_CONFIRM=1 run_fix
+check "declining leaves the firewall alone" "no|0" \
+      "$([[ -e "$FWD_UNIT" ]] && echo yes || echo no)|$(grep -c . "$FWD_FWLOG")"
+
+printf 'SENTINEL\n' >"$FWD_UNIT"; : >"$FWD_FWLOG"
+HAS_DOCKER=1 NO_CHAIN=0 UNIT_ENABLED=0 run_fix
+check "an already-enabled unit is not rewritten" "SENTINEL" "$(cat "$FWD_UNIT")"
+
+rm -f "$FWD_UNIT"; : >"$FWD_FWLOG"
+HAS_DOCKER=1 NO_CHAIN=0 UNIT_ENABLED=1 FIX_CONFIRM=0 HAS_FWD=0 run_fix
+check "no firewalld: unit written, no firewalld calls" "yes|0" \
+      "$([[ -e "$FWD_UNIT" ]] && echo yes || echo no)|$(grep -c . "$FWD_FWLOG")"
+
 section "WinApps: the standalone scan entry"
 check "a scan with no template set up bails" "1" \
       "$( WINAPPS_TEMPLATE="$WA_TMP/nonexistent.template"; WINAPPS_CONFIGURED=0
