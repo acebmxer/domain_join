@@ -21,15 +21,16 @@ changed — not that an artefact was published anywhere.
 - **The "Windows apps for every user" menu step can now remove WinApps, not
   only reconfigure it.** When it finds WinApps already set up on an interactive
   run it asks first: *Revisit the settings* (what it did before) or *Remove
-  WinApps*. Removal then asks how far to go — *the multi-user wiring only* (the
-  same as `--winapps-remove`), or *a clean slate*, which also runs the upstream
-  `setup.sh --system --uninstall`, deletes the upstream source tree and every
-  user's `~/.config/winapps/winapps.conf`, and still asks before destroying the
-  Windows VM. The clean-slate option is the one-stop teardown before a
-  from-scratch reinstall; previously it took `--winapps-remove
-  --winapps-vm-remove` plus two commands the script only printed as a hint.
-  Flag-directed and `-y` runs are unaffected — they stay on the configure path,
-  and `--winapps-remove` still short-circuits straight to removal as before.
+  WinApps completely*. Removal is the whole teardown in one go — the multi-user
+  wiring, the upstream install and its `/usr/share/applications` launchers, this
+  installer's fetched `/etc/winapps/setup.sh`, the now-empty `/etc/winapps`, and
+  every user's `~/.config/winapps` — after which a later run is a genuine fresh
+  install with no "already set up" prompt. The Windows VM is still asked about
+  separately. Previously this took `--winapps-remove --winapps-vm-remove` plus
+  two more commands the script only printed as hints, and even then left
+  `/etc/winapps/setup.sh` and per-user configs behind. The bare `--winapps-remove`
+  flag is unchanged: wiring only, upstream install left for a per-user fallback.
+  Flag-directed and `-y` runs stay on the configure path as before.
 
 ### Removed
 

@@ -1037,6 +1037,7 @@ check_contains "the uninstall hint passes --system" "--system" \
 wa_rm_tmp="$(mktemp -d)"
 wa_is_installed() {
     ( WINAPPS_TEMPLATE="$wa_rm_tmp/tpl"; WINAPPS_SEEDER="$wa_rm_tmp/seed"
+      WINAPPS_ASKPASS="$wa_rm_tmp/askpass"
       WINAPPS_SYS_LAUNCHER="$wa_rm_tmp/bin"; WINAPPS_ETC_DIR="$wa_rm_tmp/etc"
       winapps_installed && printf 'yes' || printf 'no' )
 }
@@ -1044,30 +1045,46 @@ check "winapps_installed: false with no footprint" "no" "$(wa_is_installed)"
 : > "$wa_rm_tmp/tpl"
 check "winapps_installed: true once the template exists" "yes" "$(wa_is_installed)"
 rm -f "$wa_rm_tmp/tpl"
-mkdir -p "$wa_rm_tmp/etc"; : > "$wa_rm_tmp/etc/setup.sh"
-check "winapps_installed: upstream setup.sh alone is enough" "yes" "$(wa_is_installed)"
-rm -rf "$wa_rm_tmp/etc"
+mkdir -p "${wa_rm_tmp:?}/etc"; : > "$wa_rm_tmp/etc/setup.sh"
+check "winapps_installed: a lone fetched setup.sh still counts" "yes" "$(wa_is_installed)"
+rm -rf "${wa_rm_tmp:?}/etc"
 
-# The clean-slate depth: WINAPPS_REMOVE_CLEAN makes winapps_remove also call the
-# upstream uninstaller and clear the per-user configs it leaves behind.
-clean_dryrun="$( ( DRY_RUN=1; WINAPPS_REMOVE_CLEAN=1
+# WINAPPS_REMOVE_CLEAN makes winapps_remove take out the upstream install, the
+# fetched setup.sh, /etc/winapps and every per-user config - so a machine that
+# followed the menu's "Remove WinApps" is a clean slate, not one winapps_installed
+# still fires on. Give it a real /etc/winapps/setup.sh so the check is hermetic.
+wa_etc="$(mktemp -d)"; : > "$wa_etc/setup.sh"; chmod +x "$wa_etc/setup.sh"
+clean_dryrun="$( ( DRY_RUN=1; WINAPPS_REMOVE_CLEAN=1; WINAPPS_ETC_DIR="$wa_etc"
                    winapps_remove 2>/dev/null ) )"
+rm -rf "$wa_etc"
 check_contains "clean slate runs the upstream --system --uninstall" "--system" \
       "$(printf '%s\n' "$clean_dryrun" | grep -F 'setup.sh --system --uninstall')"
-check_contains "clean slate clears the per-user winapps.conf" "~/.config/winapps/winapps.conf" \
-      "$(printf '%s\n' "$clean_dryrun" | grep -F 'Clearing every user')"
+check_contains "clean slate deletes the fetched setup.sh" "remove" \
+      "$(printf '%s\n' "$clean_dryrun" | grep -F "remove $wa_etc/setup.sh")"
+check_contains "clean slate removes /etc/winapps" "rmdir" \
+      "$(printf '%s\n' "$clean_dryrun" | grep -F "rmdir $wa_etc")"
+check "clean slate clears every user's config dir" "1" \
+      "$(printf '%s\n' "$clean_dryrun" | grep -cF 'Clearing every user')"
 
-# winapps_remove_interactive: 'clean' sets the flag before calling winapps_remove;
-# 'wiring' leaves it at 0. menu_single is stubbed to return the forced key.
-wa_rm_depth() {
-    ( _WA_PICK="$1"
-      menu_single() { printf -v "$1" '%s' "$_WA_PICK"; }
-      winapps_remove() { printf 'CLEAN=%s' "$WINAPPS_REMOVE_CLEAN"; }
+# The plain flag path (WINAPPS_REMOVE_CLEAN=0) still leaves the upstream install
+# alone and only points at the uninstall command.
+plain_dryrun="$( ( DRY_RUN=1; WINAPPS_REMOVE_CLEAN=0; winapps_remove 2>/dev/null ) )"
+check_lacks "the flag path does not run the upstream uninstaller" "--uninstall" \
+      "$(printf '%s\n' "$plain_dryrun" | grep -F '[dry-run]')"
+
+# winapps_remove_interactive: a yes at the confirm runs a full (clean) removal;
+# a no runs nothing at all.
+wa_rm_run() {
+    ( _WA_CONFIRM="$1"
+      confirm() { [[ "$_WA_CONFIRM" == yes ]]; }
+      winapps_remove() { printf 'WINAPPS_REMOVE_CALLED clean=%s\n' "$WINAPPS_REMOVE_CLEAN"; }
       WINAPPS_REMOVE_CLEAN=0
       winapps_remove_interactive )
 }
-check "winapps_remove_interactive: 'clean' sets the flag" "CLEAN=1" "$(wa_rm_depth clean)"
-check "winapps_remove_interactive: 'wiring' leaves it off"  "CLEAN=0" "$(wa_rm_depth wiring)"
+check_contains "remove_interactive: yes triggers a full removal" "clean=1" \
+      "$(wa_rm_run yes | grep WINAPPS_REMOVE_CALLED)"
+check_lacks "remove_interactive: no removes nothing" "WINAPPS_REMOVE_CALLED" \
+      "$(wa_rm_run no)"
 rm -rf "$wa_rm_tmp"
 
 # An invalid enum must stop the run rather than be carried into a config file.

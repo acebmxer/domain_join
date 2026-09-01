@@ -120,9 +120,11 @@ OPT_VM_SYSTEM_LOCALE=""  # SystemLocale         (empty = the UI language)
 OPT_VM_USER_LOCALE=""    # UserLocale           (empty = the UI language)
 OPT_VM_INPUT_LOCALE=""   # InputLocale          (empty = 0409:00000409)
 WINAPPS_VM_REMOVE=0      # --winapps-vm-remove: also undefine the libvirt guest
-WINAPPS_REMOVE_CLEAN=0   # winapps_remove: also run the upstream --system --uninstall
-                         # and delete every user's ~/.config/winapps/winapps.conf,
-                         # for a from-scratch reinstall. Set by the menu's remove path.
+WINAPPS_REMOVE_CLEAN=0   # winapps_remove: remove everything - the upstream install,
+                         # this installer's fetched setup.sh, /etc/winapps and every
+                         # user's ~/.config/winapps - so the next run is a fresh
+                         # install. Set by the menu's "Remove WinApps" choice; the
+                         # bare --winapps-remove flag leaves it 0 (wiring only).
 
 # What to install. Filled in by the choice builders, or by the matching flags.
 BACKEND=""
@@ -5480,23 +5482,22 @@ winapps_remove() {
         fi
     fi
 
-    # A clean slate: the upstream install and every generated per-user config,
-    # so the next run installs WinApps from scratch rather than refreshing it.
+    # "Remove WinApps" from the menu: take out everything the installer put on
+    # the machine, so a later run is a clean install and winapps_installed no
+    # longer fires. The bare --winapps-remove flag keeps this off and leaves the
+    # upstream install for a per-user fallback, as documented.
     if (( WINAPPS_REMOVE_CLEAN )); then
         printf '\n'
         local up="$WINAPPS_ETC_DIR/setup.sh"
-        if [[ $DRY_RUN -eq 1 ]]; then
-            printf '%s  [dry-run]%s %s --system --uninstall\n' "$C_CYAN" "$C_RESET" "$up"
-        elif [[ -x "$up" ]]; then
-            run "$up" --system --uninstall \
-                || warn "The upstream WinApps uninstaller exited non-zero."
-        else
-            note "No $up here to run '--system --uninstall'; skipping it."
+        if [[ -e "$up" ]]; then
+            run bash "$up" --system --uninstall \
+                || warn "The upstream uninstaller exited non-zero; removing its files directly."
         fi
-        # Upstream leaves its source tree and launchers; take them too.
+        # The upstream source tree and launchers, and this installer's fetched
+        # copy of setup.sh - none of it belongs to a fresh install.
         local p
         for p in "$WINAPPS_SYS_LAUNCHER" "${WINAPPS_SYS_LAUNCHER}-src" \
-                 "${WINAPPS_SYS_LAUNCHER}-setup"; do
+                 "${WINAPPS_SYS_LAUNCHER}-setup" "$up"; do
             [[ -e "$p" || -L "$p" ]] || continue
             if [[ $DRY_RUN -eq 1 ]]; then
                 printf '%s  [dry-run]%s remove %s\n' "$C_CYAN" "$C_RESET" "$p"
@@ -5504,24 +5505,29 @@ winapps_remove() {
                 rm -rf "$p" && ok "Removed $p"
             fi
         done
-        # Every generated per-user config, plus root's.
-        note "Clearing every user's ~/.config/winapps/winapps.conf"
-        local d conf
+        if [[ $DRY_RUN -eq 1 ]]; then
+            printf '%s  [dry-run]%s rmdir %s if empty\n' "$C_CYAN" "$C_RESET" "$WINAPPS_ETC_DIR"
+        elif [[ -d "$WINAPPS_ETC_DIR" ]]; then
+            rmdir "$WINAPPS_ETC_DIR" 2>/dev/null && ok "Removed $WINAPPS_ETC_DIR" || true
+        fi
+        # Every user's generated config directory, root included.
+        note "Clearing every user's ~/.config/winapps"
+        local d dir
         for d in /root /home/*; do
-            conf="$d/.config/winapps/winapps.conf"
-            [[ -e "$conf" ]] || continue
+            dir="$d/.config/winapps"
+            [[ -d "$dir" ]] || continue
             if [[ $DRY_RUN -eq 1 ]]; then
-                printf '%s  [dry-run]%s remove %s\n' "$C_CYAN" "$C_RESET" "$conf"
+                printf '%s  [dry-run]%s remove %s\n' "$C_CYAN" "$C_RESET" "$dir"
             else
-                rm -f "$conf" && ok "Removed $conf"
+                rm -rf "$dir" && ok "Removed $dir"
             fi
         done
     fi
 
     printf '\n'
     if (( WINAPPS_REMOVE_CLEAN )); then
-        note "Left in place on purpose:"
-        note "  - the cached ISOs in $WINAPPS_ISO_CACHE"
+        note "WinApps is fully removed; a later run installs it fresh."
+        note "Left alone: the cached ISOs in $WINAPPS_ISO_CACHE"
     else
         note "Left in place on purpose:"
         note "  - each user's ~/.config/winapps/winapps.conf"
@@ -5532,22 +5538,27 @@ winapps_remove() {
     return 0
 }
 
-# True when WinApps is set up here in any form - the multi-user wiring or just
-# the upstream install. The trigger for offering removal, not only a reconfigure.
+# True when WinApps is set up here in any form - the multi-user wiring, the
+# upstream install, or just this installer's fetched setup.sh. The trigger for
+# offering removal rather than only a reconfigure.
 winapps_installed() {
-    [[ -e "$WINAPPS_TEMPLATE" || -e "$WINAPPS_SEEDER" \
+    [[ -e "$WINAPPS_TEMPLATE" || -e "$WINAPPS_SEEDER" || -e "$WINAPPS_ASKPASS" \
        || -e "$WINAPPS_SYS_LAUNCHER" || -e "$WINAPPS_ETC_DIR/setup.sh" ]]
 }
 
-# The menu's route into winapps_remove: choose how far the removal goes, set the
-# flag winapps_remove reads, then run it. Reached from configure_winapps when an
-# existing install is found on an interactive run.
+# The menu's route into a full WinApps removal: confirm, then run winapps_remove
+# with WINAPPS_REMOVE_CLEAN set so nothing the installer wrote is left behind.
+# Reached from configure_winapps when an existing install is found interactively.
 winapps_remove_interactive() {
-    local depth
-    menu_single depth "How much of WinApps should be removed?" "wiring" \
-        "wiring|The multi-user wiring only|Removes the config template, the per-user generator, the login hooks and the askpass and VM-deploy helpers. The upstream launchers, each user's own ~/.config/winapps/winapps.conf and the Windows VM stay." \
-        "clean|Everything - a clean slate|Also runs the upstream 'setup.sh --system --uninstall' (the launchers and /usr/local/bin/winapps), deletes the upstream source tree and every user's ~/.config/winapps/winapps.conf. You are still asked before the Windows VM is destroyed. Use this to reinstall WinApps from scratch."
-    [[ "$depth" == "clean" ]] && WINAPPS_REMOVE_CLEAN=1
+    printf '\n'
+    note "This removes the multi-user wiring, the upstream WinApps install and"
+    note "launchers, this installer's fetched setup.sh and /etc/winapps, and"
+    note "every user's ~/.config/winapps. The Windows VM is asked about separately."
+    if ! confirm "Remove WinApps from this machine?" "n"; then
+        note "Left WinApps in place."
+        return 0
+    fi
+    WINAPPS_REMOVE_CLEAN=1
     winapps_remove
 }
 
@@ -6036,7 +6047,7 @@ configure_winapps() {
         local what
         menu_single what "WinApps is already set up on this machine." "reconfigure" \
             "reconfigure|Revisit the settings|Rewrites the template, generator and login hooks from your answers, re-seeds the users who already exist and offers the VM build again. Nothing is removed." \
-            "remove|Remove WinApps|Takes the multi-user wiring back out, and optionally the upstream launchers, every user's config and the Windows VM. The clean-slate option before a fresh install."
+            "remove|Remove WinApps completely|Takes out the wiring, the upstream install and launchers, the fetched installer and /etc/winapps, and every user's config, so the next run is a fresh install. Asks before destroying the Windows VM."
         if [[ "$what" == "remove" ]]; then
             winapps_remove_interactive
             return $?
