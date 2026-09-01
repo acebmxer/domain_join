@@ -29,3 +29,6 @@ windows-vm.conf
 .vscode/
 .idea/
 .DS_Store
+
+# Claude Code working notes - local handoff between sessions, never shared.
+.claude/
