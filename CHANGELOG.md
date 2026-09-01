@@ -144,22 +144,36 @@ changed — not that an artefact was published anywhere.
   fetched installer is corrected in place before it runs; a no-op once upstream
   fixes it.
 
-- **The Windows VM reaches the internet when Docker is also installed.**
-  Docker's default firewall setup sets the `FORWARD` chain policy to `DROP` and
-  adds no exception for a libvirt NAT network, so a guest on `virbr0` got a DHCP
-  lease from `dnsmasq` — that traffic is host-directed and never forwarded — but
-  no routed packet reached the internet, and the fault looked like broken DNS.
-  libvirt's own accept and masquerade rules live in a separate nftables table
-  and cannot undo another table's `DROP`. When Docker is present with its
-  iptables driver active (the `DOCKER-USER` chain exists), the WinApps step now
-  offers to install `libvirt-docker-forward.service` — a one-shot unit ordered
-  `After=` and `PartOf=` `docker.service` that adds an `ACCEPT` for the libvirt
-  bridge (`virbr0` unless renamed) to `DOCKER-USER`. Docker recreates that chain
-  empty on every daemon start, so the unit re-applies the rule each time; a
-  matching permanent firewalld direct rule covers `firewall-cmd --reload`, which
-  makes Docker rebuild its chains too. Declining the prompt leaves the firewall
-  untouched. `--winapps-remove` disables the unit and drops the firewalld rule.
-  (`dd6f3e8`)
+- **The Windows VM keeps working when Docker is also installed.** Docker and
+  libvirt both drive the host firewall, and Docker's startup churn broke a guest
+  on `virbr0` two separate ways:
+
+  - **No outbound traffic.** Docker's default setup sets the `FORWARD` chain
+    policy to `DROP` with no exception for a libvirt NAT network, so a routed
+    packet from the guest never reached the internet — and the fault looked like
+    broken DNS. libvirt's own accept and masquerade rules live in a separate
+    nftables table and cannot undo another table's `DROP`.
+
+  - **No IP at all (with firewalld running).** `virtnetworkd` puts `virbr0` in
+    the firewalld `libvirt` zone, the zone that lets the guest reach `dnsmasq`
+    for DHCP and DNS. Docker starting up makes firewalld rebuild its ruleset,
+    which drops that runtime-only interface→zone assignment; libvirt does not
+    re-add it, `virbr0` falls to the default zone, and DHCP (udp/67) and DNS are
+    blocked.
+
+  When Docker is present with its iptables driver active (the `DOCKER-USER`
+  chain exists), the WinApps step now offers to install
+  `libvirt-docker-forward.service` — a one-shot unit ordered `After=` and
+  `PartOf=` `docker.service` that adds an `ACCEPT` for the libvirt bridge
+  (`virbr0` unless renamed) to `DOCKER-USER` **and** re-pins the bridge to the
+  `libvirt` zone. Docker rebuilds its chains on every daemon start, so the unit
+  re-applies both each time. A permanent firewalld direct rule and a permanent
+  `libvirt`-zone interface binding cover `firewall-cmd --reload`, and the step
+  also re-asserts the zone immediately, so a host that is already broken is
+  fixed on the spot. An install from before this change is upgraded in place
+  without a second prompt. Declining the prompt leaves the firewall untouched.
+  `--winapps-remove` disables the unit, drops the firewalld direct rule and
+  removes the permanent zone binding. (`dd6f3e8`)
 
 - **The Windows program scan no longer aborts on a group-membership check.**
   Upstream's `setup.sh` refuses the libvirt backend unless the user running it

@@ -5433,6 +5433,13 @@ winapps_remove() {
                     run_quiet firewall-cmd --permanent --direct --remove-rule \
                         ipv4 filter DOCKER-USER 0 $dir -j ACCEPT
                 done
+                # Drop our permanent libvirt-zone pin for the bridge; libvirt
+                # still assigns it at runtime when the network starts.
+                if firewall-cmd --permanent --zone=libvirt --query-interface="$br" \
+                        >/dev/null 2>&1; then
+                    run_quiet firewall-cmd --permanent --zone=libvirt \
+                        --remove-interface="$br"
+                fi
             fi
         fi
     fi
@@ -5639,18 +5646,30 @@ winapps_enable_ro_sockets() {
 # ---------------------------------------------------------------------------
 # Docker and the libvirt NAT bridge
 #
-# Docker's default iptables setup sets the FORWARD chain policy to DROP and adds
-# no exception for a libvirt NAT network. A Windows guest on 'virbr0' then gets
-# a DHCP lease from dnsmasq - that traffic is host-directed and never forwarded
-# - but no routed packet reaches the internet: libvirt's own accept and
-# masquerade rules live in a separate nftables table and cannot undo another
-# table's DROP verdict.
+# Docker and libvirt both drive the host firewall, and Docker's startup churn
+# breaks a Windows guest on 'virbr0' in two separate ways:
 #
-# The fix is an ACCEPT for the bridge in Docker's DOCKER-USER chain, the
-# injection point Docker documents and never flushes. Docker recreates that
-# chain empty on every daemon start, so the rule goes in a systemd unit ordered
-# after (and PartOf) docker.service; a permanent firewalld direct rule covers
-# 'firewall-cmd --reload', which makes Docker rebuild its chains too.
+#   1. FORWARD is DROP.  Docker's iptables setup sets the FORWARD chain policy
+#      to DROP with no exception for a libvirt NAT network, so a routed packet
+#      from the guest never reaches the internet - libvirt's own accept and
+#      masquerade rules live in a separate nftables table and cannot undo
+#      another table's DROP verdict.  The fix is an ACCEPT for the bridge in
+#      Docker's DOCKER-USER chain, the injection point Docker documents and
+#      never flushes.
+#
+#   2. virbr0 loses its firewalld zone.  When firewalld is running, virtnetworkd
+#      puts virbr0 in the 'libvirt' zone (the zone that permits the guest's DHCP
+#      and DNS to dnsmasq on the host).  Docker starting up makes firewalld
+#      rebuild its ruleset, which drops that runtime-only interface->zone
+#      assignment, and libvirt does not re-add it.  virbr0 then falls to the
+#      default zone, DHCP (udp/67) and DNS are blocked, and the guest gets no IP
+#      at all.  The fix is to pin virbr0 to the 'libvirt' zone in firewalld's
+#      permanent config and re-assert it whenever Docker restarts.
+#
+# Docker recreates DOCKER-USER empty on every daemon start, so both fixes go in
+# a systemd unit ordered after (and PartOf) docker.service; a permanent
+# firewalld direct rule and the permanent zone pin cover 'firewall-cmd
+# --reload', which makes Docker rebuild its chains too.
 #
 # Only touched when Docker is actually present with its iptables driver active
 # (the DOCKER-USER chain exists) - a host without Docker needs none of it.
@@ -5677,24 +5696,35 @@ winapps_fix_docker_libvirt_forward() {
     bridge="$(winapps_docker_bridge)"
     unit="$(basename "$WINAPPS_DOCKER_FWD_UNIT")"
 
-    if [[ $DRY_RUN -eq 0 ]] && systemctl is-enabled --quiet "$unit" >/dev/null 2>&1; then
-        ok "Docker/libvirt forwarding rule already in place ($unit)"
-        return 0
+    # An enabled unit that already carries the libvirt-zone line is current;
+    # anything older is upgraded in place (the operator consented once already,
+    # so no second prompt). A brand-new install still asks.
+    local unit_current=0
+    if [[ $DRY_RUN -eq 0 ]] \
+       && systemctl is-enabled --quiet "$unit" >/dev/null 2>&1 \
+       && grep -q 'zone=libvirt' "$WINAPPS_DOCKER_FWD_UNIT" 2>/dev/null; then
+        unit_current=1
     fi
 
-    printf '\n'
-    note "Docker is installed. When it runs it filters the FORWARD firewall"
-    note "chain, which stops the Windows VM on '$bridge' reaching the internet"
-    note "(it still gets a DHCP address, so the fault looks like DNS)."
-    confirm "Add a permanent rule letting the '$bridge' bridge through Docker's chain?" "y" || {
-        note "Left the firewall alone. Re-run this step to add the rule later,"
-        note "or the VM will have no outbound network while Docker is running."
-        return 0
-    }
+    if [[ $unit_current -eq 1 ]]; then
+        ok "Docker/libvirt bridge unit already in place ($unit)"
+    else
+        if [[ ! -e "$WINAPPS_DOCKER_FWD_UNIT" ]]; then
+            printf '\n'
+            note "Docker is installed. While it runs it drives the host firewall,"
+            note "which cuts the Windows VM on '$bridge' off from the network - no"
+            note "outbound traffic, and with firewalld active no DHCP or DNS to the"
+            note "host either, so the guest gets no IP at all."
+            confirm "Add a rule keeping '$bridge' working while Docker runs?" "y" || {
+                note "Left the firewall alone. Re-run this step to add the rule later,"
+                note "or the VM will have no network while Docker is running."
+                return 0
+            }
+        fi
 
-    winapps_install_file "$WINAPPS_DOCKER_FWD_UNIT" 0644 <<UNIT
+        winapps_install_file "$WINAPPS_DOCKER_FWD_UNIT" 0644 <<UNIT
 [Unit]
-Description=Allow the libvirt NAT bridge ($bridge) through Docker's DOCKER-USER chain
+Description=Keep the libvirt NAT bridge ($bridge) working while Docker manages the firewall
 After=docker.service
 Wants=docker.service
 PartOf=docker.service
@@ -5704,6 +5734,7 @@ Type=oneshot
 RemainAfterExit=yes
 ExecStart=/bin/sh -c 'iptables -C DOCKER-USER -i $bridge -j ACCEPT 2>/dev/null || iptables -I DOCKER-USER -i $bridge -j ACCEPT'
 ExecStart=/bin/sh -c 'iptables -C DOCKER-USER -o $bridge -j ACCEPT 2>/dev/null || iptables -I DOCKER-USER -o $bridge -j ACCEPT'
+ExecStart=/bin/sh -c 'command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld && firewall-cmd --zone=libvirt --change-interface=$bridge >/dev/null 2>&1 || true'
 ExecStop=/bin/sh -c 'iptables -D DOCKER-USER -i $bridge -j ACCEPT 2>/dev/null || true'
 ExecStop=/bin/sh -c 'iptables -D DOCKER-USER -o $bridge -j ACCEPT 2>/dev/null || true'
 
@@ -5711,17 +5742,21 @@ ExecStop=/bin/sh -c 'iptables -D DOCKER-USER -o $bridge -j ACCEPT 2>/dev/null ||
 WantedBy=multi-user.target docker.service
 UNIT
 
-    [[ $DRY_RUN -eq 1 ]] && return 0
+        [[ $DRY_RUN -eq 1 ]] && return 0
 
-    run_quiet systemctl daemon-reload
-    if run_quiet systemctl enable --now "$unit"; then
-        ok "The '$bridge' bridge is now allowed through Docker's FORWARD chain"
-    else
-        warn "Could not start $unit (see log)."
+        run_quiet systemctl daemon-reload
+        if run_quiet systemctl enable --now "$unit"; then
+            ok "The '$bridge' bridge is kept reachable while Docker runs ($unit)"
+        else
+            warn "Could not start $unit (see log)."
+        fi
     fi
 
+    [[ $DRY_RUN -eq 1 ]] && return 0
+
     # firewalld re-applies its direct rules on every reload, including the one
-    # that makes Docker rebuild DOCKER-USER.
+    # that makes Docker rebuild DOCKER-USER. Both blocks below are idempotent,
+    # so they also run on a re-invocation against an already-current unit.
     if have firewall-cmd && systemctl is-active --quiet firewalld 2>/dev/null; then
         local dir
         for dir in "-i $bridge" "-o $bridge"; do
@@ -5732,7 +5767,17 @@ UNIT
             run_quiet firewall-cmd --permanent --direct --add-rule \
                 ipv4 filter DOCKER-USER 0 $dir -j ACCEPT
         done
-        ok "firewalld: direct rule stored for '$bridge' (applied on the next reload)"
+        ok "firewalld: DOCKER-USER rule stored for '$bridge' (applied on the next reload)"
+
+        # Docker's firewalld churn also knocks virbr0 out of the 'libvirt' zone,
+        # which is what lets the guest reach dnsmasq for DHCP and DNS. Pin it
+        # there in permanent config (survives 'firewall-cmd --reload') and
+        # re-assert it now so a currently-broken host is fixed on this run.
+        if firewall-cmd --get-zones 2>/dev/null | grep -qw libvirt; then
+            run_quiet firewall-cmd --permanent --zone=libvirt --change-interface="$bridge"
+            run_quiet firewall-cmd --zone=libvirt --change-interface="$bridge"
+            ok "firewalld: '$bridge' pinned to the libvirt zone (guest DHCP + DNS)"
+        fi
     fi
 }
 

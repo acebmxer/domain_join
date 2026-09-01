@@ -1434,10 +1434,12 @@ check "accepting the power cycle shuts down then starts" "1|1" \
                          "$(grep -c 'start IT-VM' "$WA_TMP/pc.log")" )"
 
 section "WinApps: Docker / libvirt bridge coexistence"
-# winapps_fix_docker_libvirt_forward installs a systemd unit (and a firewalld
-# direct rule) so a guest on virbr0 still reaches the internet when Docker has
-# taken over the FORWARD chain. It must stay out of the way when Docker is
-# absent, when Docker's iptables driver is off, or when the operator declines.
+# winapps_fix_docker_libvirt_forward installs a systemd unit (and firewalld
+# permanent config) so a guest on virbr0 keeps working when Docker drives the
+# host firewall: a DOCKER-USER ACCEPT for outbound traffic, and virbr0 pinned to
+# the firewalld 'libvirt' zone for the guest's DHCP and DNS. It must stay out of
+# the way when Docker is absent, when its iptables driver is off, or when the
+# operator declines.
 FWD_UNIT="$WA_TMP/libvirt-docker-forward.service"
 FWD_FWLOG="$WA_TMP/fw.log"
 
@@ -1457,7 +1459,10 @@ run_fix() { (
         *) return 0 ;; esac; }
     virsh() { printf 'Bridge:          virbr9\n'; }
     firewall-cmd() { echo "$*" >>"$FWD_FWLOG"
-                     case "$*" in *--query-rule*) return 1 ;; *) return 0 ;; esac; }
+                     case "$*" in
+                        *--get-zones*)  echo "block dmz docker libvirt public trusted" ;;
+                        *--query-rule*) return 1 ;;
+                        *)              return 0 ;; esac; }
     confirm() { return "${FIX_CONFIRM:-0}"; }             # 0 = operator says yes
     run_quiet() { "$@" >/dev/null 2>&1; }
     winapps_install_file() { local d="$1"; shift; cat > "$d"; }
@@ -1467,14 +1472,20 @@ run_fix() { (
 
 rm -f "$FWD_UNIT"; : >"$FWD_FWLOG"
 HAS_DOCKER=1 NO_CHAIN=0 UNIT_ENABLED=1 FIX_CONFIRM=0 run_fix
-check_line "the unit names the discovered bridge" 'Description=Allow the libvirt NAT bridge (virbr9)' "$FWD_UNIT"
+check_line "the unit names the discovered bridge" 'Description=Keep the libvirt NAT bridge (virbr9)' "$FWD_UNIT"
 check_line "the unit is ordered after docker"     'After=docker.service'  "$FWD_UNIT"
 check_line "the unit is PartOf docker"            'PartOf=docker.service' "$FWD_UNIT"
 check_line "it accepts inbound bridge traffic"    'iptables -I DOCKER-USER -i virbr9 -j ACCEPT' "$FWD_UNIT"
 check_line "it accepts outbound bridge traffic"   'iptables -I DOCKER-USER -o virbr9 -j ACCEPT' "$FWD_UNIT"
 check_line "it checks the rule before inserting"  'iptables -C DOCKER-USER -i virbr9 -j ACCEPT 2>/dev/null ||' "$FWD_UNIT"
+check_line "the unit re-pins the bridge to the libvirt zone" \
+      'firewall-cmd --zone=libvirt --change-interface=virbr9' "$FWD_UNIT"
 check "it also stores a permanent firewalld rule" "2" \
       "$(grep -c -- '--add-rule ipv4 filter DOCKER-USER 0' "$FWD_FWLOG")"
+check_line "it pins the bridge to the libvirt zone in permanent config" \
+      '--permanent --zone=libvirt --change-interface=virbr9' "$FWD_FWLOG"
+check "it re-asserts the libvirt zone now (runtime call)" "1" \
+      "$(grep -c '^--zone=libvirt --change-interface=virbr9$' "$FWD_FWLOG")"
 
 rm -f "$FWD_UNIT"; : >"$FWD_FWLOG"
 HAS_DOCKER=0 run_fix
@@ -1491,9 +1502,15 @@ HAS_DOCKER=1 NO_CHAIN=0 UNIT_ENABLED=1 FIX_CONFIRM=1 run_fix
 check "declining leaves the firewall alone" "no|0" \
       "$([[ -e "$FWD_UNIT" ]] && echo yes || echo no)|$(grep -c . "$FWD_FWLOG")"
 
-printf 'SENTINEL\n' >"$FWD_UNIT"; : >"$FWD_FWLOG"
+printf 'SENTINEL zone=libvirt\n' >"$FWD_UNIT"; : >"$FWD_FWLOG"
 HAS_DOCKER=1 NO_CHAIN=0 UNIT_ENABLED=0 run_fix
-check "an already-enabled unit is not rewritten" "SENTINEL" "$(cat "$FWD_UNIT")"
+check "an up-to-date enabled unit is not rewritten" "SENTINEL zone=libvirt" "$(cat "$FWD_UNIT")"
+
+# A unit written before the zone fix is upgraded in place, with no re-prompt.
+printf 'Description=old\nAfter=docker.service\n' >"$FWD_UNIT"; : >"$FWD_FWLOG"
+HAS_DOCKER=1 NO_CHAIN=0 UNIT_ENABLED=0 FIX_CONFIRM=1 run_fix
+check_line "a pre-zone-fix unit is upgraded in place" \
+      'firewall-cmd --zone=libvirt --change-interface=virbr9' "$FWD_UNIT"
 
 rm -f "$FWD_UNIT"; : >"$FWD_FWLOG"
 HAS_DOCKER=1 NO_CHAIN=0 UNIT_ENABLED=1 FIX_CONFIRM=0 HAS_FWD=0 run_fix

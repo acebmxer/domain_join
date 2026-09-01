@@ -142,23 +142,35 @@ drivers answer before doing any multi-GB ISO work.
 
 ### Docker on the same host
 
-Docker's default firewall setup sets the `FORWARD` chain policy to `DROP` and
-adds no exception for a libvirt NAT network. The Windows guest then gets a DHCP
-lease (that traffic goes to the host and is never forwarded) but no routed
-packet reaches the internet — the fault looks like broken DNS. libvirt's own
-accept and masquerade rules live in a separate nftables table and cannot undo
-Docker's `DROP`.
+Docker and libvirt both drive the host firewall, and Docker's startup churn
+breaks a guest on `virbr0` two separate ways:
+
+- **No outbound traffic.** Docker's default setup sets the `FORWARD` chain
+  policy to `DROP` with no exception for a libvirt NAT network, so a routed
+  packet from the guest never reaches the internet — the fault looks like broken
+  DNS. libvirt's own accept and masquerade rules live in a separate nftables
+  table and cannot undo Docker's `DROP`.
+
+- **No IP at all**, when firewalld is running. `virtnetworkd` puts `virbr0` in
+  the firewalld `libvirt` zone — the zone that lets the guest reach `dnsmasq`
+  for DHCP and DNS. Docker starting up makes firewalld rebuild its ruleset,
+  which drops that runtime-only interface-to-zone assignment; libvirt does not
+  re-add it, `virbr0` falls to the default zone, and the guest's DHCP (udp/67)
+  and DNS are blocked.
 
 When it sees Docker installed with its iptables driver active, the WinApps step
 offers to install `libvirt-docker-forward.service` — a one-shot unit, ordered
 `After=` and `PartOf=` `docker.service`, that adds an `ACCEPT` for the libvirt
-bridge (`virbr0` unless renamed) to Docker's `DOCKER-USER` chain. Docker
-recreates that chain empty on every daemon start, so the unit re-applies the
-rule each time; a matching permanent firewalld direct rule covers
-`firewall-cmd --reload`, which makes Docker rebuild its chains too. Declining
-the prompt leaves the firewall untouched — the guest just has no outbound
-network while Docker is running. `--winapps-remove` disables the unit and drops
-the firewalld rule.
+bridge (`virbr0` unless renamed) to Docker's `DOCKER-USER` chain **and** re-pins
+the bridge to the `libvirt` zone. Docker rebuilds its chains on every daemon
+start, so the unit re-applies both each time. A permanent firewalld direct rule
+and a permanent `libvirt`-zone interface binding cover `firewall-cmd --reload`,
+and the step re-asserts the zone straight away so a host that is already broken
+is fixed on the spot. An install from before this behaviour existed is upgraded
+in place without a second prompt. Declining the prompt leaves the firewall
+untouched — the guest just has no network while Docker is running.
+`--winapps-remove` disables the unit, drops the firewalld direct rule and
+removes the permanent zone binding.
 
 Supply the install media with `--winapps-iso FILE`. This has to be the full
 path to the `.iso` file itself — filename included, e.g.
@@ -402,8 +414,8 @@ Windows has to exist first:
 2. Run this script's WinApps step. It installs FreeRDP and the virtualisation
    stack, writes the template, generator and login hooks, seeds existing
    accounts, grants an AD group access to `qemu:///system`
-   ([above](#who-can-launch-apps-and-who-can-drive-the-vm)), fixes libvirt
-   forwarding if Docker is in the way
+   ([above](#who-can-launch-apps-and-who-can-drive-the-vm)), keeps the VM's
+   network working if Docker is in the way
    ([above](#docker-on-the-same-host)), and offers to
    **build the Windows VM** ([above](#building-the-vm)).
 3. **Join Windows to the domain.** The script never does this — not even for a
