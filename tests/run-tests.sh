@@ -1031,6 +1031,45 @@ check "main sends --winapps-vm-remove straight to removal" "REMOVE" \
 check_contains "the uninstall hint passes --system" "--system" \
       "$( ( DRY_RUN=1; winapps_remove 2>/dev/null | grep -F 'setup.sh' ) )"
 
+# winapps_installed: the trigger for the menu offering removal rather than only
+# a reconfigure. Point every footprint path at a temp dir so the check is
+# hermetic on a machine that does or does not have WinApps.
+wa_rm_tmp="$(mktemp -d)"
+wa_is_installed() {
+    ( WINAPPS_TEMPLATE="$wa_rm_tmp/tpl"; WINAPPS_SEEDER="$wa_rm_tmp/seed"
+      WINAPPS_SYS_LAUNCHER="$wa_rm_tmp/bin"; WINAPPS_ETC_DIR="$wa_rm_tmp/etc"
+      winapps_installed && printf 'yes' || printf 'no' )
+}
+check "winapps_installed: false with no footprint" "no" "$(wa_is_installed)"
+: > "$wa_rm_tmp/tpl"
+check "winapps_installed: true once the template exists" "yes" "$(wa_is_installed)"
+rm -f "$wa_rm_tmp/tpl"
+mkdir -p "$wa_rm_tmp/etc"; : > "$wa_rm_tmp/etc/setup.sh"
+check "winapps_installed: upstream setup.sh alone is enough" "yes" "$(wa_is_installed)"
+rm -rf "$wa_rm_tmp/etc"
+
+# The clean-slate depth: WINAPPS_REMOVE_CLEAN makes winapps_remove also call the
+# upstream uninstaller and clear the per-user configs it leaves behind.
+clean_dryrun="$( ( DRY_RUN=1; WINAPPS_REMOVE_CLEAN=1
+                   winapps_remove 2>/dev/null ) )"
+check_contains "clean slate runs the upstream --system --uninstall" "--system" \
+      "$(printf '%s\n' "$clean_dryrun" | grep -F 'setup.sh --system --uninstall')"
+check_contains "clean slate clears the per-user winapps.conf" "~/.config/winapps/winapps.conf" \
+      "$(printf '%s\n' "$clean_dryrun" | grep -F 'Clearing every user')"
+
+# winapps_remove_interactive: 'clean' sets the flag before calling winapps_remove;
+# 'wiring' leaves it at 0. menu_single is stubbed to return the forced key.
+wa_rm_depth() {
+    ( _WA_PICK="$1"
+      menu_single() { printf -v "$1" '%s' "$_WA_PICK"; }
+      winapps_remove() { printf 'CLEAN=%s' "$WINAPPS_REMOVE_CLEAN"; }
+      WINAPPS_REMOVE_CLEAN=0
+      winapps_remove_interactive )
+}
+check "winapps_remove_interactive: 'clean' sets the flag" "CLEAN=1" "$(wa_rm_depth clean)"
+check "winapps_remove_interactive: 'wiring' leaves it off"  "CLEAN=0" "$(wa_rm_depth wiring)"
+rm -rf "$wa_rm_tmp"
+
 # An invalid enum must stop the run rather than be carried into a config file.
 # 'kerberos' was a mode once; it is not any more (WinApps dials the guest by IP,
 # which Kerberos cannot ticket) and must now be rejected like any other unknown.

@@ -16,6 +16,21 @@ changed — not that an artefact was published anywhere.
 
 ## [Unreleased]
 
+### Added
+
+- **The "Windows apps for every user" menu step can now remove WinApps, not
+  only reconfigure it.** When it finds WinApps already set up on an interactive
+  run it asks first: *Revisit the settings* (what it did before) or *Remove
+  WinApps*. Removal then asks how far to go — *the multi-user wiring only* (the
+  same as `--winapps-remove`), or *a clean slate*, which also runs the upstream
+  `setup.sh --system --uninstall`, deletes the upstream source tree and every
+  user's `~/.config/winapps/winapps.conf`, and still asks before destroying the
+  Windows VM. The clean-slate option is the one-stop teardown before a
+  from-scratch reinstall; previously it took `--winapps-remove
+  --winapps-vm-remove` plus two commands the script only printed as a hint.
+  Flag-directed and `-y` runs are unaffected — they stay on the configure path,
+  and `--winapps-remove` still short-circuits straight to removal as before.
+
 ### Removed
 
 - **The `kerberos` WinApps credential mode is gone.** `--winapps-creds` now takes

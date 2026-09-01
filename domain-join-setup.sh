@@ -120,6 +120,9 @@ OPT_VM_SYSTEM_LOCALE=""  # SystemLocale         (empty = the UI language)
 OPT_VM_USER_LOCALE=""    # UserLocale           (empty = the UI language)
 OPT_VM_INPUT_LOCALE=""   # InputLocale          (empty = 0409:00000409)
 WINAPPS_VM_REMOVE=0      # --winapps-vm-remove: also undefine the libvirt guest
+WINAPPS_REMOVE_CLEAN=0   # winapps_remove: also run the upstream --system --uninstall
+                         # and delete every user's ~/.config/winapps/winapps.conf,
+                         # for a from-scratch reinstall. Set by the menu's remove path.
 
 # What to install. Filled in by the choice builders, or by the matching flags.
 BACKEND=""
@@ -5477,13 +5480,75 @@ winapps_remove() {
         fi
     fi
 
+    # A clean slate: the upstream install and every generated per-user config,
+    # so the next run installs WinApps from scratch rather than refreshing it.
+    if (( WINAPPS_REMOVE_CLEAN )); then
+        printf '\n'
+        local up="$WINAPPS_ETC_DIR/setup.sh"
+        if [[ $DRY_RUN -eq 1 ]]; then
+            printf '%s  [dry-run]%s %s --system --uninstall\n' "$C_CYAN" "$C_RESET" "$up"
+        elif [[ -x "$up" ]]; then
+            run "$up" --system --uninstall \
+                || warn "The upstream WinApps uninstaller exited non-zero."
+        else
+            note "No $up here to run '--system --uninstall'; skipping it."
+        fi
+        # Upstream leaves its source tree and launchers; take them too.
+        local p
+        for p in "$WINAPPS_SYS_LAUNCHER" "${WINAPPS_SYS_LAUNCHER}-src" \
+                 "${WINAPPS_SYS_LAUNCHER}-setup"; do
+            [[ -e "$p" || -L "$p" ]] || continue
+            if [[ $DRY_RUN -eq 1 ]]; then
+                printf '%s  [dry-run]%s remove %s\n' "$C_CYAN" "$C_RESET" "$p"
+            else
+                rm -rf "$p" && ok "Removed $p"
+            fi
+        done
+        # Every generated per-user config, plus root's.
+        note "Clearing every user's ~/.config/winapps/winapps.conf"
+        local d conf
+        for d in /root /home/*; do
+            conf="$d/.config/winapps/winapps.conf"
+            [[ -e "$conf" ]] || continue
+            if [[ $DRY_RUN -eq 1 ]]; then
+                printf '%s  [dry-run]%s remove %s\n' "$C_CYAN" "$C_RESET" "$conf"
+            else
+                rm -f "$conf" && ok "Removed $conf"
+            fi
+        done
+    fi
+
     printf '\n'
-    note "Left in place on purpose:"
-    note "  - each user's ~/.config/winapps/winapps.conf"
-    note "  - the launchers in /usr/share/applications"
-    note "  - the cached ISOs in $WINAPPS_ISO_CACHE"
-    note "To remove those too:  sudo $WINAPPS_ETC_DIR/setup.sh --system --uninstall"
+    if (( WINAPPS_REMOVE_CLEAN )); then
+        note "Left in place on purpose:"
+        note "  - the cached ISOs in $WINAPPS_ISO_CACHE"
+    else
+        note "Left in place on purpose:"
+        note "  - each user's ~/.config/winapps/winapps.conf"
+        note "  - the launchers in /usr/share/applications"
+        note "  - the cached ISOs in $WINAPPS_ISO_CACHE"
+        note "To remove those too:  sudo $WINAPPS_ETC_DIR/setup.sh --system --uninstall"
+    fi
     return 0
+}
+
+# True when WinApps is set up here in any form - the multi-user wiring or just
+# the upstream install. The trigger for offering removal, not only a reconfigure.
+winapps_installed() {
+    [[ -e "$WINAPPS_TEMPLATE" || -e "$WINAPPS_SEEDER" \
+       || -e "$WINAPPS_SYS_LAUNCHER" || -e "$WINAPPS_ETC_DIR/setup.sh" ]]
+}
+
+# The menu's route into winapps_remove: choose how far the removal goes, set the
+# flag winapps_remove reads, then run it. Reached from configure_winapps when an
+# existing install is found on an interactive run.
+winapps_remove_interactive() {
+    local depth
+    menu_single depth "How much of WinApps should be removed?" "wiring" \
+        "wiring|The multi-user wiring only|Removes the config template, the per-user generator, the login hooks and the askpass and VM-deploy helpers. The upstream launchers, each user's own ~/.config/winapps/winapps.conf and the Windows VM stay." \
+        "clean|Everything - a clean slate|Also runs the upstream 'setup.sh --system --uninstall' (the launchers and /usr/local/bin/winapps), deletes the upstream source tree and every user's ~/.config/winapps/winapps.conf. You are still asked before the Windows VM is destroyed. Use this to reinstall WinApps from scratch."
+    [[ "$depth" == "clean" ]] && WINAPPS_REMOVE_CLEAN=1
+    winapps_remove
 }
 
 winapps_print_summary() {
@@ -5962,6 +6027,21 @@ configure_winapps() {
     heading "WinApps - Windows applications for every domain user"
 
     (( WINAPPS_REMOVE )) && { winapps_remove; return $?; }
+
+    # An existing install can be taken back out from here, not only reconfigured
+    # - which is what someone rebuilding from scratch wants. The WinApps flags
+    # all name settings to write, so a flag-directed run stays on the configure
+    # path; only a bare interactive visit is offered the choice.
+    if winapps_installed && [[ $ASSUME_YES -ne 1 && $CLI_DIRECTED -ne 1 ]]; then
+        local what
+        menu_single what "WinApps is already set up on this machine." "reconfigure" \
+            "reconfigure|Revisit the settings|Rewrites the template, generator and login hooks from your answers, re-seeds the users who already exist and offers the VM build again. Nothing is removed." \
+            "remove|Remove WinApps|Takes the multi-user wiring back out, and optionally the upstream launchers, every user's config and the Windows VM. The clean-slate option before a fresh install."
+        if [[ "$what" == "remove" ]]; then
+            winapps_remove_interactive
+            return $?
+        fi
+    fi
 
     wrap_text "  " "WinApps makes individual Windows programs appear as ordinary entries in this machine's application menu, launched over RDP. Installed system-wide the launchers are shared by every account, and this step adds what upstream leaves out: a per-user configuration generated at login, so each domain user reaches Windows as themselves."
     printf '\n'
@@ -6689,7 +6769,7 @@ MENU_HINTS=(
     "Short usernames, who is allowed to log in, and then the sudo rights"
     "Give an account or a group sudo through its own /etc/sudoers.d file"
     "Second factor for local and domain logins via Duo Unix, or remove it"
-    "Windows programs in the app menu, configured per domain user via WinApps"
+    "Windows programs in the app menu per domain user, or remove WinApps"
     "Re-run the WinApps program scan - after the first install and any app change"
     "Read-only: hostname, clock, DNS, membership and service state"
 )

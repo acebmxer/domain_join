@@ -467,6 +467,13 @@ sudo ./domain-join-setup.sh --winapps-remove   # take the wiring back out
 sudo ./domain-join-setup.sh --winapps-vm-remove # ...and delete the libvirt guest
 ```
 
+Removal is also in the menu: pick **Windows apps for every user** when WinApps is
+already installed and it offers **Remove WinApps** alongside reconfiguring. The
+remove path then asks whether to take out just the multi-user wiring or go to a
+**clean slate** — the upstream launchers, the source tree and every user's
+`~/.config/winapps/winapps.conf` as well, still prompting before the VM is
+destroyed. Use the clean slate to reinstall WinApps from scratch.
+
 New apps installed in Windows need one re-scan on the machine
 (`setup.sh --system --add-apps`); new *users* need nothing at all — they are
 configured the moment they log in.
