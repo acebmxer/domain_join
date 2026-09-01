@@ -83,7 +83,28 @@ changed — not that an artefact was published anywhere.
   documentation now notes that putting that group (or another) into the guest's
   local Administrators, e.g. by GPO, is what enables it.
 
+- **The README is cut to a lean front page.** It went from ~1300 lines to ~270:
+  what the tool is, the menu, supported systems, the choices, usage, the
+  post-install summary, verification and troubleshooting. The deep-dive material
+  moved verbatim into `docs/` — `sudo.md`, `duo.md`, `winapps.md`,
+  `sddm-user-list.md`, `short-usernames.md` and `development.md` (tests and
+  releases) — each linked from a "Read next" table near the top. The deep-dive
+  pages keep their full text; the README's own sections were tightened.
+
 ### Fixed
+
+- **The Windows VM builder starts libvirt's modular daemons first.** On Fedora,
+  RHEL and their rebuilds libvirt is split into a daemon per driver
+  (`virtqemud` for the hypervisor, `virtstoraged` for disks, `virtnetworkd` for
+  networks), each socket-activated but only once its `.socket` unit is
+  listening. On a libvirt that was just installed and not yet rebooted those
+  sockets are enabled but not started, so `winapps-vm-deploy` passed its `virsh
+  version` preflight — which only wakes the hypervisor daemon — and then died
+  mid-build with `Failed to connect socket to '…/virtstoraged-sock'`. The
+  builder now starts whichever modular sockets are present (falling back to the
+  monolithic `libvirtd`) and confirms the storage and network drivers answer
+  before it does any multi-GB ISO work. The same missing daemon was also why
+  the `default` network came up "not defined".
 
 - **Re-scanning Windows for installed apps works.** The scan re-ran the upstream
   installer as `setup.sh --system`, which aborts with "EXISTING 'SYSTEM'

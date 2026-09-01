@@ -4345,8 +4345,34 @@ done
 [ -e /dev/kvm ] || die "/dev/kvm is missing - enable VT-x/AMD-V in the firmware."
 { [ -r /dev/kvm ] && [ -w /dev/kvm ]; } || \
     warn "no read/write access to /dev/kvm - the guest may fail to start."
+# Fedora and other distros that use libvirt's modular daemons ship a separate
+# socket per driver - virtqemud (hypervisor), virtstoraged (disks) and
+# virtnetworkd (networks). They are socket-activated, but only once the
+# .socket unit is listening; on a libvirt that was just installed and not yet
+# rebooted the sockets are enabled but not started, and virt-install dies
+# partway with "Failed to connect socket to '.../virtstoraged-sock'". Start
+# whichever modular sockets exist, else fall back to the monolithic libvirtd.
+if command -v systemctl >/dev/null 2>&1; then
+    _modular=0
+    for _u in virtqemud virtstoraged virtnetworkd virtnodedevd; do
+        systemctl cat "$_u.socket" >/dev/null 2>&1 || continue
+        _modular=1
+        systemctl start "$_u.socket" >/dev/null 2>&1 || true
+    done
+    if [ "$_modular" = "0" ]; then
+        systemctl start libvirtd.socket >/dev/null 2>&1 \
+            || systemctl start libvirtd >/dev/null 2>&1 || true
+    fi
+fi
+
 virsh -c "$LIBVIRT_URI" version >/dev/null 2>&1 || \
-    die "cannot reach libvirt at $LIBVIRT_URI - is libvirtd running?"
+    die "cannot reach libvirt at $LIBVIRT_URI - is libvirtd (or virtqemud) running?"
+# 'version' only wakes the hypervisor daemon; virt-install also needs the
+# storage and network drivers, so confirm those respond before the ISO work.
+virsh -c "$LIBVIRT_URI" pool-list --all >/dev/null 2>&1 || \
+    die "cannot reach the libvirt storage driver - start virtstoraged.socket (or libvirtd)."
+virsh -c "$LIBVIRT_URI" net-list --all >/dev/null 2>&1 || \
+    die "cannot reach the libvirt network driver - start virtnetworkd.socket (or libvirtd)."
 
 _ovmf=""
 for f in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd \
