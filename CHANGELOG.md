@@ -18,6 +18,16 @@ changed — not that an artefact was published anywhere.
 
 ### Removed
 
+- **The `kerberos` WinApps credential mode is gone.** `--winapps-creds` now takes
+  `askpass` (default) or `shared` only. The mode never delivered single sign-on:
+  the WinApps launcher reaches the libvirt guest by its NAT IP address, and
+  Kerberos cannot issue a service ticket for an IP, so FreeRDP always fell back
+  to NLA-over-NTLM and prompted for a password anyway — the same prompt `askpass`
+  gives, which at least caches in the session keyring. Real SSO would need the
+  guest pinned to a stable address, its AD name resolvable from the host, and the
+  launcher connecting by that name; that is out of scope for this installer.
+  `--winapps-creds kerberos` is now rejected like any other unknown value.
+
 - **WinApps is libvirt-only now.** The `docker`, `podman` and `manual` backends
   are gone, along with `--winapps-backend`, `--winapps-host` and
   `--winapps-port`. The containers this tool would never domain-join, and a
@@ -92,6 +102,18 @@ changed — not that an artefact was published anywhere.
   pages keep their full text; the README's own sections were tightened.
 
 ### Fixed
+
+- **`winapps-user-config --all` now reaches domain accounts.** The bulk re-seed
+  (used to push a template change to everyone already provisioned) walked
+  `getent passwd` only, which on a normal SSSD setup does not enumerate domain
+  users — so a template change never propagated to them and they kept a stale
+  `~/.config/winapps/winapps.conf` until their next login. `--all` now also
+  walks real home directories under `/home`, taking each account's login name
+  from the directory owner (resolved the same way `id -un` resolves it at
+  login, so `DOMAIN\user` and `user@realm` come out identical). Accounts already
+  handled from `getent` are revisited and skipped on the template checksum, so
+  the overlap costs nothing. The per-login seeding was unaffected — it always
+  ran for whoever logged in, local or domain.
 
 - **The Windows VM builder starts libvirt's modular daemons first.** On Fedora,
   RHEL and their rebuilds libvirt is split into a daemon per driver

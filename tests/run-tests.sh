@@ -1032,7 +1032,9 @@ check_contains "the uninstall hint passes --system" "--system" \
       "$( ( DRY_RUN=1; winapps_remove 2>/dev/null | grep -F 'setup.sh' ) )"
 
 # An invalid enum must stop the run rather than be carried into a config file.
-for bad in "--winapps-creds telepathy"; do
+# 'kerberos' was a mode once; it is not any more (WinApps dials the guest by IP,
+# which Kerberos cannot ticket) and must now be rejected like any other unknown.
+for bad in "--winapps-creds telepathy" "--winapps-creds kerberos"; do
     if ( parse_args $bad ) >/dev/null 2>&1; then
         printf '  %s %s was accepted\n' "$(red FAIL)" "$bad"; ((FAIL++))
     else
@@ -1195,6 +1197,16 @@ seed_as jdoe >/dev/null
 check "a copy without the marker is left alone" 'RDP_USER="hand-edited"' \
       "$(grep '^RDP_USER=' "$OWN")"
 
+# --all must not rely on 'getent passwd' alone: SSSD does not enumerate domain
+# accounts by default, so the branch also walks real home directories and takes
+# the login from each directory's owner.
+if grep -qF 'for _h in /home/*' "$WINAPPS_SEEDER" \
+   && grep -qF "stat -c '%U'" "$WINAPPS_SEEDER"; then
+    printf '  %s --all falls back to /home for non-enumerable domain accounts\n' "$(green PASS)"; ((PASS++))
+else
+    printf '  %s --all only reads getent passwd, missing domain accounts\n' "$(red FAIL)"; ((FAIL++))
+fi
+
 section "WinApps: the root program-scan config"
 # winapps_seed_scan_config writes root's ~/.config/winapps for the program scan.
 # The default is the guest's local admin (all a fresh or not-yet-joined guest
@@ -1202,7 +1214,7 @@ section "WinApps: the root program-scan config"
 SCAN_HOME="$WA_TMP/scanroot"; mkdir -p "$SCAN_HOME"
 WINAPPS_TEMPLATE="$WA_TMP/scan.template"
 ( OPT_WINAPPS_LAUNCHER_RO="yes"
-  winapps_write_template "CORP.EXAMPLE.COM" "kerberos" "IT-VM" ) >/dev/null 2>&1
+  winapps_write_template "CORP.EXAMPLE.COM" "askpass" "IT-VM" ) >/dev/null 2>&1
 ( HOME="$SCAN_HOME"; OPT_WINAPPS_VM_ADMIN="admin"; OPT_WINAPPS_VM_PASS="p'wd"
   winapps_seed_scan_config /etc/winapps/setup.sh ) >/dev/null 2>&1
 SCAN_CONF="$SCAN_HOME/.config/winapps/winapps.conf"
@@ -1221,11 +1233,6 @@ fi
 check_line "it blanks the RDP domain"                       'RDP_DOMAIN=""'    "$SCAN_CONF"
 check_line "it keeps the libvirt VM name for IP discovery"  'VM_NAME="IT-VM"'  "$SCAN_CONF"
 check_line "it points RDP_ASKPASS at the scan helper"       'scan-askpass'     "$SCAN_CONF"
-if grep -qF '/sec:nla' "$SCAN_CONF"; then
-    printf '  %s it left Kerberos NLA on a local-account connection\n' "$(red FAIL)"; ((FAIL++))
-else
-    printf '  %s it drops Kerberos NLA for the local-account connection\n' "$(green PASS)"; ((PASS++))
-fi
 if grep -qF '/cert:ignore' "$SCAN_CONF" && ! grep -qF '/cert:tofu' "$SCAN_CONF"; then
     printf '  %s it tolerates the guest cert changing on domain join (/cert:ignore)\n' "$(green PASS)"; ((PASS++))
 else

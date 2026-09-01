@@ -25,7 +25,7 @@ work for *every* domain user rather than for one account.
       --winapps-vm-autostart, --no-...
                           'virsh autostart' the guest (default: on)
       --winapps-domain D  RDP_DOMAIN (default: the realm this machine joined)
-      --winapps-creds M   askpass | kerberos | shared
+      --winapps-creds M   askpass | shared
       --winapps-user USER Windows service account, 'shared' mode only
       --winapps-remove    Remove the multi-user wiring
       --winapps-vm-remove With --winapps-remove, also delete the libvirt guest
@@ -383,8 +383,14 @@ and its disk first).
 | Mode | Description |
 | --- | --- |
 | **askpass** *(default)* | Each user is prompted for their own AD password, handed to FreeRDP through its askpass interface — so it never appears on a command line or in the WinApps log. Cached in the kernel *session* keyring where `keyctl` is available, so it is asked once per login rather than once per app, and it dies with the session. Nothing is stored on disk. |
-| **kerberos** | Single sign-on from the ticket SSSD obtained at login. The best experience when it works, but it needs the Windows host domain-joined with a correct SPN and a ticket cache FreeRDP can read. **Not verified against a live domain — treat it as the thing to aim for, not to switch on blind.** Falls back to a prompt. |
 | **shared** | Everyone connects as one service account. Appropriate for a kiosk; on a multi-user machine it defeats the domain join, because all users land in one Windows profile and the directory cannot tell them apart. |
+
+Kerberos single sign-on is **not** an option. WinApps reaches the libvirt guest
+by its NAT IP address, and Kerberos cannot issue a service ticket for an IP — so
+FreeRDP falls back to NLA-over-NTLM, which needs a password anyway. Making SSO
+work would require pinning the guest to a stable address, resolving its AD name
+from the host, and connecting FreeRDP by that name; that is out of scope for this
+installer.
 
 ### Order of operations
 

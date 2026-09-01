@@ -81,7 +81,7 @@ DUO_BUILD_SOURCE=-1     # -1 = ask before building Duo Unix from source
 OPT_WINAPPS=-1           # -1 = ask, 0 = no, 1 = yes
 OPT_WINAPPS_VM=""        # VM_NAME of the local Windows guest (empty = RDPWindows)
 OPT_WINAPPS_DOMAIN=""    # RDP_DOMAIN (empty = derive from the joined realm)
-OPT_WINAPPS_CREDS=""     # askpass | kerberos | shared (empty = ask)
+OPT_WINAPPS_CREDS=""     # askpass | shared (empty = ask)
 OPT_WINAPPS_RDP_USER=""  # shared-credential mode only: the service account
 OPT_WINAPPS_RDP_PASS="${WINAPPS_RDP_PASS:-}"  # shared-credential mode only
 OPT_WINAPPS_LIBVIRT_GROUP=""  # AD group granted read-write qemu:///system (virt-manager); empty = ask/derive
@@ -3740,7 +3740,6 @@ winapps_freerdp_cmd() {
 winapps_choose_creds() {
     local -a entries=()
     entries+=("askpass|Ask each user for their own AD password  ${C_GREEN}(recommended)${C_RESET}|Nothing secret is stored on disk. The first time a user opens a Windows app they are prompted for their Active Directory password, which is handed to FreeRDP through its askpass interface and never appears on a command line or in a log. It is cached in the kernel session keyring where available, so they are asked once per login rather than once per app.")
-    entries+=("kerberos|Single sign-on with the user's Kerberos ticket|No password prompt at all: FreeRDP reuses the ticket SSSD obtained when the user logged into Linux. The cleanest experience by far, but it needs the Windows host domain-joined with a correct SPN and a ticket cache FreeRDP can read, so treat it as the thing to aim for rather than the thing to switch on blind. Falls back to a prompt if the ticket is refused.")
     entries+=("shared|One shared service account for everybody|Every user connects as the same Windows account, with its password stored in the root-owned template. Simple, and appropriate for a kiosk or a single shared appliance - but it defeats the point of the domain join, because all users land in one Windows profile and the directory cannot tell them apart. Not recommended on a multi-user machine.")
 
     menu_single OPT_WINAPPS_CREDS "How should users authenticate to Windows?" "askpass" "${entries[@]}"
@@ -3829,13 +3828,7 @@ winapps_write_template() {
         askpass_line="RDP_ASKPASS=\"$WINAPPS_ASKPASS\""
     fi
 
-    # Kerberos SSO: no password at all, and NLA told to use the ticket cache
-    # SSSD populated at login.
     flags='/cert:tofu /sound /microphone +home-drive'
-    if [[ "$creds" == "kerberos" ]]; then
-        askpass_line="RDP_ASKPASS=\"$WINAPPS_ASKPASS\"   # fallback if the ticket is refused"
-        flags="$flags /sec:nla"
-    fi
 
     # libvirt discovers the guest address from the VM itself; a hard-coded one
     # here would override that with something that goes stale on reboot.
@@ -3970,9 +3963,11 @@ winapps_write_seeder() {
 # display managers do not reliably source /etc/profile.d, so both are wired
 # up and the second one to run is a no-op).
 #
-# With --all, walks every home directory instead and seeds each one. That is
-# for pushing a template change out to users who are already logged in; the
-# per-user path needs no arguments and no privileges.
+# With --all, seeds every account on the machine instead - enumerable ones
+# from 'getent passwd', plus any real home directory under /home whose owner
+# 'getent' does not list (SSSD leaves domain accounts out of enumeration by
+# default). That is for pushing a template change out to users who are already
+# provisioned; the per-user path needs no arguments and no privileges.
 #
 # Exits 0 on every path it can. A login must not fail because a Windows
 # application launcher could not be configured.
@@ -4029,12 +4024,31 @@ seed_for() {
 
 if [ "\${1:-}" = "--all" ]; then
     [ "\$(id -u)" = "0" ] || { echo "--all must be run as root." >&2; exit 1; }
-    # getent covers domain accounts from SSSD/Winbind as well as local ones.
+
+    # Enumerable accounts: local, plus domain accounts only if SSSD/Winbind
+    # enumeration is switched on - which it is not by default.
     getent passwd 2>/dev/null | while IFS=: read -r _n _x _u _g _c _h _s; do
         [ "\$_u" -ge 1000 ] 2>/dev/null || continue
         case "\$_s" in */nologin|*/false) continue ;; esac
         seed_for "\$_n" "\$_h"
     done
+
+    # Domain accounts SSSD does not enumerate: walk real home directories and
+    # take the login name from the directory's owner. That is the same name
+    # 'id -un' hands the per-user path at login, resolved the same way, so
+    # 'DOMAIN\\user' and 'user@realm' come out identical to a normal login.
+    # A home already seeded above is re-visited here and returns early on the
+    # template stamp, so the overlap costs nothing.
+    for _h in /home/*; do
+        [ -d "\$_h" ] || continue
+        _n="\$(stat -c '%U' "\$_h" 2>/dev/null)" || continue
+        [ -n "\$_n" ] && [ "\$_n" != "UNKNOWN" ] || continue
+        case "\$_n" in *[!0-9]*) : ;; *) continue ;; esac  # all-digits = unresolved uid
+        _u="\$(id -u "\$_n" 2>/dev/null)" || continue
+        [ "\$_u" -ge 1000 ] 2>/dev/null || continue
+        seed_for "\$_n" "\$_h"
+    done
+
     exit 0
 fi
 
@@ -5129,9 +5143,7 @@ winapps_seed_scan_config() {
     fi
 
     # Start from the template so libvirt IP discovery (VM_NAME) is preserved,
-    # then override: the scan account, its domain (blank = local), no forced
-    # Kerberos NLA (FreeRDP still negotiates NLA over NTLM, which needs no
-    # ticket - root has none).
+    # then override: the scan account and its domain (blank = local).
     #
     # '/cert:tofu' becomes '/cert:ignore' for this one connection. The guest's
     # self-signed RDP certificate is regenerated whenever its hostname changes -
@@ -5146,7 +5158,6 @@ winapps_seed_scan_config() {
         -e "s|^RDP_DOMAIN=.*|RDP_DOMAIN=\"$scan_domain\"|" \
         -e 's|^RDP_PASS=.*|RDP_PASS=""|' \
         -e "s|^RDP_ASKPASS=.*|RDP_ASKPASS=\"$askpass\"|" \
-        -e 's| /sec:nla||' \
         -e 's|/cert:tofu|/cert:ignore|' \
         -e '/^# >>> domain-join-setup: read-only libvirt access >>>/,/^# <<< domain-join-setup: read-only libvirt access <<</d' \
         "$WINAPPS_TEMPLATE" >"$HOME/.config/winapps/winapps.conf"
@@ -5912,7 +5923,7 @@ configure_winapps() {
 
     # --- Choices ------------------------------------------------------------
     [[ -z "$OPT_WINAPPS_CREDS" ]] && winapps_choose_creds
-    if [[ ! "$OPT_WINAPPS_CREDS" =~ ^(askpass|kerberos|shared)$ ]]; then
+    if [[ ! "$OPT_WINAPPS_CREDS" =~ ^(askpass|shared)$ ]]; then
         err "Invalid WinApps credential mode '$OPT_WINAPPS_CREDS'."
         return 1
     fi
@@ -7631,9 +7642,8 @@ ${C_BOLD}WINDOWS APPLICATIONS (WINAPPS)${C_RESET}
                           Whether to 'virsh autostart' the guest so the host
                           powers it. Default: on. 'winapps_vm_autostart'.
       --winapps-domain D  RDP_DOMAIN (default: the realm this machine joined).
-      --winapps-creds M   askpass  - prompt each user for their own AD password
-                          kerberos - single sign-on from the user's ticket
-                          shared   - one service account for everyone
+      --winapps-creds M   askpass - prompt each user for their own AD password
+                          shared  - one service account for everyone
       --winapps-user USER Windows service account, 'shared' mode only.
       --winapps-remove    Remove the multi-user wiring (template, generator,
                           login hooks). Leaves per-user configs and launchers.
@@ -7797,8 +7807,8 @@ parse_args() {
         die "Invalid --duo-failmode '$OPT_DUO_FAILMODE' (expected safe or secure)."
     fi
 
-    if [[ -n "$OPT_WINAPPS_CREDS" && ! "$OPT_WINAPPS_CREDS" =~ ^(askpass|kerberos|shared)$ ]]; then
-        die "Invalid --winapps-creds '$OPT_WINAPPS_CREDS' (expected askpass, kerberos or shared)."
+    if [[ -n "$OPT_WINAPPS_CREDS" && ! "$OPT_WINAPPS_CREDS" =~ ^(askpass|shared)$ ]]; then
+        die "Invalid --winapps-creds '$OPT_WINAPPS_CREDS' (expected askpass or shared)."
     fi
 
     if [[ "$OPT_WINAPPS_CREDS" == "shared" && $ASSUME_YES -eq 1 && -z "$OPT_WINAPPS_RDP_USER" ]]; then
