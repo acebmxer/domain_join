@@ -1346,6 +1346,53 @@ check "the strip flags a pending power cycle"    "1" \
           winapps_strip_vm_cdroms >/dev/null 2>&1
           printf '%s' "$WINAPPS_CDROMS_PENDING" )"
 
+# A re-scan reaches the strip again after the guest is already stripped: one
+# empty CD-ROM, no spares. It must return without prompting or touching the VM.
+cat >"$WA_TMP/virsh_stub_done" <<STUB
+virsh() {
+    case "\$*" in
+        *"dominfo"*)   return 0 ;;
+        *"domblklist --details"*)
+            printf ' Type Device Target Source\\n'
+            printf ' file disk  vda /var/lib/libvirt/images/vm.qcow2\\n'
+            printf ' file cdrom sda -\\n' ;;
+        *"domstate"*)     echo running ;;
+        *"change-media"*|*"detach-disk"*) echo "\$*" >>"$EJECT_LOG" ;;
+    esac
+}
+STUB
+: >"$EJECT_LOG"; : >"$WA_TMP/confirm.log"
+( OPT_WINAPPS_VM="IT-VM"; DRY_RUN=0
+  source "$WA_TMP/virsh_stub_done"; have() { [[ "$1" == virsh ]]; }
+  confirm() { echo asked >>"$WA_TMP/confirm.log"; return 0; }
+  ok() { :; }; warn() { :; }; note() { :; }; info() { :; }
+  winapps_strip_vm_cdroms ) >/dev/null 2>&1
+check "a re-scan with nothing loaded does not prompt or act" "0|0" \
+      "$(grep -c asked "$WA_TMP/confirm.log")|$(grep -cE 'change-media|detach-disk' "$EJECT_LOG")"
+
+# But media put back into the kept drive is still ejected on a later run.
+cat >"$WA_TMP/virsh_stub_one" <<STUB
+virsh() {
+    case "\$*" in
+        *"dominfo"*)   return 0 ;;
+        *"domblklist --details"*)
+            printf ' Type Device Target Source\\n'
+            printf ' file disk  vda /var/lib/libvirt/images/vm.qcow2\\n'
+            printf ' file cdrom sda /var/lib/libvirt/images/some.iso\\n' ;;
+        *"domstate"*)     echo running ;;
+        *"change-media"*|*"detach-disk"*) echo "\$*" >>"$EJECT_LOG" ;;
+    esac
+}
+STUB
+: >"$EJECT_LOG"
+( OPT_WINAPPS_VM="IT-VM"; DRY_RUN=0
+  source "$WA_TMP/virsh_stub_one"; have() { [[ "$1" == virsh ]]; }
+  confirm() { return 0; }
+  ok() { :; }; warn() { :; }; note() { :; }; info() { :; }
+  winapps_strip_vm_cdroms ) >/dev/null 2>&1
+check "media reloaded into the kept drive is still ejected" "1|0" \
+      "$(grep -c 'change-media IT-VM sda --eject' "$EJECT_LOG")|$(grep -c 'detach-disk' "$EJECT_LOG")"
+
 section "WinApps: offering the post-strip power cycle"
 # winapps_offer_cdrom_powercycle only acts when the strip left drives pending,
 # and a declined prompt must not touch the guest.
@@ -1539,7 +1586,7 @@ check_line "it records whether the prompt was removed" '"$_src_sz" "$_mode" > "$
 check_line "it keeps a key-tap safety net"         'send-key "$VM_NAME" KEY_ENTER' "$WINAPPS_VM_DEPLOYER"
 check_line "the key-tap net is skipped when the prompt is gone" 'if [ "${NOPROMPT_OK:-0}" != "1" ]; then' "$WINAPPS_VM_DEPLOYER"
 check_line "it warns when the prompt is still there" 'the CD boot prompt could not be removed' "$WINAPPS_VM_DEPLOYER"
-check_line "it points the user at the app scan"    'setup.sh --system'      "$WINAPPS_VM_DEPLOYER"
+check_line "it points the user at the scan menu entry" 'Scan Windows for installed apps' "$WINAPPS_VM_DEPLOYER"
 # The '--help' banner must not fall through to the argument parser.
 if ( "$WINAPPS_VM_DEPLOYER" --nonsense ) >/dev/null 2>&1; then
     printf '  %s the VM builder accepts a bogus argument\n' "$(red FAIL)"; ((FAIL++))

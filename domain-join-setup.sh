@@ -4928,12 +4928,13 @@ else
 echo "    Password             : (the one you supplied)"
 fi
 echo ""
-echo "  When Windows is up and reachable over RDP, scan it for installed"
-echo "  programs and create the launchers:"
+echo "  When Windows is up and reachable over RDP, re-run domain-join-setup.sh"
+echo "  and choose \"Scan Windows for installed apps\" to scan the guest and"
+echo "  build the launchers. It adapts the upstream scanner to this machine"
+echo "  and ejects the install CDs; a plain 'setup.sh --system' does neither."
 echo ""
-echo "    sudo /etc/winapps/setup.sh --system"
-echo ""
-echo "  After a program is added in Windows, refresh the launchers with:"
+echo "  After the first scan, a re-scan for newly added programs can also be"
+echo "  run directly:"
 echo ""
 echo "    sudo /etc/winapps/setup.sh --system --add-apps"
 echo ""
@@ -5182,6 +5183,15 @@ winapps_strip_vm_cdroms() {
     (( ${#cdroms[@]} )) || return 0
 
     local keep="${cdroms[0]}" spare=$(( ${#cdroms[@]} - 1 ))
+
+    # A re-scan reaches here too, after an earlier run already stripped the
+    # guest. If nothing is loaded and there are no spare drives left, there is
+    # nothing to do - don't prompt.
+    local loaded
+    loaded=$(virsh -c "$uri" domblklist --details "$vm" 2>/dev/null \
+             | awk '$2 == "cdrom" && $4 != "-" && $4 != "" { n++ } END { print n+0 }')
+    (( spare == 0 && loaded == 0 )) && return 0
+
     local msg="Eject the install media from guest '$vm'"
     if (( spare > 0 )); then
         msg+=" and remove $spare spare CD drive"
@@ -5311,8 +5321,10 @@ winapps_install_upstream() {
     if ! confirm "Is the Windows side already installed, domain-joined and reachable over RDP?" "n"; then
         printf '\n'
         note "Leaving the WinApps launchers for later - Windows has to be up first."
-        note "Once it is, run:"
-        printf '    %ssudo %s %s%s\n' "$C_CYAN" "$installer" "${mode[*]}" "$C_RESET"
+        note "Once it is, re-run this installer and choose \"Scan Windows for"
+        note "installed apps\". It fetches the upstream scanner, adapts it to this"
+        note "machine and ejects the guest's install CDs - a plain"
+        note "'$installer ${mode[*]}' does none of that."
         return 0
     fi
 
@@ -5497,10 +5509,11 @@ winapps_print_summary() {
     printf '    %ssudo %s --all%s\n' "$C_CYAN" "$WINAPPS_SEEDER" "$C_RESET"
     printf '\n'
     printf '  %sTo scan (or re-scan) Windows for programs and refresh the launchers:%s\n' "$C_BOLD" "$C_RESET"
-    printf '    %ssudo %s/setup.sh --system%s            (first scan)\n' "$C_CYAN" "$WINAPPS_ETC_DIR" "$C_RESET"
-    printf '    %ssudo %s/setup.sh --system --add-apps%s (re-scan)\n' "$C_CYAN" "$WINAPPS_ETC_DIR" "$C_RESET"
-    printf '    Re-scan whenever a program is added to Windows. The menu entry\n'
-    printf '    "Scan Windows for installed apps" runs the right one for you.\n'
+    printf '    Re-run this installer and choose "Scan Windows for installed apps".\n'
+    printf '    It adapts the upstream scanner to this machine and runs the right\n'
+    printf '    mode for you. Do this whenever a program is added to Windows.\n'
+    printf '    After the first scan, a re-scan can also be run directly:\n'
+    printf '    %ssudo %s/setup.sh --system --add-apps%s\n' "$C_CYAN" "$WINAPPS_ETC_DIR" "$C_RESET"
 
     if [[ -x "$WINAPPS_VM_DEPLOYER" ]]; then
         printf '\n'

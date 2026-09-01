@@ -149,6 +149,22 @@ changed — not that an artefact was published anywhere.
   same check in the fetched installer, beside the existing `--add-apps`
   correction. A no-op if upstream drops or renames the function.
 
+- **A re-scan no longer prompts to eject CD media that is already gone.**
+  `winapps_strip_vm_cdroms` runs on every scan, but after the first run the
+  guest has one empty CD-ROM and no spare drives — nothing to do. It asked
+  "Eject the install media from guest…?" anyway. It now returns silently when
+  no medium is loaded and no spare drive is left; media put back into the kept
+  drive is still ejected on a later run.
+
+- **The "scan Windows" instructions point at the menu entry, not a bare
+  `setup.sh --system`.** The post-install summary, the "do this later" note and
+  the standalone VM builder's closing message all told the user to run
+  `sudo /etc/winapps/setup.sh --system` for the first scan. Run directly that is
+  the unadapted upstream installer — it aborts on the group check and skips the
+  CD-drive cleanup. They now say to re-run this installer and choose "Scan
+  Windows for installed apps", and mention the direct `--add-apps` command only
+  for re-scans after the first.
+
 ## [1.5.0] — 2026-08-30
 
 A dedicated menu entry for re-scanning the Windows guest for installed apps,
