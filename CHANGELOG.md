@@ -32,6 +32,16 @@ changed — not that an artefact was published anywhere.
   flag is unchanged: wiring only, upstream install left for a per-user fallback.
   Flag-directed and `-y` runs stay on the configure path as before.
 
+### Changed
+
+- **The WinApps summary no longer prints the "to change the settings for
+  everyone" commands.** Editing `winapps.conf.template` and running
+  `winapps-user-config --all` is a day-2 task, never a step of an install or
+  reinstall — the step seeds every existing user itself — and printing it on
+  every run read as an unfinished to-do. It stays documented in
+  [docs/winapps.md](docs/winapps.md). The summary still shows where the template
+  lives, and how to re-scan Windows and rebuild the VM.
+
 ### Removed
 
 - **The `kerberos` WinApps credential mode is gone.** `--winapps-creds` now takes

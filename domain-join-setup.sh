@@ -5598,10 +5598,6 @@ winapps_print_summary() {
     printf '  application menu open under their own Windows profile.\n'
 
     printf '\n'
-    printf '  %sTo change the settings for everyone:%s\n' "$C_BOLD" "$C_RESET"
-    printf '    %ssudo nano %s%s\n' "$C_CYAN" "$WINAPPS_TEMPLATE" "$C_RESET"
-    printf '    %ssudo %s --all%s\n' "$C_CYAN" "$WINAPPS_SEEDER" "$C_RESET"
-    printf '\n'
     printf '  %sTo scan (or re-scan) Windows for programs and refresh the launchers:%s\n' "$C_BOLD" "$C_RESET"
     printf '    Re-run this installer and choose "Scan Windows for installed apps".\n'
     printf '    It adapts the upstream scanner to this machine and runs the right\n'
