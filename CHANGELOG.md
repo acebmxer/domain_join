@@ -122,6 +122,33 @@ changed — not that an artefact was published anywhere.
   fetched installer is corrected in place before it runs; a no-op once upstream
   fixes it.
 
+- **The Windows VM reaches the internet when Docker is also installed.**
+  Docker's default firewall setup sets the `FORWARD` chain policy to `DROP` and
+  adds no exception for a libvirt NAT network, so a guest on `virbr0` got a DHCP
+  lease from `dnsmasq` — that traffic is host-directed and never forwarded — but
+  no routed packet reached the internet, and the fault looked like broken DNS.
+  libvirt's own accept and masquerade rules live in a separate nftables table
+  and cannot undo another table's `DROP`. When Docker is present with its
+  iptables driver active (the `DOCKER-USER` chain exists), the WinApps step now
+  offers to install `libvirt-docker-forward.service` — a one-shot unit ordered
+  `After=` and `PartOf=` `docker.service` that adds an `ACCEPT` for the libvirt
+  bridge (`virbr0` unless renamed) to `DOCKER-USER`. Docker recreates that chain
+  empty on every daemon start, so the unit re-applies the rule each time; a
+  matching permanent firewalld direct rule covers `firewall-cmd --reload`, which
+  makes Docker rebuild its chains too. Declining the prompt leaves the firewall
+  untouched. `--winapps-remove` disables the unit and drops the firewalld rule.
+  (`dd6f3e8`)
+
+- **The Windows program scan no longer aborts on a group-membership check.**
+  Upstream's `setup.sh` refuses the libvirt backend unless the user running it
+  is in the local `libvirt` and `kvm` groups (exit 7). This script runs it as
+  root — which needs no such membership — on a machine whose whole model is that
+  domain users are in no local groups either (`qemu:///system` through polkit,
+  the launchers via `virsh -r`). The launcher side was already handled by the
+  read-only block in `winapps.conf`; `winapps_install_upstream` now neuters the
+  same check in the fetched installer, beside the existing `--add-apps`
+  correction. A no-op if upstream drops or renames the function.
+
 ## [1.5.0] — 2026-08-30
 
 A dedicated menu entry for re-scanning the Windows guest for installed apps,

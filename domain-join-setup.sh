@@ -5348,6 +5348,15 @@ winapps_install_upstream() {
             "$installer"
     fi
 
+    # Upstream refuses the libvirt backend unless the invoking user is in the
+    # local 'libvirt' and 'kvm' groups (exit 7). We run it as root, which needs
+    # no such membership, on a machine whose model is that domain users are in
+    # no local groups either - qemu:///system is reached through polkit and the
+    # launchers use 'virsh -r'. The launcher side is already handled by the
+    # read-only block in winapps.conf; neuter the same check in the installer.
+    # A no-op if upstream ever drops or renames the function.
+    sed -i -E 's/^(function )?waCheckGroupMembership\(\) \{/&\n    return 0/' "$installer"
+
     winapps_seed_scan_config "$installer"
 
     info "Running the WinApps installer ($label)"

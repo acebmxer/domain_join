@@ -1479,6 +1479,24 @@ check "the re-scan corrects the broken upstream --add-apps install check" "yes" 
           fetch_url() { printf '%s\n' 'X && -d "${SYS_SOURCE_PATH}/winapps" ]]; then' > "$2"; }
           winapps_install_upstream >/dev/null 2>&1
           grep -qF 'X && -d "${SYS_SOURCE_PATH}" ]]; then' "$d/setup.sh" && echo yes || echo no )"
+# Upstream's libvirt group-membership check (exit 7) must be neutered in the
+# fetched installer - this script runs it as root, and its whole model is that
+# nobody is in the local libvirt/kvm groups.
+check "the fetched installer's group check is neutered" "yes" \
+      "$( d="$WA_TMP/wa-grp"; mkdir -p "$d"; WINAPPS_ETC_DIR="$d"; DRY_RUN=0
+          WINAPPS_SYS_LAUNCHER="$WA_TMP/no-such-launcher"
+          confirm() { return 0; }; info() { :; }; note() { :; }; ok() { :; }; warn() { :; }; err() { :; }
+          winapps_strip_vm_cdroms() { :; }; winapps_seed_scan_config() { :; }; run() { :; }
+          fetch_url() { printf '%s\n' \
+            'function waCheckGroupMembership() {' \
+            '    USER_GROUPS=$(groups "$(whoami)")' \
+            '    return 7' \
+            '}' > "$2"; }
+          winapps_install_upstream >/dev/null 2>&1
+          # bash runs the injected 'return 0' before ever reaching 'return 7'.
+          ( set -e
+            eval "$(cat "$d/setup.sh")"
+            waCheckGroupMembership ) && echo yes || echo no )"
 
 section "WinApps: the VM builder script"
 WINAPPS_VM_DEPLOYER="$WA_TMP/winapps-vm-deploy"
